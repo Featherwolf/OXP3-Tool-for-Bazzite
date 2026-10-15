@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.4 shellcheck udev
+          python -m pip install pyyaml jsonschema ruff
+      - name: Fetch InputPlumber capability map schema
+        run: >
+          curl -fsSL -o "$RUNNER_TEMP/capability_map_v1.json"
+          https://raw.githubusercontent.com/ShadowBlip/InputPlumber/v0.82.0/rootfs/usr/share/inputplumber/schema/capability_map_v1.json
+      - name: Unit tests
+        env:
+          OXP3_IP_CAPABILITY_MAP_SCHEMA: ${{ runner.temp }}/capability_map_v1.json
+        run: python -m unittest discover -s tests -t . -v
+      - name: Lint
+        run: |
+          ruff check .
+          shellcheck install.sh uninstall.sh
+      - name: Install smoke test
+        run: |
+          prefix="$(mktemp -d)"
+          sudo PREFIX="$prefix" ./install.sh
+          "$prefix/bin/oxp3-tool" --version
+          "$prefix/bin/oxp3-tool" status || true
+          sudo PREFIX="$prefix" ./uninstall.sh

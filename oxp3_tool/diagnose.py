@@ -1,0 +1,195 @@
+"""Collect a diagnostic bundle for bug reports."""
+
+from __future__ import annotations
+
+import datetime
+import io
+import os
+import re
+import tarfile
+from typing import Callable, Optional
+
+from .detect import IMU_I2C_DEVICE, Context, parse_edid
+
+# Kernel log patterns worth calling out, with what they usually mean.
+PATTERNS: list[tuple[str, str]] = [
+    (r"Disabling device after reset failure",
+     "The NVMe SSD did not come back from sleep (black or frozen screen after resume). "
+     "The nvme-resume fix addresses this."),
+    (r"platform quirk: setting simple suspend",
+     "Firmware asks for ACPI simple suspend on the SSD; this is what breaks resume with the Predator GM7."),
+    (r"FIFO underrun", "Display pipe FIFO underruns (xe)."),
+    (r"DSB \d+ poll error", "xe Display State Buffer errors; xe-dsb-off silences them."),
+    (r"flip_done timed out", "A display update timed out; often seen together with a black screen."),
+    (r"Timed out waiting PSR idle state", "Panel Self Refresh did not idle; xe-panel-replay-off may help."),
+    (r"Selective fetch area calculation failed", "PSR2/Panel Replay selective-fetch failure."),
+    (r"Failed to write aux backlight level", "Backlight control over the DisplayPort AUX channel failed."),
+    (r"Chip id not found", "bmi160 probed the BMI260 IMU and failed (gyro); see the gyro fix."),
+]
+
+DMI_PUBLIC = (
+    "sys_vendor", "product_name", "product_version", "product_family", "product_sku",
+    "board_vendor", "board_name", "board_version", "bios_vendor", "bios_version",
+    "bios_date", "bios_release", "ec_firmware_release", "chassis_type",
+)
+
+COMMANDS: list[tuple[str, list[str]]] = [
+    ("uname.txt", ["uname", "-a"]),
+    ("rpm-ostree-status.txt", ["rpm-ostree", "status"]),
+    ("rpm-ostree-kargs.txt", ["rpm-ostree", "kargs"]),
+    ("packages.txt", ["rpm", "-q", "kernel", "inputplumber", "gamescope", "gamescope-session-plus",
+                      "systemd", "linux-firmware", "steamos-manager", "powerstation", "hhd"]),
+    ("lspci.txt", ["lspci", "-nnk"]),
+    ("lsusb.txt", ["lsusb"]),
+    ("units.txt", ["systemctl", "status", "--no-pager", "--lines=20", "inputplumber.service",
+                   "inputplumber-suspend.service", "powerstation.service", "steamos-manager.service",
+                   "bazzite-hardware-setup.service"]),
+    ("units-failed.txt", ["systemctl", "--failed", "--no-pager"]),
+    ("journal-kernel-this-boot.txt", ["journalctl", "-k", "-b", "0", "--no-pager", "-o", "short-monotonic"]),
+    ("journal-kernel-previous-boot.txt", ["journalctl", "-k", "-b", "-1", "--no-pager", "-o", "short-monotonic"]),
+    ("journal-sleep-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
+                                     "-u", "systemd-suspend.service", "-u", "systemd-logind.service",
+                                     "-u", "inputplumber-suspend.service"]),
+    ("journal-inputplumber-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
+                                            "-u", "inputplumber.service", "-n", "3000"]),
+    ("journal-gamescope-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
+                                         "--grep", "gamescope|known display", "-n", "3000"]),
+]
+
+TEXT_FILES = [
+    "/proc/cmdline",
+    "/etc/os-release",
+    "/usr/share/ublue-os/image-info.json",
+    "/proc/bus/input/devices",
+    "/sys/power/mem_sleep",
+    "/sys/kernel/security/lockdown",
+    "/sys/module/nvme/parameters/noacpi",
+]
+
+DEBUGFS_GLOBS = [
+    "/sys/kernel/debug/dri/*/i915_edp_psr_status",
+    "/sys/kernel/debug/dri/*/i915_display_info",
+    "/sys/kernel/debug/dri/*/i915_dmc_info",
+    "/sys/kernel/debug/dri/*/eDP-*/i915_psr_status",
+    "/sys/kernel/debug/pmc_core/substate_residencies",
+    "/sys/kernel/debug/pmc_core/slp_s0_residency_usec",
+]
+
+MAX_FILE = 4 * 1024 * 1024
+
+
+class Bundle:
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+
+    def add(self, name: str, data: bytes | str) -> None:
+        if isinstance(data, str):
+            data = data.encode()
+        self.files[name] = data[:MAX_FILE]
+
+    def write(self, path: str) -> None:
+        stamp = datetime.datetime.now().timestamp()
+        with tarfile.open(path, "w:gz") as tar:
+            for name, data in sorted(self.files.items()):
+                info = tarfile.TarInfo(f"oxp3-diagnose/{name}")
+                info.size = len(data)
+                info.mtime = int(stamp)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+
+
+def scan_patterns(text: str) -> list[tuple[str, int, str]]:
+    hits = []
+    for pattern, meaning in PATTERNS:
+        count = len(re.findall(pattern, text))
+        if count:
+            hits.append((pattern, count, meaning))
+    return hits
+
+
+def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
+    sys = ctx.sys
+    bundle = Bundle()
+    bundle.add("status.txt", status_text)
+
+    dmi_lines = []
+    for f in DMI_PUBLIC:
+        v = sys.read_attr(f"/sys/class/dmi/id/{f}")
+        if v is not None:
+            dmi_lines.append(f"{f}: {v}")
+    bundle.add("dmi.txt", "\n".join(dmi_lines) + "\n")
+
+    for path in TEXT_FILES:
+        data = sys.read_bytes(path)
+        if data is not None:
+            bundle.add("files" + path, data)
+
+    stats = []
+    for p in sys.glob("/sys/power/suspend_stats/*"):
+        stats.append(f"{p.rsplit('/', 1)[-1]}: {sys.read_attr(p)}")
+    if stats:
+        bundle.add("suspend_stats.txt", "\n".join(stats) + "\n")
+
+    for name, argv in COMMANDS:
+        res = sys.run(argv, timeout=120)
+        bundle.add(f"commands/{name}", f"$ {' '.join(argv)}\n(exit {res.returncode})\n{res.stdout}{res.stderr}")
+
+    debug_lines = []
+    for pattern in DEBUGFS_GLOBS:
+        for p in sys.glob(pattern):
+            data = sys.read_bytes(p)
+            if data is not None:
+                bundle.add("debugfs" + p.replace("/sys/kernel/debug", ""), data)
+            else:
+                debug_lines.append(f"unreadable: {p}")
+    if debug_lines:
+        bundle.add("debugfs/README.txt", "\n".join(debug_lines) + "\n")
+
+    hw = []
+    for conn in sys.glob("/sys/class/drm/card*-*"):
+        name = conn.rsplit("/", 1)[-1]
+        if not re.match(r"card\d+-", name):
+            continue
+        status = sys.read_attr(f"{conn}/status")
+        enabled = sys.read_attr(f"{conn}/enabled")
+        dpms = sys.read_attr(f"{conn}/dpms")
+        edid_bytes = sys.read_bytes(f"{conn}/edid")
+        edid = parse_edid(edid_bytes) if edid_bytes else None
+        edid_s = f"{edid.vendor} 0x{edid.product:04x} {edid.name or ''}".strip() if edid else "-"
+        hw.append(f"drm {name}: status={status} enabled={enabled} dpms={dpms} edid={edid_s}")
+    for bl in sys.glob("/sys/class/backlight/*"):
+        vals = {a: sys.read_attr(f"{bl}/{a}") for a in ("type", "brightness", "actual_brightness", "max_brightness")}
+        hw.append(f"backlight {bl.rsplit('/', 1)[-1]}: " + " ".join(f"{k}={v}" for k, v in vals.items()))
+    for d in ctx.nvme_drives:
+        hw.append(f"nvme {d.name}: {d.vendor}:{d.device} model={d.model} fw={d.firmware}")
+    hw.append(f"iio devices: {', '.join(ctx.iio_names) or 'none'}")
+    hw.append(f"{IMU_I2C_DEVICE}: present={ctx.imu_present} driver={ctx.imu_driver}")
+    hw.append(f"hid-oxp devices: {', '.join(ctx.hid_oxp_devices) or 'none'}")
+    released = ctx.atkbd_force_release
+    hw.append(f"atkbd force_release: {sorted(released) if released is not None else 'unreadable'}")
+    for param in ("enable_psr", "enable_panel_replay", "enable_psr2_sel_fetch", "enable_dsb", "enable_dc"):
+        v = sys.read_attr(f"/sys/module/xe/parameters/{param}")
+        if v is not None:
+            hw.append(f"xe.{param} = {v}")
+    bundle.add("hardware.txt", "\n".join(hw) + "\n")
+
+    kernel_logs = ""
+    for name in ("journal-kernel-this-boot.txt", "journal-kernel-previous-boot.txt"):
+        kernel_logs += bundle.files.get(f"commands/{name}", b"").decode(errors="replace")
+    findings = []
+    for pattern, count, meaning in scan_patterns(kernel_logs):
+        findings.append(f"{count:6d}x  /{pattern}/  {meaning}")
+    bundle.add("findings.txt", ("\n".join(findings) or "No known problem patterns in the kernel logs.") + "\n")
+    return bundle, findings
+
+
+def default_output_name() -> str:
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"oxp3-diagnose-{stamp}.tar.gz"
+
+
+def write_bundle(bundle: Bundle, path: str, chown: Optional[Callable[[str], None]] = None) -> None:
+    bundle.write(path)
+    os.chmod(path, 0o600)
+    if chown:
+        chown(path)

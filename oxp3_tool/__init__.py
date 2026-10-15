@@ -1,0 +1,5 @@
+"""oxp3-tool: controller and wake-from-sleep fixes for the OneXPlayer 3 on Bazzite."""
+
+__version__ = "0.1.0"
+
+PROJECT_URL = "https://github.com/Featherwolf/OXP3-Tool-for-Bazzite"
