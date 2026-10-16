@@ -72,6 +72,9 @@ class Plan:
     # Units an earlier apply enabled and this plan drops are disabled; False
     # leaves them running until the next boot.
     stop_dropped_units: bool = True
+    # Writing one of these files leaves a restart pending (notes restart_pending)
+    # until a post step gated on it has run, or the next boot.
+    pending_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -269,9 +272,8 @@ class ButtonsFix(Fix):
                    "game_mode_input": session},
             # Without the restart InputPlumber keeps the old map, which may still need a dropped helper.
             stop_dropped_units=restart,
+            pending_paths=(map_path,),
         )
-        # The engine records a restart as pending while it is due and clears it once it ran.
-        map_changes = ctx.sys.sha256(map_path) != sha256_bytes(content.encode())
         if session == OGUI:
             plan.messages.append(
                 "Game Mode runs Steam behind the OpenGamepadUI overlay, so the map is written for it. If you "
@@ -283,8 +285,7 @@ class ButtonsFix(Fix):
                     "controller for native Steam Input only when Game Mode starts, and the InputPlumber restart "
                     "resets it.") if session == NATIVE_STEAM else ""
             plan.post.append(_restart_inputplumber(only_if_changed=(map_path,), note=note))
-        elif map_changes:
-            plan.notes.update(restart_pending=True, restart_pending_boot=ctx.boot_id)
+        elif ctx.sys.sha256(map_path) != sha256_bytes(content.encode()):
             plan.messages.append("InputPlumber was not restarted; the new map loads on the next reboot.")
         if not self._stock_map_known(ctx):
             plan.messages.append(

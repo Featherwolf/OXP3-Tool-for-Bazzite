@@ -344,6 +344,30 @@ class OskFixTest(unittest.TestCase):
         rc, out, _ = self.cli("status")
         self.assertNotIn("InputPlumber has not been restarted", out)
 
+    def test_failed_no_restart_apply_keeps_the_restart_pending(self):
+        self.f.runner.fail.add(f"systemctl enable {self.UNIT}")
+        self.assertNotEqual(self.cli("apply", "--yes", "buttons", "--no-restart")[0], 0)  # map already written
+        self.f.runner.fail.clear()
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "--no-restart")[0], 0)
+        rc, out, _ = self.cli("status")
+        self.assertIn("InputPlumber has not been restarted", out)
+        self.f.runner.calls.clear()
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        self.assertIn("systemctl try-restart inputplumber.service", self.calls())
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("InputPlumber has not been restarted", out)
+
+    def test_failure_before_the_map_write_is_not_a_pending_restart(self):
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        self.f.runner.fail.add(f"systemctl disable --now {self.UNIT}")
+        self.assertNotEqual(self.cli("apply", "--yes", "buttons", "--keyboard-key", "keyboard-chord")[0], 0)
+        self.f.runner.fail.clear()
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("InputPlumber has not been restarted", out)
+        self.f.runner.calls.clear()
+        rc, out, _ = self.cli("apply", "--yes", "buttons")
+        self.assertNotIn("systemctl try-restart inputplumber.service", self.calls())
+
     def test_no_restart_helper_update_is_not_a_pending_restart(self):
         self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
         with mock.patch.object(templates, "osk_key_helper_script", lambda: "#!/usr/bin/python3 -I\n# new\n"):
@@ -415,6 +439,22 @@ class OskFixTest(unittest.TestCase):
         self.assertEqual(self.cli("revert", "--yes", "buttons")[0], 0)
         self.assertTrue((self.root / "usr/local/libexec/oxp3-tool").exists())
         self.assertEqual(self.cli("revert", "--yes", "xbox-key")[0], 0)
+        self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
+
+    def test_shared_directory_after_the_helper_was_dropped(self):
+        import json
+        from oxp3_tool.state import STATE_FILE
+        from .test_xbox_key import IP_LOG
+        self.f.mcu_hidraw()
+        self.f.runner.ip_journal = IP_LOG
+        self.assertEqual(self.cli("apply", "--yes", "xbox-key", "buttons")[0], 0)
+        path = self.root / STATE_FILE.lstrip("/")
+        data = json.loads(path.read_text())
+        data["fixes"]["buttons"]["dirs_created"] = []  # state from the first version
+        path.write_text(json.dumps(data))
+        self.assertEqual(self.cli("revert", "--yes", "xbox-key")[0], 0)
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "--keyboard-key", "keyboard-chord")[0], 0)
+        self.assertEqual(self.cli("revert", "--yes", "buttons")[0], 0)
         self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
 
     def test_lost_state_still_owns_the_unit(self):

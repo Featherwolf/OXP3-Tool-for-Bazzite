@@ -281,11 +281,7 @@ class Engine:
         restarting: list[Fix] = []
         for fix, plan in todo:
             due = self._due_steps(fix, plan)
-            gated = any(s.only_if_changed for s in due)
-            if gated:
-                # Write-ahead: a failed or interrupted run leaves the restart pending, so the next run does it.
-                self.state.entry(fix.id)["notes"].update(restart_pending=True, restart_pending_boot=self.ctx.boot_id)
-                self.state.save()
+            gated = any(s.only_if_changed for s in due)  # clears a pending restart once it ran
             try:
                 dropped = self._apply_local(fix, plan)
             except OSError as e:
@@ -381,6 +377,10 @@ class Engine:
                 rec = {"path": spec.path}
                 entry["files"].append(rec)
             rec.update({"sha256": wanted, "backup": backup})
+            if current != wanted and spec.path in plan.pending_paths:
+                # Pending from this write until the restart has run, so a failed or
+                # interrupted run leaves it for the next one.
+                entry["notes"].update(restart_pending=True, restart_pending_boot=self.ctx.boot_id)
             self.state.save()  # write-ahead
             if current != wanted:
                 self.sys.write_atomic(spec.path, spec.content, spec.mode)
@@ -552,12 +552,11 @@ class Engine:
                     self._disable_unit(unit)
                     entry["units_enabled"].remove(unit)
                     self.state.save()
-                records = list(entry.get("files", []))
-                for rec in records:
+                for rec in list(entry.get("files", [])):
                     self._drop_file(fix_id, entry, rec)
-                # Also for state from before every fix recorded the shared directories.
-                tool_dirs = [d for d in TOOL_DIRS if any(r["path"].startswith(d + "/") for r in records)]
-                for d in sorted(set(entry.get("dirs_created", []) + tool_dirs), key=len, reverse=True):
+                # Only this tool writes to TOOL_DIRS, so an empty one goes too (also for
+                # state from before every fix recorded them).
+                for d in sorted(set(entry.get("dirs_created", [])) | set(TOOL_DIRS), key=len, reverse=True):
                     self.sys.rmdir_if_empty(d)
                 entry["dirs_created"] = []  # a directory still in use is no longer ours to remove
             except OSError as e:
