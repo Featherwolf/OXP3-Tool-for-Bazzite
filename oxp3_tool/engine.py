@@ -484,15 +484,16 @@ class Engine:
             fix = BY_ID.get(fix_id)
             self.out(f"{fix_id}:")
             try:
+                # Units first: disabling needs a unit file this fix may have installed.
+                for unit in list(entry.get("units_enabled", [])):
+                    self._disable_unit(unit)
+                    entry["units_enabled"].remove(unit)
+                    self.state.save()
                 for rec in list(entry.get("files", [])):
                     self._drop_file(fix_id, entry, rec)
                 for d in sorted(entry.get("dirs_created", []), key=len, reverse=True):
                     self.sys.rmdir_if_empty(d)
                 entry["dirs_created"] = []  # a directory still in use is no longer ours to remove
-                for unit in list(entry.get("units_enabled", [])):
-                    self._disable_unit(unit)
-                    entry["units_enabled"].remove(unit)
-                    self.state.save()
             except OSError as e:
                 outcome.ok = False
                 outcome.errors.append(f"{fix_id}: {e}")

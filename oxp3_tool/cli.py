@@ -66,7 +66,7 @@ def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
         label = OPTIONAL  # e.g. nvme-resume without the GM7 SSD
     else:
         label = fix.level
-    return label, ([check.reason] if check.reason else [])
+    return label, ([check.reason] if check.reason else []) + fix.note(ctx)
 
 
 def _wrap(text: str, first: str, rest: str, width: int = 100) -> str:
@@ -150,7 +150,8 @@ def status_text(ctx: Context, state: State) -> str:
     elif not ctx.sys.is_real_root or os.geteuid() == 0:
         lines.append(f"Panel:    not checked: {why}")
     refresh = ctx.refresh_state
-    if ctx.xe_loaded or refresh.kwin:
+    show_refresh = ctx.show_refresh
+    if show_refresh:
         for i, line in enumerate(refresh.summary()):
             lines.append(f"{'Refresh:' if i == 0 else '':<10}{line}")
     game = {OGUI: "Steam behind the OpenGamepadUI overlay (Bazzite default; "
@@ -174,7 +175,7 @@ def status_text(ctx: Context, state: State) -> str:
             lines.append(f"  [{label:<12}] {fix.id:<21} {fix.summary}")
             for note in notes:
                 lines.append(f"  {'':14} {'':21} {note}")
-    advice = refresh.advice() if (ctx.xe_loaded or refresh.kwin) else []
+    advice = refresh.advice() if show_refresh else []
     if advice:
         lines.append("")
         lines.append("Refresh rate")

@@ -121,6 +121,7 @@ class FakeRunner:
         self.hhd_units: list[str] = []
         self.packages = {"inputplumber": "0.82.0"}
         self.journal: dict[str, str] = {}  # boot ("0", "-1") -> kernel log
+        self.ip_journal = ""  # this boot's inputplumber.service messages
         self.bmi270_aliases = "i2c:bmi270\nacpi*:BMI0260:*\nacpi*:10EC5280:*\n"
 
     def _failing(self, argv: Sequence[str]) -> bool:
@@ -145,6 +146,10 @@ class FakeRunner:
         if cmd == "journalctl" and "-k" in argv:
             boot = argv[argv.index("-b") + 1]
             return CommandResult(0, self.journal.get(boot, ""))
+        if cmd == "journalctl" and "inputplumber.service" in argv:
+            pattern = argv[argv.index("--grep") + 1] if "--grep" in argv else ""
+            lines = [ln for ln in self.ip_journal.splitlines() if pattern in ln]
+            return CommandResult(0 if lines else 1, "".join(ln + "\n" for ln in lines))
         if cmd == "modinfo":
             if argv[-1] == "bmi270_i2c":
                 return CommandResult(0, self.bmi270_aliases)
@@ -188,6 +193,12 @@ class FakeRunner:
             return CommandResult(0)
         if verb == "disable":
             self.unit_enabled[args[1]] = "disabled"
+            return CommandResult(0)
+        if verb in ("start", "restart"):
+            self.unit_active[args[1]] = "active"
+            return CommandResult(0)
+        if verb == "stop":
+            self.unit_active[args[1]] = "inactive"
             return CommandResult(0)
         if verb == "list-units":
             lines = [f"{u} loaded active running Handheld Daemon" for u in self.hhd_units]
@@ -324,11 +335,27 @@ class FakeOxp3:
                    "Sink support: PSR = yes [0x03], Panel Replay = yes, Panel Replay Selective Update = yes, "
                    "Panel Replay DSC support = not supported\n"
                    f"PSR mode: {psr}\n")
-        info = "DMC initialized: yes\nfw loaded: yes\npath: i915/xe3lpd_dmc.bin\n"
+        info = f"DMC initialized: yes\nfw loaded: {'yes' if dmc else 'no'}\npath: i915/xe3lpd_dmc.bin\n"
         if dmc:
             info += f"version: {dmc}\n"
         self.write(f"{d}/i915_dmc_info", info)
         self.symlink("/sys/kernel/debug/dri/0", "0000:00:02.0")
+
+    def mcu_hidraw(self, moved: bool = True) -> None:
+        """The controller MCU's three USB interfaces with hidraw nodes; interface 2 is the vendor one.
+
+        InputPlumber moves the nodes of devices it manages to /dev/inputplumber/sources.
+        """
+        usb = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-5"
+        for n in range(3):
+            intf = f"{usb}/1-5:1.{n}"
+            hid = f"{intf}/0003:1A86:FE00.000{8 + n}"
+            self.write(f"{intf}/bInterfaceNumber", f"0{n}\n")
+            self.mkdir(f"{hid}/hidraw/hidraw{n}")
+            self.symlink(f"{hid}/hidraw/hidraw{n}/device", f"../../../0003:1A86:FE00.000{8 + n}")
+            self.symlink(f"/sys/class/hidraw/hidraw{n}", f"../../..{hid}/hidraw/hidraw{n}")
+            self.write(f"/dev/inputplumber/sources/hidraw{n}" if moved and n == 2 else f"/dev/hidraw{n}", b"")
+        self.write("/usr/bin/busctl", "")
 
     def kwin_config(self, user: str = "gamer", refresh_mhz: Optional[int] = 144000,
                     vrr: Optional[str] = None, hdr: Optional[bool] = None) -> None:

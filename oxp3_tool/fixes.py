@@ -1,8 +1,9 @@
 """The fixes the tool can apply.
 
-A fix never touches /usr. It only writes files under /etc, appends kernel
-arguments with rpm-ostree, or enables a systemd unit, and every one of those
-changes is recorded so ``revert`` can undo exactly what was done.
+A fix never touches the read-only /usr. It only writes files under /etc (and
+/usr/local, which is /var/usrlocal on Bazzite), appends kernel arguments with
+rpm-ostree, or enables a systemd unit, and every one of those changes is
+recorded so ``revert`` can undo exactly what was done.
 """
 
 from __future__ import annotations
@@ -21,6 +22,9 @@ DISPLAY = "display"
 RECOMMENDED = "recommended"
 OPTIONAL = "optional"
 EXPERIMENTAL = "experimental"
+
+# Vendor button id the OXP3 controller can report its Xbox key as.
+XBOX_KEY_BUTTON = 0x25
 
 # InputPlumber's OXP3 capability map id whose chords the button template mirrors.
 SUPPORTED_MAP_ID = "oxp9"
@@ -103,6 +107,10 @@ class Fix:
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
         """Extra status lines describing whether the change is in effect."""
+        return []
+
+    def note(self, ctx: Context) -> list[str]:
+        """Extra status lines for a fix that is not applied (status only, never during apply)."""
         return []
 
 
@@ -219,6 +227,11 @@ class ButtonsFix(Fix):
                 "Game Mode runs Steam behind the OpenGamepadUI overlay, so the map is written for it. If you "
                 "switch with `ujust configure-opengamepadui`, run `sudo oxp3-tool apply buttons` again."
             )
+        elif session == NATIVE_STEAM and restart:
+            plan.messages.append(
+                "Reboot (or leave Game Mode and start it again) afterwards: Bazzite selects the Steam Deck "
+                "controller for native Steam Input only when Game Mode starts, and the InputPlumber restart resets it."
+            )
         if restart:
             plan.post.append(_restart_inputplumber())
         else:
@@ -257,7 +270,85 @@ class ButtonsFix(Fix):
                          "Steam Input, or an older oxp3-tool); run `sudo oxp3-tool apply buttons` again")
         if restart_pending(ctx, entry.get("notes", {})):
             lines.append("InputPlumber has not been restarted since; reboot or run `sudo oxp3-tool apply buttons`")
+        if ctx.game_mode_input == OGUI and written_for == OGUI and actions.get("keyboard") == "keyboard":
+            lines.append("under the OpenGamepadUI overlay the keyboard key's Steam+X shortcut often does nothing "
+                         "(OpenGamepadUI issue #549); for a working on-screen keyboard switch to native Steam Input "
+                         "(`ujust configure-opengamepadui disable`, reboot, `sudo oxp3-tool apply buttons`)")
         return lines
+
+
+class XboxKeyFix(Fix):
+    id = "xbox-key"
+    group = CONTROLLER
+    level = OPTIONAL
+    title = "Xbox key as the Steam button"
+    summary = "Helper that makes the Xbox key (vendor button 0x25) work as the Steam button"
+    details = (
+        "On some OXP3 units the controller reports the Xbox key (the lit logo key below\n"
+        "Home) only on its vendor interface, as button 0x25. InputPlumber 0.82 cannot\n"
+        "decode that id: it logs 'OXP HID: failed to parse B2 report ... 25 ...' and the\n"
+        "key does nothing. Which units do this depends on the button layout stored in the\n"
+        "controller (OneXConsole on Windows can change it); on others the key arrives as\n"
+        "the normal Xbox guide button and works without this fix.\n"
+        "This installs a small helper and a systemd service that read that interface\n"
+        "(read-only: nothing is written to the controller) and send the Steam button to\n"
+        "InputPlumber over D-Bus while the key is held, so Steam+button shortcuts work too.\n"
+        f"Files: {templates.XBOX_KEY_HELPER_PATH} and {templates.XBOX_KEY_UNIT_PATH}.\n"
+        "Recommended when InputPlumber's log shows button 25 this boot (press the key\n"
+        "once, then run `sudo oxp3-tool status`). The key always sends the Steam button\n"
+        "here; --xbox-key does not apply to it."
+    )
+    takes_effect = "immediately"
+    UNIT = templates.XBOX_KEY_UNIT_NAME
+
+    def check(self, ctx: Context) -> Check:
+        if ctx.hhd.running:
+            return Check(False, "Handheld Daemon is running and handles the controller instead of InputPlumber")
+        if not ctx.inputplumber.installed:
+            return Check(False, "InputPlumber is not installed")
+        if ctx.oxp_vendor_hidraw is None:
+            return Check(False, "the controller's vendor interface (1a86:fe00, interface 2) was not found")
+        if not ctx.sys.exists("/usr/bin/busctl"):
+            return Check(False, "busctl is not installed")
+        seen = ctx.ip_undecoded_buttons
+        if seen and XBOX_KEY_BUTTON in seen:
+            return Check(True, "InputPlumber logged the Xbox key as button 0x25 this boot, which it cannot read",
+                         recommended=True)
+        return Check(True, "only needed when the Xbox key does nothing; press it once, and if InputPlumber "
+                           "cannot read it this becomes recommended")
+
+    def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
+        return Plan(
+            files=[
+                FileSpec(templates.XBOX_KEY_HELPER_PATH, templates.xbox_key_helper_script().encode(), 0o755),
+                FileSpec(templates.XBOX_KEY_UNIT_PATH, templates.XBOX_KEY_UNIT.encode()),
+            ],
+            enable_units=[self.UNIT],
+            post=[
+                PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units", order=10),
+                PostStep("restart-xbox-key", ["systemctl", "restart", self.UNIT], "start the Xbox key helper",
+                         order=70),
+            ],
+        )
+
+    def after_apply(self, ctx: Context) -> list[str]:
+        state = ctx.unit_state(self.UNIT)
+        if state != "active":
+            return [f"{self.UNIT} is {state or 'not running'}; see `journalctl -u {self.UNIT}`"]
+        return []
+
+    def revert_post(self, ctx: Context) -> list[PostStep]:
+        return [
+            PostStep("stop-xbox-key", ["systemctl", "stop", self.UNIT], "stop the Xbox key helper", order=5),
+            PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units", order=10),
+        ]
+
+    def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
+        state = ctx.unit_state(self.UNIT) or "unknown"
+        line = f"{self.UNIT} is {state}"
+        if state != "active":
+            line += f"; see `journalctl -u {self.UNIT}`"
+        return [line]
 
 
 class VolumeKeysFix(Fix):
@@ -578,10 +669,11 @@ class XePanelReplayFix(_KargFix):
         present = [k for k in self.BAD if ctx.karg_active(k) or ctx.karg_pending(k)]
         if present:
             return Check(False, f"{', '.join(present)} is set; combined with this it blanks the OXP3 screen")
-        psr = ctx.refresh_state.psr_mode
-        if psr and psr.startswith("Panel Replay"):
-            return Check(True, f"PSR mode now: {psr}")
         return Check(True)
+
+    def note(self, ctx: Context) -> list[str]:
+        psr = ctx.refresh_state.psr_mode
+        return [f"PSR mode now: {psr}"] if psr and psr.startswith("Panel Replay") else []
 
 
 class XeHdrBacklightFix(_KargFix):
@@ -648,13 +740,14 @@ class XeDsbFix(_KargFix):
     takes_effect = "after reboot"
     karg = "xe.enable_dsb=0"
 
-    def _check(self, ctx: Context) -> Check:
+    def note(self, ctx: Context) -> list[str]:
         errors = ctx.refresh_state.dsb_errors
-        return Check(True, f"the kernel logged {errors} 'DSB poll error' messages this boot" if errors else "")
+        return [f"the kernel logged {errors} 'DSB poll error' messages this boot"] if errors else []
 
 
 ALL_FIXES: list[Fix] = [
     ButtonsFix(),
+    XboxKeyFix(),
     VolumeKeysFix(),
     GyroFix(),
     InputPlumberSuspendFix(),

@@ -211,8 +211,9 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
         hw.append(f"sleep: {note}")
     released = ctx.atkbd_force_release
     hw.append(f"atkbd force_release: {sorted(released) if released is not None else 'unreadable'}")
-    for line in ctx.refresh_state.summary():
-        hw.append(f"refresh: {line}")
+    if ctx.show_refresh:
+        for line in ctx.refresh_state.summary():
+            hw.append(f"refresh: {line}")
     for param in ("enable_psr", "enable_panel_replay", "enable_psr2_sel_fetch", "enable_dsb", "enable_dc",
                   "enable_dc_balance"):
         v = sys.read_attr(f"/sys/module/xe/parameters/{param}")
@@ -227,7 +228,7 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     for pattern, count, meaning in scan_patterns(kernel_logs):
         findings.append(f"{count:6d}x  /{pattern}/  {meaning}")
     text = "\n".join(findings) or "No known problem patterns in the kernel logs."
-    advice = ctx.refresh_state.advice()
+    advice = ctx.refresh_state.advice() if ctx.show_refresh else []
     if advice:
         text += "\n\nRefresh rate:\n" + "\n".join(f"- {a}" for a in advice)
     bundle.add("findings.txt", text + "\n")

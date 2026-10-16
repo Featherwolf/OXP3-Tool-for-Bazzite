@@ -17,15 +17,21 @@ from typing import Optional
 from .display import (
     DC_BALANCE_PARAM,
     DEBUGFS_DRI,
+    DSB_OFF_KARG,
     KWIN_CONFIG,
     KWIN_CONFIG_MAX,
+    PANEL_REPLAY_OFF_KARG,
+    KwinOutput,
     RefreshState,
     count_dsb_errors,
+    count_psr_errors,
+    dmc_version_from_log,
     parse_crtc_mode,
-    parse_dmc_version,
+    parse_dmc_info,
     parse_fixed_modes,
     parse_kwin_outputs,
     parse_psr_mode,
+    safe_name,
 )
 from .system import System
 
@@ -63,6 +69,8 @@ IP_ETC_CAPABILITY_MAPS = "/etc/inputplumber/capability_maps.d"
 _PRODUCT_RE = re.compile(r"""^\s*product_name:\s*["']?ONEXPLAYER 3["']?\s*(#.*)?$""", re.M)
 _MAP_ID_RE = re.compile(r"""^capability_map_id:\s*["']?([A-Za-z0-9_.-]+)["']?\s*(#.*)?$""", re.M)
 _ID_RE = re.compile(r"""^id:\s*["']?([A-Za-z0-9_.-]+)["']?\s*(#.*)?$""", re.M)
+# InputPlumber 0.82 oxp_hid: "failed to parse B2 report: <err>: [b2 3f 01 01 1f 80 25 ...]" (byte 6 = button id)
+_UNDECODED_RE = re.compile(r"failed to parse B2 report: .*?\[b2 3f(?: [0-9a-f]{2}){4} ([0-9a-f]{2})")
 
 
 def parse_kargs(text: str) -> list[str]:
@@ -563,15 +571,19 @@ class Context:
 
     @cached_property
     def refresh_state(self) -> RefreshState:
-        """Read-only refresh-rate picture: current mode, PSR, display firmware, KWin settings."""
+        """Read-only refresh-rate picture: display mode, PSR, display firmware, KWin settings."""
         st = RefreshState()
+        st.needs_root = self.sys.is_real_root and os.geteuid() != 0
+        st.game_mode = self.has_game_mode
         panel = self.internal_panel
         st.connector = re.sub(r"^card\d+-", "", panel[0]) if panel else None
+        debugfs_read = False
         if st.connector:
             for info in self.sys.glob(f"{DEBUGFS_DRI}/*/i915_display_info"):
                 text = self.sys.read_text(info)
                 if not text or f":{st.connector}]" not in text:
                     continue
+                debugfs_read = True
                 d = info.rsplit("/", 1)[0]
                 st.mode = parse_crtc_mode(text, st.connector)
                 st.fixed_modes = parse_fixed_modes(text, st.connector)
@@ -579,31 +591,63 @@ class Context:
                 if psr is None:
                     psr = self.sys.read_text(f"{d}/i915_edp_psr_status")
                 st.psr_mode = parse_psr_mode(psr) if psr else None
-                st.dmc_version = parse_dmc_version(self.sys.read_text(f"{d}/i915_dmc_info"), "")
+                st.dmc_loaded, st.dmc_version = parse_dmc_info(self.sys.read_text(f"{d}/i915_dmc_info") or "")
                 if st.mode is None:
                     st.debugfs_why = f"no active display pipe drives {st.connector} (screen off?)"
                 break
             else:
-                if self.sys.is_real_root and os.geteuid() != 0:
+                if st.needs_root:
                     st.debugfs_why = "needs root"
                 else:
                     st.debugfs_why = f"no readable i915_display_info for {st.connector} under {DEBUGFS_DRI}"
-        if st.dmc_version is None:
-            st.dmc_version = parse_dmc_version(None, self.kernel_log(0))
+        if st.dmc_version is None and not (debugfs_read and st.dmc_loaded is not None):
+            device = None
+            if panel:
+                pci = self.sys.realpath(f"/sys/class/drm/{panel[0].split('-', 1)[0]}/device")
+                device = pci.rsplit("/", 1)[-1] if pci else None
+            st.dmc_version = dmc_version_from_log(self.kernel_log(0), device)
         if self.xe_loaded:
             st.dc_balance_param = self.sys.exists(DC_BALANCE_PARAM)
-        st.dsb_errors = count_dsb_errors(self.kernel_log(0))
-        users: set[str] = set()
+            # 0400, so only root sees the value; the default is off.
+            st.dc_balance_on = self.sys.read_attr(DC_BALANCE_PARAM) in ("Y", "1")
+        log = self.kernel_log(0)
+        st.dsb_errors = count_dsb_errors(log)
+        st.psr_errors = count_psr_errors(log)
+        st.awaiting_reboot = frozenset(k for k in (DSB_OFF_KARG, PANEL_REPLAY_OFF_KARG)
+                                       if self.karg_pending(k) and not self.karg_active(k))
+        st.panel_replay_blocked = any(self.karg_active(k) or self.karg_pending(k)
+                                      for k in ("xe.enable_psr=0", "xe.enable_psr2_sel_fetch=0"))
+        st.kwin = self._kwin_outputs(panel[1] if panel else None)
+        return st
+
+    @property
+    def show_refresh(self) -> bool:
+        """The refresh checks are written for the OXP3 panel on xe; other panels are skipped."""
+        return bool(self.xe_loaded or self.refresh_state.kwin) and self.panel_is_known is not False
+
+    def _kwin_outputs(self, edid: Optional[EdidInfo]) -> list[KwinOutput]:
+        """KWin's saved settings for the panel; only the invoking user's when they have any."""
+        vendor, product = (edid.vendor, edid.product) if edid else (OXP3_PANEL_VENDOR, OXP3_PANEL_PRODUCT)
+        try:
+            me = int(os.environ.get("SUDO_UID") or os.environ.get("PKEXEC_UID") or os.getuid())
+        except ValueError:
+            me = os.getuid()
+        by_user: dict[str, list[KwinOutput]] = {}
+        mine: list[str] = []
         for home_root in ("/home", "/var/home"):
             for path in self.sys.glob(f"{home_root}/*/{KWIN_CONFIG}"):
-                user = path.split("/")[-3]
-                if user in users:
+                user = safe_name(path.split("/")[-3])
+                if user in by_user:
                     continue
-                users.add(user)
                 data = self.sys.read_regular(path, KWIN_CONFIG_MAX)
-                if data:
-                    st.kwin += parse_kwin_outputs(data, OXP3_PANEL_VENDOR, OXP3_PANEL_PRODUCT)
-        return st
+                by_user[user] = parse_kwin_outputs(data, vendor, product, user) if data else []
+                try:
+                    if os.stat(self.sys.path(path.rsplit("/", 2)[0])).st_uid == me:
+                        mine.append(user)
+                except OSError:
+                    pass
+        users = [u for u in mine if by_user[u]] or list(by_user)
+        return [out for u in users for out in by_user[u]]
 
     # -- Game Mode -------------------------------------------------------
 
@@ -663,6 +707,26 @@ class Context:
                 text = self.sys.read_attr(f"{serio}/force_release")
                 if text is not None:
                     return parse_ranges(text)
+        return None
+
+    @cached_property
+    def oxp_vendor_hidraw(self) -> Optional[str]:
+        """/dev node of the controller MCU's vendor interface (1a86:fe00 interface 2)."""
+        from .xbox_helper import find_hidraw
+
+        found = find_hidraw(str(self.sys.root))
+        if found is None:
+            return None
+        return "/" + os.path.relpath(found, str(self.sys.root))
+
+    @cached_property
+    def ip_undecoded_buttons(self) -> Optional[set[int]]:
+        """Vendor button ids InputPlumber logged this boot as undecodable; None if the log is unreadable."""
+        res = self.sys.run(["journalctl", "-u", "inputplumber.service", "-b", "0", "--no-pager", "-o", "cat",
+                            "--grep", "failed to parse B2 report", "-n", "500"], timeout=60)
+        found = {int(m.group(1), 16) for m in _UNDECODED_RE.finditer(res.stdout)}
+        if found or res.returncode in (0, 1):
+            return found
         return None
 
     @cached_property

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional
 
 from . import PROJECT_URL
@@ -129,6 +130,50 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnONE-NETBOOK:pnONEXPLAYER3:*
 
 # Scancodes 0xae and 0xb0 as listed in atkbd's force_release attribute.
 VOLUME_SCANCODES = {0xAE, 0xB0}
+
+
+# -- Xbox key helper -------------------------------------------------------------
+
+XBOX_KEY_HELPER_PATH = "/usr/local/libexec/oxp3-tool/xbox-key-helper"
+XBOX_KEY_UNIT_NAME = "oxp3-tool-xbox-key.service"
+XBOX_KEY_UNIT_PATH = f"/etc/systemd/system/{XBOX_KEY_UNIT_NAME}"
+
+
+def xbox_key_helper_script() -> str:
+    """The standalone helper script: oxp3_tool/xbox_helper.py behind a shebang and our marker."""
+    from . import xbox_helper
+
+    return (
+        "#!/usr/bin/python3 -I\n"
+        f"# Installed by oxp3-tool ({PROJECT_URL}).\n"
+        "# Remove with `sudo oxp3-tool revert xbox-key`.\n"
+        + inspect.getsource(xbox_helper)
+    )
+
+
+XBOX_KEY_UNIT = f"""\
+# Installed by oxp3-tool ({PROJECT_URL}).
+# Remove with `sudo oxp3-tool revert xbox-key`.
+#
+# Reads the ONEXPLAYER 3 controller's vendor interface (read-only) and sends the
+# Steam button to InputPlumber when the Xbox key reports as button 0x25.
+[Unit]
+Description=ONEXPLAYER 3 Xbox key as the Steam button (oxp3-tool)
+After=inputplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I {XBOX_KEY_HELPER_PATH}
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
 
 
 # -- modprobe: IMU -------------------------------------------------------------
