@@ -201,9 +201,9 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     hw.append(f"iio devices: {', '.join(ctx.iio_names) or 'none'}")
     hw.append(f"{IMU_I2C_DEVICE}: present={ctx.imu_present} driver={ctx.imu_driver}")
     hw.append(f"hid-oxp devices: {', '.join(ctx.hid_oxp_devices) or 'none'}")
-    caps = ctx.edp_caps
+    caps, why = ctx.edp_probe
     hw.append(f"eDP DPCD: {caps.aux_device}: {caps.describe()} (tcon caps {caps.tcon.hex()}, edp rev {caps.edp_rev})"
-              if caps else "eDP DPCD: not readable (needs root and /dev/drm_dp_aux*)")
+              if caps else f"eDP DPCD: not checked: {why}")
     for note in ctx.resume_evidence.lines():
         hw.append(f"sleep: {note}")
     released = ctx.atkbd_force_release

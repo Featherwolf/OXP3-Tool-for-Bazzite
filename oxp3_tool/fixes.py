@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import templates
-from .detect import IP_ETC_CAPABILITY_MAPS, OGUI, Context
+from .detect import IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
 
 CONTROLLER = "controller"
 DISPLAY = "display"
@@ -250,10 +250,11 @@ class ButtonsFix(Fix):
             )
         if ip.effective_map and override and ip.effective_map != override:
             lines.append(f"warning: InputPlumber loads {ip.effective_map} instead of this override")
-        written_for = entry.get("notes", {}).get("game_mode_input")
-        if "game_mode_input" in entry.get("notes", {}) and written_for != ctx.game_mode_input:
-            lines.append("Game Mode input changed since this was applied (OpenGamepadUI overlay or native "
-                         "Steam Input); run `sudo oxp3-tool apply buttons` again")
+        # Maps written before the tool knew about the overlay were native-Steam-Input maps.
+        written_for = entry.get("notes", {}).get("game_mode_input", NATIVE_STEAM)
+        if ctx.game_mode_input is not None and written_for != ctx.game_mode_input:
+            lines.append("this map was written for a different Game Mode input (OpenGamepadUI overlay or native "
+                         "Steam Input, or an older oxp3-tool); run `sudo oxp3-tool apply buttons` again")
         if restart_pending(ctx, entry.get("notes", {})):
             lines.append("InputPlumber has not been restarted since; reboot or run `sudo oxp3-tool apply buttons`")
         return lines

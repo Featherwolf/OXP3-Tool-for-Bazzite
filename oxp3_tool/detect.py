@@ -539,7 +539,8 @@ class Context:
                 if oui is None or tcon is None or rev is None:
                     return None, f"reading the panel's DPCD through {dev} failed"
                 if oui != INTEL_SOURCE_OUI:
-                    return None, "the panel does not carry Intel's source OUI right now; check again later"
+                    return None, (f"the panel does not carry Intel's source OUI right now (reads {oui.hex()}); "
+                                  "check again later")
                 return EdpCaps(dev, rev[0], tcon), ""
         return None, "no DP AUX device for the eDP panel (/dev/drm_dp_aux*)"
 

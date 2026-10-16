@@ -174,9 +174,32 @@ class GameModeSessionTest(Base):
         self.apply(["buttons"])
         self.f.write("/var/home/gamer/.config/gamescope-session-plus/sessions.d/ogui-steam", "x\n")
         rc, status, _ = self.cli("status")
-        self.assertIn("Game Mode input changed", status)
+        self.assertIn("written for a different Game Mode input", status)
         self.apply(["buttons"])
         self.assertEqual(self.maps()["Keyboard"], "Keyboard")
+
+
+class OlderStateTest(Base):
+    def test_map_from_older_version_is_flagged_under_ogui(self):
+        self.fake()
+        self.f.ogui_overlay()
+        self.apply(["buttons"])
+        import json
+        from oxp3_tool.state import STATE_FILE
+        data = json.loads(self.read(STATE_FILE))
+        del data["fixes"]["buttons"]["notes"]["game_mode_input"]  # written before session detection
+        self.f.write(STATE_FILE, json.dumps(data))
+        rc, out, _ = self.cli("status")
+        self.assertIn("written for a different Game Mode input", out)
+
+    def test_diagnose_explains_unchecked_panel(self):
+        self.fake()
+        self.f.panel_dpcd()
+        self.f.write("/sys/class/drm/card1-eDP-1/dpms", "Off\n")
+        from oxp3_tool import diagnose
+        from oxp3_tool.detect import Context
+        bundle, _ = diagnose.collect(Context(self.f.system()), "status")
+        self.assertIn(b"eDP DPCD: not checked: the panel is off", bundle.files["hardware.txt"])
 
 
 @unittest.skipIf(yaml is None, "PyYAML not installed")
