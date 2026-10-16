@@ -663,10 +663,11 @@ class Context:
     @cached_property
     def gamescope_known_display(self) -> Optional[str]:
         """The gamescope display profile Game Mode used this boot ("Got known display: <name>"), if logged."""
-        res = self.sys.run(["journalctl", "-b", "0", "--no-pager", "-q", "-o", "cat",
-                            "--grep", "Got known display", "-n", "20"], timeout=60)
+        # -r -n 1: only the newest match (journalctl stops at the first one).
+        res = self.sys.run(["journalctl", "-b", "0", "-r", "-n", "1", "--no-pager", "-q", "-o", "cat",
+                            "--grep", "Got known display"], timeout=60)
         found = _KNOWN_DISPLAY_RE.findall(res.stdout)
-        return found[-1] if found else None
+        return found[0] if found else None
 
     # -- Game Mode -------------------------------------------------------
 

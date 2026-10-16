@@ -150,6 +150,10 @@ class FakeRunner:
         if cmd == "journalctl" and "--grep" in argv and "-u" not in argv:
             pattern = argv[argv.index("--grep") + 1]
             lines = [ln for ln in self.session_journal.splitlines() if pattern in ln]
+            if "-r" in argv:
+                lines.reverse()
+            if "-n" in argv:
+                lines = lines[:int(argv[argv.index("-n") + 1])]
             return CommandResult(0 if lines else 1, "".join(ln + "\n" for ln in lines))
         if cmd == "journalctl" and "inputplumber.service" in argv:
             pattern = argv[argv.index("--grep") + 1] if "--grep" in argv else ""

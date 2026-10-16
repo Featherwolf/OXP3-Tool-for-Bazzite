@@ -176,19 +176,9 @@ WantedBy=multi-user.target
 """
 
 
-# -- gamescope HDR switch ----------------------------------------------------------
-
+# Table key of oxp3-tool's known display in the gamescope Lua (gamescope logs
+# "Got known display: <key> (<pretty name>)" when it picks one).
 OLED_DISPLAY_KEY = "oxp3_tool_sdc_oled"
-GAMESCOPE_HDR_ENV = "/etc/environment.d/90-oxp3-tool-gamescope-hdr.conf"
-GAMESCOPE_HDR_CONF = f"""\
-# Installed by oxp3-tool ({PROJECT_URL}).
-# Remove with `sudo oxp3-tool revert gamescope-hdr`, then restart Game Mode.
-#
-# gamescope-session-plus starts gamescope with --hdr-enabled only when this is
-# set, and Steam offers Settings > Display > HDR only then. oxp3-tool's
-# oled-profile keeps the ONEXPLAYER 3 panel in gamma 2.2 mode while HDR is on.
-ENABLE_GAMESCOPE_HDR=1
-"""
 
 
 # -- modprobe: IMU -------------------------------------------------------------
