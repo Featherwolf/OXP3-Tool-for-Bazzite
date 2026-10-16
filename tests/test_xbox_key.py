@@ -225,6 +225,16 @@ class ButtonsAdviceTest(unittest.TestCase):
         _, out = self.cli("status")
         self.assertIn("OpenGamepadUI issue #549", out)
 
+    def test_steam_screen_reader_warning(self):
+        self.cli("apply", "--yes", "buttons")
+        vdf = "/var/home/jordan/.local/share/Steam/config/config.vdf"
+        self.f.write(vdf, '"InstallConfigStore"\n{\n\t"ScreenReaderEnabled"\t\t"0"\n}\n')
+        _, out = self.cli("status")
+        self.assertNotIn("screen reader", out)
+        self.f.write(vdf, '"InstallConfigStore"\n{\n\t"ScreenReaderEnabled"\t\t"1"\n}\n')
+        _, out = self.cli("status")
+        self.assertIn("warning: Steam's screen reader is on for jordan", out)
+
     def test_native_apply_says_reboot(self):
         rc, out = self.cli("apply", "--yes", "buttons")
         self.assertEqual(rc, 0)

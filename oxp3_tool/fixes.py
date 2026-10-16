@@ -271,6 +271,9 @@ class ButtonsFix(Fix):
                          "Steam Input, or an older oxp3-tool); run `sudo oxp3-tool apply buttons` again")
         if restart_pending(ctx, entry.get("notes", {})):
             lines.append("InputPlumber has not been restarted since; reboot or run `sudo oxp3-tool apply buttons`")
+        for user in ctx.steam_screen_reader_users:
+            lines.append(f"warning: Steam's screen reader is on for {user}; it replaces the Steam button shortcuts "
+                         "(Steam+X keyboard, Steam+R1 screenshot). See README > Common problems to turn it off")
         if ctx.game_mode_input == OGUI and written_for == OGUI and actions.get("keyboard") == "keyboard":
             lines.append("under the OpenGamepadUI overlay the keyboard key's Steam+X shortcut often does nothing "
                          "(OpenGamepadUI issue #549); for a working on-screen keyboard switch to native Steam Input "

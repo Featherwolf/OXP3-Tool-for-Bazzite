@@ -69,6 +69,9 @@ IP_ETC_CAPABILITY_MAPS = "/etc/inputplumber/capability_maps.d"
 _PRODUCT_RE = re.compile(r"""^\s*product_name:\s*["']?ONEXPLAYER 3["']?\s*(#.*)?$""", re.M)
 _MAP_ID_RE = re.compile(r"""^capability_map_id:\s*["']?([A-Za-z0-9_.-]+)["']?\s*(#.*)?$""", re.M)
 _ID_RE = re.compile(r"""^id:\s*["']?([A-Za-z0-9_.-]+)["']?\s*(#.*)?$""", re.M)
+STEAM_CONFIG_VDF = ".local/share/Steam/config/config.vdf"
+STEAM_CONFIG_VDF_MAX = 16 * 1024 * 1024
+_SCREEN_READER_RE = re.compile(rb'"ScreenReaderEnabled"\s+"1"')
 # gamescope DRM backend: "Got known display: <key> (<pretty name>)"
 _KNOWN_DISPLAY_RE = re.compile(r"Got known display: ([A-Za-z0-9_.-]+) \(")
 # InputPlumber 0.82 oxp_hid: "failed to parse B2 report: <err>: [b2 3f 01 01 1f 80 25 ...]" (byte 6 = button id)
@@ -668,6 +671,21 @@ class Context:
                             "--grep", "Got known display"], timeout=60)
         found = _KNOWN_DISPLAY_RE.findall(res.stdout)
         return found[0] if found else None
+
+    @cached_property
+    def steam_screen_reader_users(self) -> list[str]:
+        """Users whose Steam has its screen reader on: it replaces the Steam button
+        chords (Steam+X keyboard, Steam+R1 screenshot) with screen-reader controls."""
+        users = []
+        for home_root in ("/home", "/var/home"):
+            for path in self.sys.glob(f"{home_root}/*/{STEAM_CONFIG_VDF}"):
+                user = safe_name(path.split("/")[-6])
+                if user in users:
+                    continue
+                data = self.sys.read_regular(path, STEAM_CONFIG_VDF_MAX)
+                if data and _SCREEN_READER_RE.search(data):
+                    users.append(user)
+        return users
 
     # -- Game Mode -------------------------------------------------------
 
