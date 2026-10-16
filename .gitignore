@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 oxp3-diagnose-*.tar.gz
+dist/*.tmp

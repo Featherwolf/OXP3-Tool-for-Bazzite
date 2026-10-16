@@ -1,0 +1,26 @@
+name: Release
+
+# Push a tag such as v0.1.0 to publish dist/oxp3-tool as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check that dist/ matches the sources
+        run: python -m unittest tests.test_dist -v
+      - name: Check the version matches the tag
+        run: test "$(python3 dist/oxp3-tool --version)" = "oxp3-tool ${GITHUB_REF_NAME#v}"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/oxp3-tool dist/oxp3-tool.sha256 get.sh uninstall.sh --generate-notes

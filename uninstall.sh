@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # Remove oxp3-tool from /usr/local. Revert its fixes first:
 #   sudo oxp3-tool revert --all
-#   sudo ./uninstall.sh
+#   curl -fsSL https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/uninstall.sh | sudo bash
+# (or `sudo ./uninstall.sh` from the source tree). --keep-fixes removes only
+# the program and leaves applied fixes in place.
 set -euo pipefail
 
 PREFIX="${PREFIX:-/usr/local}"
 DEST="$PREFIX/lib/oxp3-tool"
 BIN="$PREFIX/bin/oxp3-tool"
+DESKTOP="$PREFIX/share/applications/oxp3-tool.desktop"
 STATE=/var/lib/oxp3-tool/state.json
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Run this with sudo: sudo $0" >&2
+    echo "Run this as root (with sudo)." >&2
     exit 1
 fi
 
@@ -22,11 +25,11 @@ fi
 if [[ -f "$STATE" && "${1:-}" != "--keep-fixes" ]]; then
     echo "Some fixes are still applied (see: oxp3-tool status)." >&2
     echo "Revert them first with: sudo oxp3-tool revert --all" >&2
-    echo "or run '$0 --keep-fixes' to remove only the program." >&2
+    echo "or pass --keep-fixes to remove only the program." >&2
     exit 1
 fi
 
-rm -f "$BIN"
+rm -f "$BIN" "$DESKTOP"
 rm -rf "$DEST"
 
 # Keep anything revert left for the user (backups of their own files,

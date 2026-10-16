@@ -6,23 +6,45 @@ It checks what your machine needs and shows the exact changes before making them
 
 > **Status: untested on real hardware.** Every fix is based on bugs reported by OXP3 owners on Bazzite, SteamOS and CachyOS, checked against the source of the kernel, InputPlumber and gamescope that Bazzite ships (October 2026). Please report what works and what doesn't, attaching the archive from `oxp3-tool diagnose`.
 
-## Quick start
+## Install
+
+In Desktop Mode, open **Konsole** and paste:
 
 ```bash
-git clone https://github.com/Featherwolf/OXP3-Tool-for-Bazzite.git
-cd OXP3-Tool-for-Bazzite
-sudo ./install.sh           # optional: installs to /usr/local (writable on Bazzite)
+curl -fsSL https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/get.sh | sudo bash
+```
 
-oxp3-tool status            # what was detected and what each fix would do
-sudo oxp3-tool apply        # apply the recommended fixes (asks first)
+This downloads the tool (one file, about 40 KB), checks it, and installs it as `/usr/local/bin/oxp3-tool`. That location is writable on Bazzite and survives OS updates. It also adds **OXP3 Tool** to the app menu, which opens Konsole, shows the status and offers the recommended fixes. Run the same command again to update.
+
+Then:
+
+```bash
+sudo oxp3-tool status       # what was detected and what each fix would do
+sudo oxp3-tool apply        # apply the recommended fixes (shows the plan, asks first)
 systemctl reboot            # kernel arguments take effect at boot
 ```
 
 Reboot before you install a system update. A Bazzite update installed first is built from the kernel arguments the system booted with, so it drops the change. `oxp3-tool status` notices this, and running `apply` (or `revert`) again fixes it.
 
-You can also run it from the source folder without installing it: `sudo ./bin/oxp3-tool apply`.
+### Other ways to get it
 
-Run it in Desktop Mode (Konsole) or over SSH. The only requirement is Python 3, which Bazzite already includes. Run `status` with `sudo` too: reading the panel's capabilities and the kernel logs needs root.
+- **Run it without installing.** Download the single file and run it with Python:
+  ```bash
+  curl -fsSLO https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/dist/oxp3-tool
+  sudo python3 oxp3-tool status
+  ```
+  You can also open [`dist/oxp3-tool`](dist/oxp3-tool) on GitHub, click "Download raw file", and run `sudo python3 ~/Downloads/oxp3-tool status`.
+- **From a clone or the "Download ZIP" button:** `sudo ./install.sh` installs it the same way, and `sudo ./bin/oxp3-tool status` runs it in place.
+- **From a release:** once a version is tagged, [Releases](https://github.com/Featherwolf/OXP3-Tool-for-Bazzite/releases) has the same file.
+
+The only requirement is Python 3, which Bazzite already includes. Use `sudo` for `status` too: reading the panel's capabilities and the kernel logs needs root.
+
+### Uninstall
+
+```bash
+sudo oxp3-tool revert --all         # undo every fix, then reboot if kernel arguments were removed
+curl -fsSL https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/uninstall.sh | sudo bash
+```
 
 ## Common problems
 
@@ -106,12 +128,12 @@ These were ruled out because they break things on this hardware or on Bazzite:
 
 ## Files and state
 
-- Program (when installed): `/usr/local/lib/oxp3-tool`, `/usr/local/bin/oxp3-tool`
+- Program (when installed): `/usr/local/bin/oxp3-tool`, plus the app menu entry `/usr/local/share/applications/oxp3-tool.desktop`
 - Record of applied changes: `/var/lib/oxp3-tool/state.json`
 - Backups of any file it replaced: `/var/lib/oxp3-tool/backups/`
 - Copies of files you edited before a revert: `/var/lib/oxp3-tool/modified/`
 
-To uninstall, run `sudo oxp3-tool revert --all`, reboot if kernel arguments were removed, then `sudo ./uninstall.sh`. `uninstall.sh` leaves `/var/lib/oxp3-tool` in place if it still holds copies of your files.
+`uninstall.sh` (see [Uninstall](#uninstall)) leaves `/var/lib/oxp3-tool` in place if it still holds copies of your files.
 
 ## Background
 
@@ -132,4 +154,6 @@ The tests run every fix against a fake OXP3 filesystem with a simulated `rpm-ost
 - If `systemd-hwdb` is installed, the hwdb entry is compiled and queried with the real OXP3 DMI modalias.
 - If `OXP3_IP_CAPABILITY_MAP_SCHEMA` points to InputPlumber's `capability_map_v1.json`, the generated maps are validated against it.
 
-CI runs all of these. `oxp3-tool --root DIR` runs against a fake root with commands simulated.
+CI runs all of these when started from the Actions tab (it is manual while the account has no Actions minutes). `oxp3-tool --root DIR` runs against a fake root with commands simulated.
+
+`dist/oxp3-tool` is the downloadable single-file build of `oxp3_tool/`. After changing the code, rebuild it with `python3 tools/build_zipapp.py`; a test fails while it is out of date. To publish a release, bump `__version__` in `oxp3_tool/__init__.py`, rebuild, and push a tag such as `v0.1.0`. The Release workflow then attaches the file. Without Actions minutes, create the release on GitHub by hand and attach `dist/oxp3-tool` and `dist/oxp3-tool.sha256`.

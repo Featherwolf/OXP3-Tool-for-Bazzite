@@ -36,7 +36,7 @@ jobs:
       - name: Lint
         run: |
           ruff check .
-          shellcheck install.sh uninstall.sh
+          shellcheck get.sh install.sh uninstall.sh
       - name: Install smoke test
         run: |
           prefix="$(mktemp -d)"
