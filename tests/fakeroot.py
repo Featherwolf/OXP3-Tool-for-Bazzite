@@ -159,6 +159,8 @@ class FakeRunner:
             pattern = argv[argv.index("--grep") + 1] if "--grep" in argv else ""
             lines = [ln for ln in self.ip_journal.splitlines() if pattern in ln]
             return CommandResult(0 if lines else 1, "".join(ln + "\n" for ln in lines))
+        if cmd == "journalctl":
+            return CommandResult(1)  # other units: nothing logged
         if cmd == "modinfo":
             if argv[-1] == "bmi270_i2c":
                 return CommandResult(0, self.bmi270_aliases)
@@ -201,7 +203,10 @@ class FakeRunner:
             self.unit_enabled[args[1]] = "enabled"
             return CommandResult(0)
         if verb == "disable":
-            self.unit_enabled[args[1]] = "disabled"
+            unit = args[-1]
+            self.unit_enabled[unit] = "disabled"
+            if "--now" in args:
+                self.unit_active[unit] = "inactive"
             return CommandResult(0)
         if verb in ("start", "restart"):
             self.unit_active[args[1]] = "active"
@@ -250,7 +255,7 @@ class FakeOxp3:
         self.write("/proc/sys/kernel/osrelease", "7.2.9-ogc3.1.fc44.x86_64\n")
         self.write("/proc/cmdline", " ".join(self.runner.kargs) + "\n")
         self.write("/sys/power/mem_sleep", "[s2idle]\n")
-        for tool in ("rpm-ostree", "systemctl", "systemd-hwdb", "udevadm", "rpm"):
+        for tool in ("rpm-ostree", "systemctl", "systemd-hwdb", "udevadm", "rpm", "busctl"):
             self.write(f"/usr/bin/{tool}", "")
         if inputplumber:
             self.write("/usr/bin/inputplumber", "")

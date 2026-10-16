@@ -204,7 +204,7 @@ def cmd_list(ctx: Context, state: State, args: argparse.Namespace) -> int:
         _out()
     _out("Button actions for --onex-key, --keyboard-key, --home and --xbox-key:")
     for name, (_, _, desc) in templates.BUTTON_ACTIONS.items():
-        _out(f"  {name:<13} {desc}")
+        _out(f"  {name:<15} {desc}")
     return 0
 
 

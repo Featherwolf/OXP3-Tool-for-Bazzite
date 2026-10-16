@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import templates, xbox_helper
+from . import osk_helper, templates, xbox_helper
 from .detect import IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
 from .system import sha256_bytes
 
@@ -142,6 +142,28 @@ def _restart_inputplumber() -> PostStep:
                     "restart InputPlumber so it loads the capability map", order=60)
 
 
+def _daemon_reload() -> PostStep:
+    return PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units", order=10)
+
+
+def _helper_live_state(ctx: Context, entry: Optional[dict[str, Any]], unit: str, failed: str, warning: str,
+                       wanted: dict[str, bytes], fix_id: str) -> list[str]:
+    """Status of a helper service: unit state, delivery failures this boot, stale files."""
+    state = ctx.unit_state(unit) or "unknown"
+    line = f"{unit} is {state}"
+    if state != "active":
+        line += f"; see `journalctl -u {unit}`"
+    lines = [line]
+    res = ctx.sys.run(["journalctl", "-u", unit, "-b", "0", "--no-pager", "-q", "-o", "cat",
+                       "--grep", failed, "-n", "1"], timeout=30)
+    if failed in res.stdout:
+        lines.append(f"warning: {warning} this boot; see `journalctl -u {unit}`")
+    recorded = {r["path"]: r.get("sha256") for r in (entry or {}).get("files", [])}
+    if any(recorded.get(p) == ctx.sys.sha256(p) != sha256_bytes(c) for p, c in wanted.items()):
+        lines.append(f"installed by an older oxp3-tool; run `sudo oxp3-tool apply {fix_id}` to update it")
+    return lines
+
+
 # -- controller ----------------------------------------------------------------
 
 
@@ -162,8 +184,13 @@ class ButtonsFix(Fix):
         "Defaults: ONEX/console -> Quick Access, keyboard key -> Steam on-screen keyboard,\n"
         "home -> Steam menu, Xbox key -> Steam menu (as stock). Choose others with\n"
         "--onex-key, --keyboard-key, --home and --xbox-key (guide, quick-access, keyboard,\n"
-        "screenshot, ogui-menu). Check each key with `inputplumber device 0 test` (press q\n"
-        "to quit; closing the window instead leaves InputPlumber in test mode until\n"
+        "keyboard-chord, screenshot, ogui-menu).\n"
+        "With native Steam Input the keyboard action skips Steam's Steam+X shortcut,\n"
+        "which does nothing on some setups: a small helper service\n"
+        f"({templates.OSK_KEY_UNIT_NAME}) asks Steam directly to open its keyboard\n"
+        "(steam://open/keyboard, as HHD does). keyboard-chord sends Steam+X instead.\n"
+        "Check each key with `inputplumber device 0 test` (press q to quit; closing the\n"
+        "window instead leaves InputPlumber in test mode until\n"
         "`sudo systemctl restart inputplumber`). Your choice is kept when you apply again\n"
         "(--defaults resets it). Apply again after `ujust configure-opengamepadui` switches\n"
         "Game Mode input. The override replaces the whole stock map, so it is only\n"
@@ -171,6 +198,7 @@ class ButtonsFix(Fix):
         "InputPlumber is restarted."
     )
     takes_effect = "immediately (InputPlumber restarts; restart Steam if buttons do nothing)"
+    OSK_UNIT = templates.OSK_KEY_UNIT_NAME
 
     def check(self, ctx: Context) -> Check:
         hhd = ctx.hhd
@@ -242,10 +270,39 @@ class ButtonsFix(Fix):
                 f"The stock map differs from the 0.82.0 one this override was written for; compare with "
                 f"`diff {ip.upstream_map} {IP_ETC_CAPABILITY_MAPS}/{upstream_name}`."
             )
+        if any(templates.uses_osk_helper(a, session) for a in actions.values()):
+            if not ctx.sys.exists(osk_helper.BUSCTL):
+                raise FixError(f"{osk_helper.BUSCTL} is missing, which the on-screen keyboard helper needs; "
+                               "choose keyboard-chord for that key instead")
+            plan.files += [
+                FileSpec(templates.OSK_KEY_HELPER_PATH, templates.osk_key_helper_script().encode(), 0o755),
+                FileSpec(templates.OSK_KEY_UNIT_PATH, templates.OSK_KEY_UNIT.encode()),
+            ]
+            plan.enable_units.append(self.OSK_UNIT)
+            plan.post += [
+                _daemon_reload(),
+                PostStep("restart-osk-key", ["systemctl", "restart", self.OSK_UNIT],
+                         "start the on-screen keyboard helper", order=70),
+            ]
         return plan
 
+    def after_apply(self, ctx: Context) -> list[str]:
+        if not ctx.sys.exists(templates.OSK_KEY_UNIT_PATH):
+            return []
+        state = ctx.unit_state(self.OSK_UNIT)
+        if state != "active":
+            return [f"{self.OSK_UNIT} is {state or 'not running'}; see `journalctl -u {self.OSK_UNIT}`"]
+        return []
+
     def revert_post(self, ctx: Context) -> list[PostStep]:
-        return [_restart_inputplumber()]
+        steps = [_restart_inputplumber()]
+        if ctx.unit_state(self.OSK_UNIT) in ("active", "activating", "reloading"):
+            steps += [
+                PostStep("stop-osk-key", ["systemctl", "stop", self.OSK_UNIT],
+                         "stop the on-screen keyboard helper", order=5),
+                _daemon_reload(),
+            ]
+        return steps
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
         lines = []
@@ -271,10 +328,17 @@ class ButtonsFix(Fix):
                          "Steam Input, or an older oxp3-tool); run `sudo oxp3-tool apply buttons` again")
         if restart_pending(ctx, entry.get("notes", {})):
             lines.append("InputPlumber has not been restarted since; reboot or run `sudo oxp3-tool apply buttons`")
+        if any(r.get("path") == templates.OSK_KEY_UNIT_PATH for r in entry.get("files", [])):
+            lines += _helper_live_state(
+                ctx, entry, self.OSK_UNIT, osk_helper.SEND_FAILED,
+                "Steam did not take the keyboard request",
+                {templates.OSK_KEY_HELPER_PATH: templates.osk_key_helper_script().encode(),
+                 templates.OSK_KEY_UNIT_PATH: templates.OSK_KEY_UNIT.encode()}, "buttons")
         for user in ctx.steam_screen_reader_users:
             lines.append(f"warning: Steam's screen reader is on for {user}; it replaces the Steam button shortcuts "
                          "(Steam+X keyboard, Steam+R1 screenshot). See README > Common problems to turn it off")
-        if ctx.game_mode_input == OGUI and written_for == OGUI and actions.get("keyboard") == "keyboard":
+        if ctx.game_mode_input == OGUI and written_for == OGUI and \
+                actions.get("keyboard") in (templates.OSK_ACTION, "keyboard-chord"):
             lines.append("under the OpenGamepadUI overlay the keyboard key's Steam+X shortcut often does nothing "
                          "(OpenGamepadUI issue #549); for a working on-screen keyboard switch to native Steam Input "
                          "(`ujust configure-opengamepadui disable`, reboot, `sudo oxp3-tool apply buttons`)")
@@ -334,7 +398,7 @@ class XboxKeyFix(Fix):
             ],
             enable_units=[self.UNIT],
             post=[
-                PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units", order=10),
+                _daemon_reload(),
                 PostStep("restart-xbox-key", ["systemctl", "restart", self.UNIT], "start the Xbox key helper",
                          order=70),
             ],
@@ -350,26 +414,15 @@ class XboxKeyFix(Fix):
     def revert_post(self, ctx: Context) -> list[PostStep]:
         return [
             PostStep("stop-xbox-key", ["systemctl", "stop", self.UNIT], "stop the Xbox key helper", order=5),
-            PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units", order=10),
+            _daemon_reload(),
         ]
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
-        state = ctx.unit_state(self.UNIT) or "unknown"
-        line = f"{self.UNIT} is {state}"
-        if state != "active":
-            line += f"; see `journalctl -u {self.UNIT}`"
-        lines = [line]
-        res = ctx.sys.run(["journalctl", "-u", self.UNIT, "-b", "0", "--no-pager", "-q", "-o", "cat",
-                           "--grep", xbox_helper.SEND_FAILED, "-n", "1"], timeout=30)
-        if xbox_helper.SEND_FAILED in res.stdout:
-            lines.append("warning: the helper could not deliver the Xbox key to InputPlumber this boot; "
-                         f"see `journalctl -u {self.UNIT}`")
-        wanted = {templates.XBOX_KEY_HELPER_PATH: templates.xbox_key_helper_script().encode(),
-                  templates.XBOX_KEY_UNIT_PATH: templates.XBOX_KEY_UNIT.encode()}
-        recorded = {r["path"]: r.get("sha256") for r in (entry or {}).get("files", [])}
-        if any(recorded.get(p) == ctx.sys.sha256(p) != sha256_bytes(c) for p, c in wanted.items()):
-            lines.append("installed by an older oxp3-tool; run `sudo oxp3-tool apply xbox-key` to update it")
-        return lines
+        return _helper_live_state(
+            ctx, entry, self.UNIT, xbox_helper.SEND_FAILED,
+            "the helper could not deliver the Xbox key to InputPlumber",
+            {templates.XBOX_KEY_HELPER_PATH: templates.xbox_key_helper_script().encode(),
+             templates.XBOX_KEY_UNIT_PATH: templates.XBOX_KEY_UNIT.encode()}, self.id)
 
 
 class VolumeKeysFix(Fix):

@@ -217,6 +217,9 @@ class Engine:
         for unit in plan.enable_units:
             if self.ctx.unit_enabled(unit) != "enabled":
                 lines.append(f"enable {unit}")
+        for unit in (entry or {}).get("units_enabled", []):
+            if unit not in plan.enable_units:
+                lines.append(f"stop and disable {unit}")
         old_opts = (entry or {}).get("options", {})
         for key, value in plan.options.items():
             if entry and old_opts.get(key) != value:
@@ -256,12 +259,15 @@ class Engine:
         done: list[Fix] = []
         for fix, plan in todo:
             try:
-                self._apply_local(fix, plan)
+                dropped = self._apply_local(fix, plan)
             except OSError as e:
                 outcome.ok = False
                 outcome.errors.append(f"{fix.id}: {e}")
                 continue
             outcome.changed = True
+            if dropped:
+                post.append(PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units",
+                                     order=10))
             post += plan.post
             outcome.messages += plan.messages
             done.append(fix)
@@ -277,12 +283,17 @@ class Engine:
         outcome.messages = self.notes + outcome.messages
         return outcome
 
-    def _apply_local(self, fix: Fix, plan: Plan) -> None:
-        """Write files and enable units for one fix, recording each change first."""
+    def _apply_local(self, fix: Fix, plan: Plan) -> bool:
+        """Write files and enable units for one fix, recording each change first.
+
+        Returns whether a unit enabled by an earlier apply was dropped (systemd needs a reload).
+        """
         existing = self.state.get(fix.id)
         entry = self.state.entry(fix.id)
         entry.pop("reverted", None)
         try:
+            # Units first: disabling needs a unit file this fix may be about to remove.
+            dropped = self._drop_units(plan, entry)
             self._apply_files(fix, plan, entry)
             self._apply_units(plan, entry)
         except OSError:
@@ -295,6 +306,17 @@ class Engine:
         if not plan.kargs:
             self.state.stamp(fix.id)
         self.state.save()
+        return dropped
+
+    def _drop_units(self, plan: Plan, entry: dict) -> bool:
+        """Stop and disable units an earlier apply enabled that ``plan`` no longer wants."""
+        dropped = False
+        for unit in [u for u in entry["units_enabled"] if u not in plan.enable_units]:
+            self._disable_unit(unit, now=True)
+            entry["units_enabled"].remove(unit)
+            self.state.save()
+            dropped = True
+        return dropped
 
     def _apply_files(self, fix: Fix, plan: Plan, entry: dict) -> None:
         planned = {s.path for s in plan.files}
@@ -455,10 +477,10 @@ class Engine:
             self.ctx.karg_pending(k) for k in entry.get("kargs_removal_pending", [])
         )
 
-    def _disable_unit(self, unit: str) -> None:
-        res = self.sys.run(["systemctl", "disable", unit], timeout=60)
+    def _disable_unit(self, unit: str, now: bool = False) -> None:
+        res = self.sys.run(["systemctl", "disable", *(["--now"] if now else []), unit], timeout=60)
         if res.ok:
-            self.out(f"  disabled {unit}")
+            self.out(f"  {'stopped and ' if now else ''}disabled {unit}")
             return
         if self.ctx.unit_enabled(unit) != "enabled" and not self.ctx.unit_file_exists(unit):
             self.notes.append(f"{unit} is no longer installed; nothing to disable")

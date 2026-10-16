@@ -47,9 +47,31 @@ class CapabilityMapTest(unittest.TestCase):
             [e["keyboard"] for e in by_name["Keyboard"]["source_events"]],
             ["KeyLeftCtrl", "KeyLeftMeta", "KeyO"],
         )
-        self.assertEqual(by_name["Keyboard"]["target_event"], {"gamepad": {"button": "Keyboard"}})
+        # Native Steam Input: the on-screen keyboard goes to the OSK helper, not Steam+X.
+        self.assertEqual(by_name["Keyboard"]["target_event"], {"dbus": "ui_osk"})
         self.assertEqual(by_name["Home"]["source_events"], [{"gamepad": {"button": "Keyboard"}}])
         self.assertEqual(by_name["Home"]["target_event"], {"gamepad": {"button": "Guide"}})
+
+    def test_keyboard_targets(self):
+        def targets(session, **actions):
+            merged = dict(templates.DEFAULT_BUTTON_ACTIONS, **actions)
+            doc = yaml.safe_load(templates.capability_map_yaml("oxp9", merged, None, None, session))
+            return {m["name"]: m["target_event"] for m in doc["mapping"]}
+
+        chord = targets(None, keyboard="keyboard-chord", home="keyboard-chord")
+        self.assertEqual(chord["Keyboard"], {"gamepad": {"button": "Keyboard"}})
+        self.assertNotIn("Home", chord)  # Home already sends gamepad Keyboard
+        helper = targets(None, home="keyboard", xbox="keyboard")
+        self.assertEqual(helper["Home"], {"dbus": "ui_osk"})
+        self.assertEqual(helper["Xbox"], {"dbus": "ui_osk"})
+        for action in ("keyboard", "keyboard-chord"):
+            ogui = targets(templates.OGUI_SESSION, keyboard=action, home=action)
+            self.assertEqual(ogui["Keyboard"], {"gamepad": {"button": "LeftTop"}})
+            self.assertEqual(ogui["Home"], {"gamepad": {"button": "LeftTop"}})
+        self.assertIn(templates.OSK_KEY_UNIT_NAME, templates.capability_map_yaml(
+            "oxp9", dict(templates.DEFAULT_BUTTON_ACTIONS), None, None))
+        self.assertNotIn(templates.OSK_KEY_UNIT_NAME, templates.capability_map_yaml(
+            "oxp9", dict(templates.DEFAULT_BUTTON_ACTIONS), None, None, templates.OGUI_SESSION))
 
     def test_stock_actions_reproduce_upstream(self):
         doc = self.render(**templates.STOCK_BUTTON_ACTIONS)
@@ -69,6 +91,10 @@ class CapabilityMapTest(unittest.TestCase):
             for key in templates.BUTTON_ACTIONS:
                 jsonschema.validate(self.render(home=home, keyboard=key), schema)
                 jsonschema.validate(self.render(xbox=home, onex=key), schema)
+                for session in (templates.OGUI_SESSION, "native"):
+                    merged = dict(templates.DEFAULT_BUTTON_ACTIONS, home=home, keyboard=key)
+                    doc = yaml.safe_load(templates.capability_map_yaml("oxp9", merged, None, None, session))
+                    jsonschema.validate(doc, schema)
         bad = self.render()
         bad["mapping"][0]["target_event"]["gamepad"]["button"] = "Home"
         with self.assertRaises(jsonschema.ValidationError):

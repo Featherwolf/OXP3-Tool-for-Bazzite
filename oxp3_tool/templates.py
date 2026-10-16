@@ -21,22 +21,43 @@ OWN_MARKER = "Installed by oxp3-tool ("
 #   Deck target, QuickAccess2 opens the OGUI menu, and LeftTop becomes
 #   Guide+North, so the keyboard action is sent as LeftTop there.
 # The Steam Deck target turns Screenshot into Steam+R1 by itself in both.
+# With native Steam Input the keyboard action does not use Steam+X at all
+# (it does nothing on some setups): it becomes the InputPlumber D-Bus action
+# OSK_DBUS_ACTION, which the OSK helper (osk_helper.py) turns into
+# steam://open/keyboard. "keyboard-chord" keeps the Steam+X route.
 OGUI_SESSION = "ogui"
+OSK_ACTION = "keyboard"
+OSK_DBUS_ACTION = "ui_osk"
 
 # User-facing action name -> (button, button under the OGUI overlay, description)
 BUTTON_ACTIONS: dict[str, tuple[str, str, str]] = {
     "guide": ("Guide", "Guide", "Steam button (opens the Steam menu)"),
     "quick-access": ("QuickAccess", "QuickAccess", "Quick Access menu (the '...' button)"),
-    "keyboard": ("Keyboard", "LeftTop", "Steam on-screen keyboard"),
+    OSK_ACTION: ("Keyboard", "LeftTop", "Steam on-screen keyboard (native Steam Input: through oxp3-tool's helper)"),
+    "keyboard-chord": ("Keyboard", "LeftTop", "Steam on-screen keyboard through the Steam+X shortcut (no helper)"),
     "screenshot": ("Screenshot", "Screenshot", "Steam screenshot"),
     "ogui-menu": ("QuickAccess2", "QuickAccess2",
                   "OpenGamepadUI menu (with native Steam Input this takes a screenshot instead)"),
 }
 
 
-def action_button(action: str, session: Optional[str]) -> str:
+def uses_osk_helper(action: str, session: Optional[str]) -> bool:
+    return action == OSK_ACTION and session != OGUI_SESSION
+
+
+def action_target(action: str, session: Optional[str]) -> tuple[str, str]:
+    """("gamepad", button) or ("dbus", action) that ``action`` is sent as."""
+    if uses_osk_helper(action, session):
+        return ("dbus", OSK_DBUS_ACTION)
     native, ogui, _ = BUTTON_ACTIONS[action]
-    return ogui if session == OGUI_SESSION else native
+    return ("gamepad", ogui if session == OGUI_SESSION else native)
+
+
+def _target_lines(target: tuple[str, str]) -> list[str]:
+    kind, value = target
+    if kind == "dbus":
+        return ["    target_event:", f"      dbus: {value}"]
+    return ["    target_event:", "      gamepad:", f"        button: {value}"]
 
 
 # The four face keys, what InputPlumber 0.82.0's stock map "oxp9" does with
@@ -47,7 +68,7 @@ BUTTON_KEYS = {
     "home": "home key (MCU button 0x24, decoded by InputPlumber as gamepad Keyboard)",
     "xbox": "Xbox key (arrives as the gamepad Guide button)",
 }
-STOCK_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "ogui-menu", "home": "keyboard", "xbox": "guide"}
+STOCK_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "ogui-menu", "home": "keyboard-chord", "xbox": "guide"}
 DEFAULT_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "keyboard", "home": "guide", "xbox": "guide"}
 
 _CHORDS = {
@@ -77,6 +98,8 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
         f"# Written for Game Mode with {mode}; apply again after switching.",
         "# " + ", ".join(f"{k}: {actions.get(k, DEFAULT_BUTTON_ACTIONS[k])}" for k in BUTTON_KEYS),
     ]
+    if any(uses_osk_helper(a, session) for a in actions.values()):
+        lines.append(f"# dbus: {OSK_DBUS_ACTION} goes to {OSK_KEY_UNIT_NAME}, which asks Steam to open its keyboard.")
     if upstream_path:
         lines.append(f"# Stock map: {upstream_path}" + (f" (sha256 {upstream_sha256})" if upstream_sha256 else ""))
     lines += [
@@ -88,27 +111,24 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
     ]
     for key in ("onex", "keyboard"):
         name, chord = _CHORDS[key]
-        button = action_button(actions[key], session)
         lines.append(f"  - name: {name}")
         lines.append("    source_events:")
         lines += [f"      - keyboard: {k}" for k in chord]
-        lines += ["    target_event:", "      gamepad:", f"        button: {button}"]
+        lines += _target_lines(action_target(actions[key], session))
     # The home key already arrives as gamepad Keyboard and the Xbox key as
     # gamepad Guide. Translated events are not translated again, so these do
     # not touch the chords above (or each other).
     for name, key in (("Home", "home"), ("Xbox", "xbox")):
         native = _NATIVE[key]
-        target = action_button(actions.get(key, DEFAULT_BUTTON_ACTIONS[key]), session)
-        if target != native:
+        target = action_target(actions.get(key, DEFAULT_BUTTON_ACTIONS[key]), session)
+        if target != ("gamepad", native):
             lines += [
                 f"  - name: {name}",
                 "    source_events:",
                 "      - gamepad:",
                 f"          button: {native}",
-                "    target_event:",
-                "      gamepad:",
-                f"        button: {target}",
             ]
+            lines += _target_lines(target)
     lines.append("filtered_events: []")
     return "\n".join(lines) + "\n"
 
@@ -169,6 +189,54 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+# -- on-screen keyboard helper ------------------------------------------------
+
+OSK_KEY_HELPER_PATH = "/usr/local/libexec/oxp3-tool/osk-key-helper"
+OSK_KEY_UNIT_NAME = "oxp3-tool-osk-key.service"
+OSK_KEY_UNIT_PATH = f"/etc/systemd/system/{OSK_KEY_UNIT_NAME}"
+
+
+def osk_key_helper_script() -> str:
+    """The standalone helper script: oxp3_tool/osk_helper.py behind a shebang and our marker."""
+    from . import osk_helper
+
+    return (
+        "#!/usr/bin/python3 -I\n"
+        f"# Installed by oxp3-tool ({PROJECT_URL}).\n"
+        "# Remove with `sudo oxp3-tool revert buttons`, or choose another keyboard action with\n"
+        "# `sudo oxp3-tool apply buttons --keyboard-key=...`.\n"
+        + inspect.getsource(osk_helper)
+    )
+
+
+# ProtectHome=read-only, not yes: the helper writes to the FIFO
+# ~/.steam/steam.pipe (allowed on a read-only mount), and on Bazzite /home is
+# a symlink to /var/home, which ProtectHome=yes also hides.
+OSK_KEY_UNIT = f"""\
+# Installed by oxp3-tool ({PROJECT_URL}).
+# Remove with `sudo oxp3-tool revert buttons`.
+#
+# Opens Steam's on-screen keyboard when InputPlumber sends the D-Bus action
+# {OSK_DBUS_ACTION} (the ONEXPLAYER 3 keyboard key with native Steam Input).
+[Unit]
+Description=ONEXPLAYER 3 keyboard key opens Steam's on-screen keyboard (oxp3-tool)
+After=dbus.service inputplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I {OSK_KEY_HELPER_PATH}
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
 PrivateTmp=yes
 
 [Install]

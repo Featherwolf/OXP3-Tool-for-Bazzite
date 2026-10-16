@@ -142,7 +142,8 @@ class HdrBacklightTest(Base):
 class GameModeSessionTest(Base):
     def maps(self):
         doc = yaml.safe_load(self.read(CAP_MAP))
-        return {m["name"]: m["target_event"]["gamepad"]["button"] for m in doc["mapping"]}
+        return {m["name"]: m["target_event"]["gamepad"]["button"] if "gamepad" in m["target_event"]
+                else "dbus:" + m["target_event"]["dbus"] for m in doc["mapping"]}
 
     def test_ogui_overlay_sends_keyboard_as_lefttop(self):
         self.fake()
@@ -164,9 +165,11 @@ class GameModeSessionTest(Base):
         self.fake()
         self.f.ogui_overlay(disabled_for="gamer")
         self.apply(["buttons"])
-        self.assertEqual(self.maps(), {"ONEX": "QuickAccess", "Keyboard": "Keyboard", "Home": "Guide"})
+        self.assertEqual(self.maps(), {"ONEX": "QuickAccess", "Keyboard": "dbus:ui_osk", "Home": "Guide"})
         rc, status, _ = self.cli("status")
         self.assertIn("Game Mode: native Steam Input", status)
+        self.apply(["buttons"], keyboard_key="keyboard-chord")
+        self.assertEqual(self.maps(), {"ONEX": "QuickAccess", "Keyboard": "Keyboard", "Home": "Guide"})
 
     def test_session_switch_is_reported_and_reapplied(self):
         self.fake()
@@ -176,7 +179,7 @@ class GameModeSessionTest(Base):
         rc, status, _ = self.cli("status")
         self.assertIn("written for a different Game Mode input", status)
         self.apply(["buttons"])
-        self.assertEqual(self.maps()["Keyboard"], "Keyboard")
+        self.assertEqual(self.maps()["Keyboard"], "dbus:ui_osk")
 
 
 class OlderStateTest(Base):
