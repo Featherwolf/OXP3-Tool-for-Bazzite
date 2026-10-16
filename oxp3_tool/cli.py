@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import os
 import sys
+import textwrap
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -66,6 +67,16 @@ def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
     else:
         label = fix.level
     return label, ([check.reason] if check.reason else [])
+
+
+def _wrap(text: str, first: str, rest: str, width: int = 100) -> str:
+    """Wrap advice for a small screen without breaking `commands` apart."""
+    parts = text.split("`")
+    for i in range(1, len(parts), 2):
+        parts[i] = parts[i].replace(" ", "\0")
+    wrapped = textwrap.fill("`".join(parts), width=width, initial_indent=first, subsequent_indent=rest,
+                            break_on_hyphens=False, break_long_words=False)
+    return wrapped.replace("\0", " ")
 
 
 def status_text(ctx: Context, state: State) -> str:
@@ -138,6 +149,10 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(f"Panel:    {caps.describe()}")
     elif not ctx.sys.is_real_root or os.geteuid() == 0:
         lines.append(f"Panel:    not checked: {why}")
+    refresh = ctx.refresh_state
+    if ctx.xe_loaded or refresh.kwin:
+        for i, line in enumerate(refresh.summary()):
+            lines.append(f"{'Refresh:' if i == 0 else '':<10}{line}")
     game = {OGUI: "Steam behind the OpenGamepadUI overlay (Bazzite default; "
                   "`ujust configure-opengamepadui disable` switches to native Steam Input)",
             NATIVE_STEAM: "native Steam Input"}.get(ctx.game_mode_input or "")
@@ -159,6 +174,12 @@ def status_text(ctx: Context, state: State) -> str:
             lines.append(f"  [{label:<12}] {fix.id:<21} {fix.summary}")
             for note in notes:
                 lines.append(f"  {'':14} {'':21} {note}")
+    advice = refresh.advice() if (ctx.xe_loaded or refresh.kwin) else []
+    if advice:
+        lines.append("")
+        lines.append("Refresh rate")
+        for item in advice:
+            lines.append(_wrap(item, "  - ", "    "))
     lines.append("")
     if not (ctx.device_ok and ctx.os_ok):
         lines.append("This tool only changes anything on a ONEXPLAYER 3 running Bazzite.")

@@ -79,6 +79,13 @@ filtered_events: []
 """
 
 
+# The panel's two EDID modes (fixed 380.16 MHz clock, htotal 2000), as xe prints them.
+OXP3_MODES = {
+    144: '"1920x1200": 144 380160 1920 1936 1952 2000 1200 1256 1260 1320 0x48 0xa',
+    60: '"1920x1200": 60 380160 1920 1936 1952 2000 1200 3104 3108 3168 0x40 0xa',
+}
+
+
 def make_edid(vendor: str = "SDC", product: int = 0x4301, name: Optional[str] = "AMS881KB01-0") -> bytes:
     edid = bytearray(128)
     edid[0:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
@@ -277,6 +284,67 @@ class FakeOxp3:
         self.write("/dev/drm_dp_aux0", bytes(regs))
         self.mkdir("/sys/class/drm/card1-eDP-1/drm_dp_aux0")
         self.write("/sys/class/drm/card1-eDP-1/dpms", "On\n")
+
+    def display_debugfs(self, refresh: int = 144, psr: str = "Panel Replay Selective Update enabled",
+                        dmc: Optional[str] = "2.36", active: bool = True) -> None:
+        """xe debugfs for the eDP panel (root only on a real system)."""
+        d = "/sys/kernel/debug/dri/0000:00:02.0"
+        crtc_mode = OXP3_MODES[refresh] if active else '"": 0 0 0 0 0 0 0 0 0 0 0x0 0x0'
+        yes = "yes" if active else "no"
+        lines = [
+            "CRTC info", "---------",
+            "[CRTC:151:pipe A]:",
+            f"\tuapi: enable={yes}, active={yes}, mode={crtc_mode}",
+            f"\thw: enable={yes}, active={yes}",
+            f"\tadjusted_mode={crtc_mode}",
+            f"\tpipe__mode={crtc_mode}",
+            "\tpipe src=1920x1200+0+0, dither=no, bpp=30",
+        ]
+        if active:
+            lines += ["\t[ENCODER:250:DDI A/PHY A]: connectors:", "\t\t[CONNECTOR:251:eDP-1]"]
+        lines += [
+            "\tunderrun reporting: cpu=yes pch=yes",
+            "[CRTC:200:pipe B]:",
+            '\tuapi: enable=no, active=no, mode="": 0 0 0 0 0 0 0 0 0 0 0x0 0x0',
+            "",
+            "Connector info", "--------------",
+            "[CONNECTOR:251:eDP-1]: status: connected",
+            "\tphysical dimensions: 160x100mm",
+            "\tmax bpc: 10",
+            "\tfixed modes:",
+            f"\t\t{OXP3_MODES[144]}",
+            f"\t\t{OXP3_MODES[60]}",
+            "\tmodes:",
+            f"\t\t{OXP3_MODES[144]}",
+            f"\t\t{OXP3_MODES[60]}",
+            "[CONNECTOR:260:DP-1]: status: disconnected",
+        ]
+        self.write(f"{d}/i915_display_info", "\n".join(lines) + "\n")
+        self.write(f"{d}/eDP-1/i915_psr_status",
+                   "Sink support: PSR = yes [0x03], Panel Replay = yes, Panel Replay Selective Update = yes, "
+                   "Panel Replay DSC support = not supported\n"
+                   f"PSR mode: {psr}\n")
+        info = "DMC initialized: yes\nfw loaded: yes\npath: i915/xe3lpd_dmc.bin\n"
+        if dmc:
+            info += f"version: {dmc}\n"
+        self.write(f"{d}/i915_dmc_info", info)
+        self.symlink("/sys/kernel/debug/dri/0", "0000:00:02.0")
+
+    def kwin_config(self, user: str = "gamer", refresh_mhz: Optional[int] = 144000,
+                    vrr: Optional[str] = None, hdr: Optional[bool] = None) -> None:
+        """KWin's saved output settings (~/.config/kwinoutputconfig.json)."""
+        out: dict = {"edidIdentifier": "SDC 17153 0 1 2025 0", "connectorName": "eDP-1"}
+        if refresh_mhz:
+            out["mode"] = {"width": 1920, "height": 1200, "refreshRate": refresh_mhz}
+        if vrr:
+            out["vrrPolicy"] = vrr
+        if hdr is not None:
+            out["highDynamicRange"] = hdr
+        other = {"edidIdentifier": "GSM 23305 1 2 2023 0", "connectorName": "DP-1",
+                 "mode": {"width": 2560, "height": 1440, "refreshRate": 60000}, "vrrPolicy": "Always"}
+        doc = [{"name": "outputs", "data": [other, out]},
+               {"name": "setups", "data": []}]
+        self.write(f"/var/home/{user}/.config/kwinoutputconfig.json", json.dumps(doc))
 
     def ogui_overlay(self, disabled_for: Optional[str] = None) -> None:
         """Bazzite deck Game Mode: Steam behind the OpenGamepadUI overlay, optionally

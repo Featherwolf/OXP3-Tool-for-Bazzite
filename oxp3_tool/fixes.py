@@ -578,6 +578,9 @@ class XePanelReplayFix(_KargFix):
         present = [k for k in self.BAD if ctx.karg_active(k) or ctx.karg_pending(k)]
         if present:
             return Check(False, f"{', '.join(present)} is set; combined with this it blanks the OXP3 screen")
+        psr = ctx.refresh_state.psr_mode
+        if psr and psr.startswith("Panel Replay"):
+            return Check(True, f"PSR mode now: {psr}")
         return Check(True)
 
 
@@ -644,6 +647,10 @@ class XeDsbFix(_KargFix):
     )
     takes_effect = "after reboot"
     karg = "xe.enable_dsb=0"
+
+    def _check(self, ctx: Context) -> Check:
+        errors = ctx.refresh_state.dsb_errors
+        return Check(True, f"the kernel logged {errors} 'DSB poll error' messages this boot" if errors else "")
 
 
 ALL_FIXES: list[Fix] = [

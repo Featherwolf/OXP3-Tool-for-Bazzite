@@ -11,6 +11,7 @@ import errno
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,6 +177,37 @@ class System:
         finally:
             os.close(fd)
         return data if len(data) == size else None
+
+    def read_regular(self, p: str, limit: int) -> Optional[bytes]:
+        """Read a regular file of at most ``limit`` bytes, never through a symlink at ``p``.
+
+        For files in users' home directories, which root should not follow
+        elsewhere or read without bound.
+        """
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            fd = os.open(self.path(p), flags)
+        except OSError:
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+                return None
+            chunks = []
+            size = 0
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
 
     def sha256(self, p: str) -> Optional[str]:
         data = self.read_bytes(p)

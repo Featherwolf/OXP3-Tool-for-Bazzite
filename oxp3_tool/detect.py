@@ -14,6 +14,19 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Optional
 
+from .display import (
+    DC_BALANCE_PARAM,
+    DEBUGFS_DRI,
+    KWIN_CONFIG,
+    KWIN_CONFIG_MAX,
+    RefreshState,
+    count_dsb_errors,
+    parse_crtc_mode,
+    parse_dmc_version,
+    parse_fixed_modes,
+    parse_kwin_outputs,
+    parse_psr_mode,
+)
 from .system import System
 
 OXP3_SYS_VENDOR = "ONE-NETBOOK"
@@ -547,6 +560,50 @@ class Context:
     @property
     def edp_caps(self) -> Optional[EdpCaps]:
         return self.edp_probe[0]
+
+    @cached_property
+    def refresh_state(self) -> RefreshState:
+        """Read-only refresh-rate picture: current mode, PSR, display firmware, KWin settings."""
+        st = RefreshState()
+        panel = self.internal_panel
+        st.connector = re.sub(r"^card\d+-", "", panel[0]) if panel else None
+        if st.connector:
+            for info in self.sys.glob(f"{DEBUGFS_DRI}/*/i915_display_info"):
+                text = self.sys.read_text(info)
+                if not text or f":{st.connector}]" not in text:
+                    continue
+                d = info.rsplit("/", 1)[0]
+                st.mode = parse_crtc_mode(text, st.connector)
+                st.fixed_modes = parse_fixed_modes(text, st.connector)
+                psr = self.sys.read_text(f"{d}/{st.connector}/i915_psr_status")
+                if psr is None:
+                    psr = self.sys.read_text(f"{d}/i915_edp_psr_status")
+                st.psr_mode = parse_psr_mode(psr) if psr else None
+                st.dmc_version = parse_dmc_version(self.sys.read_text(f"{d}/i915_dmc_info"), "")
+                if st.mode is None:
+                    st.debugfs_why = f"no active display pipe drives {st.connector} (screen off?)"
+                break
+            else:
+                if self.sys.is_real_root and os.geteuid() != 0:
+                    st.debugfs_why = "needs root"
+                else:
+                    st.debugfs_why = f"no readable i915_display_info for {st.connector} under {DEBUGFS_DRI}"
+        if st.dmc_version is None:
+            st.dmc_version = parse_dmc_version(None, self.kernel_log(0))
+        if self.xe_loaded:
+            st.dc_balance_param = self.sys.exists(DC_BALANCE_PARAM)
+        st.dsb_errors = count_dsb_errors(self.kernel_log(0))
+        users: set[str] = set()
+        for home_root in ("/home", "/var/home"):
+            for path in self.sys.glob(f"{home_root}/*/{KWIN_CONFIG}"):
+                user = path.split("/")[-3]
+                if user in users:
+                    continue
+                users.add(user)
+                data = self.sys.read_regular(path, KWIN_CONFIG_MAX)
+                if data:
+                    st.kwin += parse_kwin_outputs(data, OXP3_PANEL_VENDOR, OXP3_PANEL_PRODUCT)
+        return st
 
     # -- Game Mode -------------------------------------------------------
 

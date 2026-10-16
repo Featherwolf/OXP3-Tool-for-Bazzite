@@ -26,6 +26,8 @@ PATTERNS: list[tuple[str, str]] = [
     (r"Selective fetch area calculation failed", "PSR2/Panel Replay selective-fetch failure."),
     (r"Failed to write aux backlight level", "Backlight control over the DisplayPort AUX channel failed."),
     (r"Chip id not found", "bmi160 probed the BMI260 IMU and failed (gyro); see the gyro fix."),
+    (r"DMC \d+ has \d+ handlers for event",
+     "The display firmware lacks an event handler the kernel expects (e.g. an older DMC with variable refresh on)."),
     (r"Panel is missing HDR static metadata",
      "The kernel did not enable the panel's Intel HDR backlight interface; see the xe-hdr-backlight fix."),
 ]
@@ -74,6 +76,7 @@ DEBUGFS_GLOBS = [
     "/sys/kernel/debug/dri/*/i915_display_info",
     "/sys/kernel/debug/dri/*/i915_dmc_info",
     "/sys/kernel/debug/dri/*/eDP-*/i915_psr_status",
+    "/sys/kernel/debug/dri/*/eDP-*/vrr_range",
     "/sys/kernel/debug/pmc_core/substate_residencies",
     "/sys/kernel/debug/pmc_core/slp_s0_residency_usec",
 ]
@@ -208,7 +211,10 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
         hw.append(f"sleep: {note}")
     released = ctx.atkbd_force_release
     hw.append(f"atkbd force_release: {sorted(released) if released is not None else 'unreadable'}")
-    for param in ("enable_psr", "enable_panel_replay", "enable_psr2_sel_fetch", "enable_dsb", "enable_dc"):
+    for line in ctx.refresh_state.summary():
+        hw.append(f"refresh: {line}")
+    for param in ("enable_psr", "enable_panel_replay", "enable_psr2_sel_fetch", "enable_dsb", "enable_dc",
+                  "enable_dc_balance"):
         v = sys.read_attr(f"/sys/module/xe/parameters/{param}")
         if v is not None:
             hw.append(f"xe.{param} = {v}")
@@ -220,7 +226,11 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     findings = []
     for pattern, count, meaning in scan_patterns(kernel_logs):
         findings.append(f"{count:6d}x  /{pattern}/  {meaning}")
-    bundle.add("findings.txt", ("\n".join(findings) or "No known problem patterns in the kernel logs.") + "\n")
+    text = "\n".join(findings) or "No known problem patterns in the kernel logs."
+    advice = ctx.refresh_state.advice()
+    if advice:
+        text += "\n\nRefresh rate:\n" + "\n".join(f"- {a}" for a in advice)
+    bundle.add("findings.txt", text + "\n")
     return bundle, findings
 
 
