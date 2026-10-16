@@ -113,6 +113,7 @@ class FakeRunner:
         self.fail: set[str] = set()  # command prefixes (joined) that should fail
         self.hhd_units: list[str] = []
         self.packages = {"inputplumber": "0.82.0"}
+        self.journal: dict[str, str] = {}  # boot ("0", "-1") -> kernel log
         self.bmi270_aliases = "i2c:bmi270\nacpi*:BMI0260:*\nacpi*:10EC5280:*\n"
 
     def _failing(self, argv: Sequence[str]) -> bool:
@@ -134,6 +135,9 @@ class FakeRunner:
             if name in self.packages:
                 return CommandResult(0, self.packages[name])
             return CommandResult(1, f"package {name} is not installed\n")
+        if cmd == "journalctl" and "-k" in argv:
+            boot = argv[argv.index("-b") + 1]
+            return CommandResult(0, self.journal.get(boot, ""))
         if cmd == "modinfo":
             if argv[-1] == "bmi270_i2c":
                 return CommandResult(0, self.bmi270_aliases)
@@ -263,6 +267,14 @@ class FakeOxp3:
     def boot(self) -> None:
         """Simulate a reboot: the pending kernel arguments become active."""
         self.write("/proc/cmdline", " ".join(self.runner.kargs) + "\n")
+
+    def panel_dpcd(self, tcon: bytes = b"\x01\x13\x00\x00", edp_rev: int = 0x03) -> None:
+        """Expose the eDP AUX channel with Intel HDR backlight caps at 0x340 and eDP rev at 0x700."""
+        regs = bytearray(0x800)
+        regs[0x340:0x344] = tcon
+        regs[0x700] = edp_rev
+        self.write("/dev/drm_dp_aux0", bytes(regs))
+        self.mkdir("/sys/class/drm/card1-eDP-1/drm_dp_aux0")
 
     def update_before_reboot(self) -> None:
         """Simulate `bootc upgrade` staging an update built from the booted kernel arguments."""

@@ -19,14 +19,15 @@ BUTTON_ACTIONS: dict[str, tuple[str, str]] = {
     "screenshot": ("QuickAccess2", "screenshot (InputPlumber QuickAccess2)"),
 }
 
-# The three chassis keys and InputPlumber's stock (0.82.0, map "oxp9") actions.
+# The four face keys and InputPlumber's stock (0.82.0, map "oxp9") actions.
 BUTTON_KEYS = {
     "onex": "ONEX / console key (sends Ctrl+Alt+Meta)",
     "keyboard": "keyboard key (sends Ctrl+Meta+O)",
     "home": "home key (MCU button 0x24, decoded by InputPlumber as gamepad Keyboard)",
+    "xbox": "Xbox key (arrives as the gamepad Guide button)",
 }
-STOCK_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "screenshot", "home": "keyboard"}
-DEFAULT_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "keyboard", "home": "guide"}
+STOCK_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "screenshot", "home": "keyboard", "xbox": "guide"}
+DEFAULT_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "keyboard", "home": "guide", "xbox": "guide"}
 
 _CHORDS = {
     "onex": ("ONEX", ["KeyLeftCtrl", "KeyLeftAlt", "KeyLeftMeta"]),
@@ -43,7 +44,8 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
             raise ValueError(f"unknown action {action!r} for {key}")
     lines = [
         f"# Installed by oxp3-tool ({PROJECT_URL}).",
-        "# Do not edit: change it with `sudo oxp3-tool apply buttons --home=... --keyboard-key=... --onex-key=...`",
+        "# Do not edit: change it with `sudo oxp3-tool apply buttons --home=... --keyboard-key=... --onex-key=...",
+        "# --xbox-key=...`",
         "# and remove it with `sudo oxp3-tool revert buttons`.",
         "#",
         f"# Replaces InputPlumber's stock capability map {map_id!r} for the ONEXPLAYER 3.",
@@ -66,19 +68,21 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
         lines.append("    source_events:")
         lines += [f"      - keyboard: {k}" for k in chord]
         lines += ["    target_event:", "      gamepad:", f"        button: {button}"]
-    # The home key already arrives as gamepad Keyboard. Translated events are
-    # not translated again, so this does not touch the keyboard-key chord above.
-    home = BUTTON_ACTIONS[actions["home"]][0]
-    if home != "Keyboard":
-        lines += [
-            "  - name: Home",
-            "    source_events:",
-            "      - gamepad:",
-            "          button: Keyboard",
-            "    target_event:",
-            "      gamepad:",
-            f"        button: {home}",
-        ]
+    # The home key already arrives as gamepad Keyboard and the Xbox key as
+    # gamepad Guide. Translated events are not translated again, so these do
+    # not touch the chords above (or each other).
+    for name, key, native in (("Home", "home", "Keyboard"), ("Xbox", "xbox", "Guide")):
+        target = BUTTON_ACTIONS[actions.get(key, DEFAULT_BUTTON_ACTIONS[key])][0]
+        if target != native:
+            lines += [
+                f"  - name: {name}",
+                "    source_events:",
+                "      - gamepad:",
+                f"          button: {native}",
+                "    target_event:",
+                "      gamepad:",
+                f"        button: {target}",
+            ]
     lines.append("filtered_events: []")
     return "\n".join(lines) + "\n"
 

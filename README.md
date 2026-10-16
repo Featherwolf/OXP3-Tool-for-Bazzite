@@ -22,18 +22,29 @@ Reboot before you install a system update. A Bazzite update installed first is b
 
 You can also run it from the source folder without installing it: `sudo ./bin/oxp3-tool apply`.
 
-Run it in Desktop Mode (Konsole) or over SSH. The only requirement is Python 3, which Bazzite already includes.
+Run it in Desktop Mode (Konsole) or over SSH. The only requirement is Python 3, which Bazzite already includes. Run `status` with `sudo` too: reading the panel's capabilities and the kernel logs needs root.
+
+## Common problems
+
+| What you see | Most likely cause | What to do |
+|---|---|---|
+| The **keyboard, home, console or Xbox key** does the wrong thing | Stock InputPlumber 0.82 sends the keyboard key to *screenshot* and the home key to the *on-screen keyboard* | `sudo oxp3-tool apply buttons`. Check each key with `inputplumber device 0 test` (Ctrl+C to exit), and change any of the four with `--keyboard-key`, `--home`, `--onex-key` and `--xbox-key`. |
+| After **waking from sleep the screen stays black**, and the device **will not sleep again until you power it off** | The SSD does not come back from sleep, so the system stalls | `sudo oxp3-tool apply nvme-resume`, then reboot. `sudo oxp3-tool status` shows why it is recommended for your unit. If it says there is no sign of the SSD problem, it can still be applied with `--any-ssd`. |
+| **Turning on HDR makes the screen black** until the setting reverts (Desktop Mode display settings, or Steam) | Probably: the kernel never turns on the OLED's HDR controls (gamescope and KDE send HDR, the panel shows black) | In Game Mode, `oled-profile` keeps HDR tone-mapped so the panel never goes black. For Desktop Mode, the experimental `xe-hdr-backlight` fix may make HDR work. Until then, leave HDR off in Desktop Mode; the display settings revert on their own after 15 seconds. |
+
+If a problem persists after the fixes, run `sudo oxp3-tool diagnose` after the next failure (reboot first if the screen is black) and attach the archive to an issue.
 
 ## What it fixes
 
 | Fix | Level | Problem | What it changes |
 |---|---|---|---|
-| `buttons` | recommended | On stock InputPlumber 0.82, the **keyboard key takes a screenshot** and the **home key opens the on-screen keyboard**. | Adds an InputPlumber capability map override in `/etc/inputplumber/capability_maps.d/`. Defaults: keyboard key opens the on-screen keyboard, home key opens Steam (Guide), ONEX key opens Quick Access. You can remap each key. The override replaces the whole stock map, so it is only recommended while the stock map is the 0.82.0 one it was written for. |
+| `buttons` | recommended | On stock InputPlumber 0.82, the **keyboard key takes a screenshot** and the **home key opens the on-screen keyboard**. | Adds an InputPlumber capability map override in `/etc/inputplumber/capability_maps.d/`. Defaults: keyboard key opens the on-screen keyboard, home key opens Steam (Guide), ONEX/console key opens Quick Access, and the Xbox key stays Steam (Guide). You can remap all four. The override replaces the whole stock map, so it is only recommended while the stock map is the 0.82.0 one it was written for. |
 | `volume-keys` | recommended | The **volume rocker sticks**: the embedded controller drops the key-release, so volume keys keep changing after you let go. | Adds a udev hwdb entry (`/etc/udev/hwdb.d/61-oxp3-tool-volume-keys.hwdb`) that forces key-release for both volume keys. Holding a key no longer auto-repeats. Not offered while Handheld Daemon runs, because HHD then drops every volume press ([hhd#342](https://github.com/hhd-dev/hhd/issues/342)). |
-| `nvme-resume` | recommended with the Predator GM7 SSD | **Black or frozen screen after sleep.** The Acer Predator GM7 SSD (PCI `1dee:1602`) does not come back from s2idle. The kernel logs `Disabling device after reset failure: -19` and the root filesystem goes read-only. | Adds the kernel argument `nvme.noacpi=1`, which fixed resume in community testing on the OXP3. |
+| `nvme-resume` | recommended with the Predator GM7 SSD, or when the logs point to the SSD | **Black screen after waking, and no sleep again until a power-off.** The firmware puts the SSD into ACPI "simple suspend", and the Acer Predator GM7 (PCI `1dee:1602`) does not come back from it. The kernel logs `Disabling device after reset failure: -19` and the root filesystem drops out. | Adds the kernel argument `nvme.noacpi=1`, which fixed resume in community testing on the OXP3. Recommended with the GM7, when the kernel log shows the failure, or when the firmware uses simple suspend for your SSD. Costs a little battery while asleep. |
 | `oled-profile` | recommended on bazzite-deck | **Black panel in Game Mode** (after boot, a session switch or resume) and a dead brightness slider while HDR is on. gamescope drives this panel (the same Samsung panel as the Legion Go 2) with BT.2020/PQ, which the OXP3 does not display. | Adds a gamescope display profile (`/etc/gamescope/scripts/90-oxp3-tool-oled.lua`) that keeps the panel in gamma 2.2 mode, the way the Steam Deck OLED works. HDR still works through gamescope's tone mapping. It also lists the panel's 48–144 Hz refresh rates. |
 | `xe-dsb-off` | optional | `DSB 0 poll error` floods the journal, and some users see cursor trails. | Kernel argument `xe.enable_dsb=0`. Cosmetic only. |
 | `xe-panel-replay-off` | experimental | Intermittent black or garbled screen (Panther Lake Panel Replay bugs). | Kernel argument `xe.enable_panel_replay=0`. Not shown to fix resume. Refused if `xe.enable_psr=0` or `xe.enable_psr2_sel_fetch=0` is set, because those combinations blank the OXP3 screen. |
+| `xe-hdr-backlight` | experimental | **Turning on HDR makes the panel black.** The likely reason: in HDR mode the panel needs Intel's eDP HDR backlight interface, and the kernel only uses it when the firmware asks. | Kernel argument `xe.enable_dpcd_backlight=3`. Only offered when a read-only check shows that the panel has this interface. Untested on the OXP3, and brightness control moves to the panel. Before trying it, run `ujust configure-grub show`: if the screen stays dark, you can then boot the previous version from the boot menu with a keyboard, or revert over SSH. |
 | `inputplumber-suspend` | experimental | Controller misbehaves after waking. | Enables `inputplumber-suspend.service`, which InputPlumber ships but Bazzite leaves disabled. |
 | `gyro` | experimental | Gyro missing: no IIO device named `bmi260`. | Blacklists `bmi160_i2c` (`/etc/modprobe.d/oxp3-tool-imu.conf`) so `bmi270_i2c` can drive the BMI260 IMU. Only offered when the running kernel's `bmi270_i2c` knows the ACPI ID `10EC5280`. |
 
@@ -41,9 +52,10 @@ Run it in Desktop Mode (Konsole) or over SSH. The only requirement is Python 3, 
 
 ```bash
 sudo oxp3-tool apply xe-dsb-off
-sudo oxp3-tool apply buttons --home quick-access --keyboard-key keyboard --onex-key guide
+sudo oxp3-tool apply buttons --home quick-access --keyboard-key keyboard --onex-key guide --xbox-key guide
 sudo oxp3-tool apply oled-profile --min-refresh 40     # below 48 Hz is untested
-sudo oxp3-tool apply nvme-resume --any-ssd             # SSD other than the GM7 that fails to resume
+sudo oxp3-tool apply nvme-resume --any-ssd             # when status finds no sign of the SSD problem
+sudo oxp3-tool apply xe-hdr-backlight                  # experimental; read its warning first
 ```
 
 Button actions are `guide`, `quick-access`, `keyboard` (on-screen keyboard) and `screenshot`. Your button choices and `--min-refresh` are remembered when you apply again; `--defaults` resets them. `oxp3-tool list` explains every fix in detail.

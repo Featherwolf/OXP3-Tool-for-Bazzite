@@ -162,6 +162,21 @@ class System:
         text = self.read_text(p)
         return None if text is None else text.strip()
 
+    def read_at(self, p: str, offset: int, size: int) -> Optional[bytes]:
+        """Read ``size`` bytes at ``offset`` (e.g. DPCD registers from /dev/drm_dp_aux*)."""
+        try:
+            fd = os.open(self.path(p), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            data = os.read(fd, size)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        return data if len(data) == size else None
+
     def sha256(self, p: str) -> Optional[str]:
         data = self.read_bytes(p)
         return None if data is None else sha256_bytes(data)

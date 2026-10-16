@@ -67,8 +67,8 @@ class CapabilityMapTest(unittest.TestCase):
         schema = json.loads(Path(IP_SCHEMA).read_text())
         for home in templates.BUTTON_ACTIONS:
             for key in templates.BUTTON_ACTIONS:
-                doc = self.render(home=home, keyboard=key)
-                jsonschema.validate(doc, schema)
+                jsonschema.validate(self.render(home=home, keyboard=key), schema)
+                jsonschema.validate(self.render(xbox=home, onex=key), schema)
         bad = self.render()
         bad["mapping"][0]["target_event"]["gamepad"]["button"] = "Home"
         with self.assertRaises(jsonschema.ValidationError):

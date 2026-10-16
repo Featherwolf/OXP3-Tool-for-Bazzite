@@ -26,6 +26,8 @@ PATTERNS: list[tuple[str, str]] = [
     (r"Selective fetch area calculation failed", "PSR2/Panel Replay selective-fetch failure."),
     (r"Failed to write aux backlight level", "Backlight control over the DisplayPort AUX channel failed."),
     (r"Chip id not found", "bmi160 probed the BMI260 IMU and failed (gyro); see the gyro fix."),
+    (r"Panel is missing HDR static metadata",
+     "The kernel did not enable the panel's Intel HDR backlight interface; see the xe-hdr-backlight fix."),
 ]
 
 DMI_PUBLIC = (
@@ -199,6 +201,11 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     hw.append(f"iio devices: {', '.join(ctx.iio_names) or 'none'}")
     hw.append(f"{IMU_I2C_DEVICE}: present={ctx.imu_present} driver={ctx.imu_driver}")
     hw.append(f"hid-oxp devices: {', '.join(ctx.hid_oxp_devices) or 'none'}")
+    caps = ctx.edp_caps
+    hw.append(f"eDP DPCD: {caps.aux_device}: {caps.describe()} (tcon caps {caps.tcon.hex()}, edp rev {caps.edp_rev})"
+              if caps else "eDP DPCD: not readable (needs root and /dev/drm_dp_aux*)")
+    for note in ctx.resume_evidence.lines():
+        hw.append(f"sleep: {note}")
     released = ctx.atkbd_force_release
     hw.append(f"atkbd force_release: {sorted(released) if released is not None else 'unreadable'}")
     for param in ("enable_psr", "enable_panel_replay", "enable_psr2_sel_fetch", "enable_dsb", "enable_dc"):

@@ -131,6 +131,11 @@ def status_text(ctx: Context, state: State) -> str:
     sleep = ctx.sys.read_attr("/sys/power/mem_sleep")
     if sleep:
         lines.append(f"Sleep:    mem_sleep {sleep}")
+    for note in ctx.resume_evidence.lines():
+        lines.append(f"          {note}")
+    caps = ctx.edp_caps
+    if caps is not None:
+        lines.append(f"Panel:    {caps.describe()}")
 
     if state.load_error:
         lines.append("")
@@ -168,7 +173,7 @@ def cmd_list(ctx: Context, state: State, args: argparse.Namespace) -> int:
             _out(f"    {line}")
         _out(f"  Takes effect: {fix.takes_effect}")
         _out()
-    _out("Button actions for --onex-key, --keyboard-key and --home:")
+    _out("Button actions for --onex-key, --keyboard-key, --home and --xbox-key:")
     for name, (_, desc) in templates.BUTTON_ACTIONS.items():
         _out(f"  {name:<13} {desc}")
     return 0
@@ -233,6 +238,7 @@ def cmd_apply(ctx: Context, state: State, args: argparse.Namespace) -> int:
         "home": args.home,
         "keyboard_key": args.keyboard_key,
         "onex_key": args.onex_key,
+        "xbox_key": args.xbox_key,
         "min_refresh": args.min_refresh,
         "any_ssd": args.any_ssd,
         "restart": not args.no_restart,
@@ -359,6 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--keyboard-key", choices=actions,
                    help="buttons: action for the keyboard key (default keyboard)")
     a.add_argument("--onex-key", choices=actions, help="buttons: action for the ONEX key (default quick-access)")
+    a.add_argument("--xbox-key", choices=actions, help="buttons: action for the Xbox key (default guide)")
     a.add_argument("--no-restart", action="store_true", help="buttons: do not restart InputPlumber")
     a.add_argument("--min-refresh", type=int, choices=range(templates.PANEL_MIN_HZ, templates.LEGIONGO2_MIN_HZ + 1),
                    metavar=f"{{{templates.PANEL_MIN_HZ}..{templates.LEGIONGO2_MIN_HZ}}}",

@@ -1,8 +1,9 @@
 name: CI
 
+# Manual only while the account has no Actions minutes left; restore
+# `push:` and `pull_request:` here to run on every change again.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

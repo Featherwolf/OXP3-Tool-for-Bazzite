@@ -145,9 +145,11 @@ class ButtonsFix(Fix):
         "InputPlumber 0.82 supports the OXP3 controller, but its stock map (id oxp9) sends\n"
         "the keyboard key to QuickAccess2, which takes a screenshot, and the home key to\n"
         "the on-screen keyboard. This installs a replacement map with the same id in\n"
-        f"{IP_ETC_CAPABILITY_MAPS}. Defaults: ONEX -> Quick Access, keyboard key ->\n"
-        "on-screen keyboard, home -> Steam/Guide. Choose others with --onex-key,\n"
-        "--keyboard-key and --home (guide, quick-access, keyboard, screenshot); your\n"
+        f"{IP_ETC_CAPABILITY_MAPS}. Defaults: ONEX/console -> Quick Access, keyboard key\n"
+        "-> on-screen keyboard, home -> Steam/Guide, Xbox key -> Steam/Guide (as stock).\n"
+        "Choose others with --onex-key, --keyboard-key, --home and --xbox-key (guide,\n"
+        "quick-access, keyboard, screenshot); check each key with\n"
+        "`inputplumber device 0 test` (exits with Ctrl+C). Your\n"
         "choice is kept when you apply again (--defaults resets it). The override\n"
         "replaces the whole stock map, so it is only recommended while the stock map is\n"
         "the 0.82.0 one it was written for. InputPlumber is restarted."
@@ -187,7 +189,8 @@ class ButtonsFix(Fix):
         for key, action in (prev.get("actions") or {}).items():
             if key in actions and action in templates.BUTTON_ACTIONS:
                 actions[key] = action
-        for key, opt in (("onex", "onex_key"), ("keyboard", "keyboard_key"), ("home", "home")):
+        for key, opt in (("onex", "onex_key"), ("keyboard", "keyboard_key"), ("home", "home"),
+                         ("xbox", "xbox_key")):
             if opts.get(opt):
                 actions[key] = opts[opt]
         if not (ip.upstream_map and ip.map_id):
@@ -411,30 +414,46 @@ class NvmeResumeFix(_KargFix):
     group = DISPLAY
     level = RECOMMENDED
     title = "SSD survives sleep"
-    summary = "nvme.noacpi=1 so the Predator GM7 SSD comes back from s2idle"
+    summary = "nvme.noacpi=1 so the SSD comes back from sleep (black screen, no further sleep)"
     details = (
-        "OXP3 units with the Acer Predator GM7 SSD (PCI 1dee:1602) can fail to resume:\n"
-        "the kernel logs 'Disabling device after reset failure: -19', the root file\n"
-        "system goes read-only and the screen stays black or frozen. The firmware asks\n"
-        "for ACPI 'simple suspend' on this drive; nvme.noacpi=1 turns that off and fixed\n"
-        "resume in community testing on the OXP3. Recommended only when a GM7 is\n"
-        "installed; --any-ssd applies it anyway. Needs a reboot."
+        "On the OXP3 the firmware asks for ACPI 'simple suspend' on the SSD, and the\n"
+        "Acer Predator GM7 (PCI 1dee:1602) then fails to come back: the kernel logs\n"
+        "'Disabling device after reset failure: -19', the root file system drops out,\n"
+        "the screen stays black and the device will not sleep again until it is powered\n"
+        "off. nvme.noacpi=1 turns simple suspend off and fixed resume in community\n"
+        "testing on the OXP3. Recommended with the GM7, when the kernel log shows the\n"
+        "failure, or when the firmware uses simple suspend for the installed SSD;\n"
+        "--any-ssd applies it anyway. Costs a little battery while asleep. Needs a reboot."
     )
     takes_effect = "after reboot"
     karg = "nvme.noacpi=1"
 
-    def _check(self, ctx: Context) -> Check:
+    @staticmethod
+    def _evidence(ctx: Context) -> list[str]:
+        ev = ctx.resume_evidence
+        out = []
         if ctx.has_gm7:
-            return Check(True, "", recommended=True)
-        return Check(True, "no Predator GM7 SSD found; only needed (with --any-ssd) if `oxp3-tool diagnose` "
-                           "finds NVMe resume errors")
+            out.append("the Predator GM7 SSD is installed")
+        if ev.nvme_reset_failure:
+            out.append("the kernel log shows the SSD failing to come back from sleep")
+        if ev.simple_suspend:
+            out.append("the firmware uses ACPI simple suspend for the SSD")
+        return out
+
+    def _check(self, ctx: Context) -> Check:
+        evidence = self._evidence(ctx)
+        if evidence:
+            return Check(True, "; ".join(evidence), recommended=True)
+        return Check(True, "no sign of the SSD sleep problem; apply with --any-ssd if waking from sleep "
+                           "leaves a black screen")
 
     def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
         any_ssd = bool(opts.get("any_ssd") or prev.get("any_ssd"))
-        if not ctx.has_gm7 and not any_ssd:
-            raise FixError("no Predator GM7 SSD (1dee:1602) found; pass --any-ssd to apply anyway")
+        evidence = self._evidence(ctx)
+        if not evidence and not any_ssd:
+            raise FixError("no sign of the SSD sleep problem on this unit; pass --any-ssd to apply anyway")
         plan = super().plan(ctx, opts, prev)
-        if any_ssd and not ctx.has_gm7:
+        if any_ssd and not evidence:
             plan.options["any_ssd"] = True
         return plan
 
@@ -535,6 +554,50 @@ class XePanelReplayFix(_KargFix):
         return Check(True)
 
 
+class XeHdrBacklightFix(_KargFix):
+    id = "xe-hdr-backlight"
+    group = DISPLAY
+    level = EXPERIMENTAL
+    title = "Let the kernel drive the OLED's HDR mode"
+    summary = "xe.enable_dpcd_backlight=3 so enabling HDR may stop blanking the panel"
+    details = (
+        "Turning HDR on (Desktop Mode display settings or Game Mode) leaves the OXP3 panel\n"
+        "black. If the panel has Intel's eDP HDR backlight interface, which switches it\n"
+        "into HDR decoding and sets its brightness in nits, the kernel only uses it when\n"
+        "the firmware's video BIOS table asks for it; otherwise the panel never gets its\n"
+        "HDR controls. xe.enable_dpcd_backlight=3 makes the kernel use the interface.\n"
+        "Only offered when the panel reports it (read-only DPCD check, needs root).\n"
+        "Untested on the OXP3: brightness control moves to the panel's AUX channel. Before\n"
+        "trying it, run `ujust configure-grub show` so the boot menu can start the previous\n"
+        "version if the screen stays dark (you need a keyboard there), or keep SSH ready.\n"
+        "Test in Desktop Mode (System Settings > Display > HDR). Game Mode keeps HDR\n"
+        "tone-mapped while oled-profile is applied. Needs a reboot."
+    )
+    takes_effect = "after reboot"
+    karg = "xe.enable_dpcd_backlight=3"
+
+    def _check(self, ctx: Context) -> Check:
+        other = [k for k in ctx.active_kargs + (ctx.pending_kargs or [])
+                 if k.startswith("xe.enable_dpcd_backlight=") and k != self.karg]
+        if other:
+            return Check(False, f"{other[0]} is already set")
+        caps = ctx.edp_caps
+        if caps is None:
+            return Check(True, "could not read the panel's capabilities (run `sudo oxp3-tool status`)")
+        if not caps.intel_hdr_backlight:
+            return Check(False, f"the panel reports {caps.describe()}; forcing the interface would change nothing")
+        if not caps.kernel_can_use_intel_hdr:
+            return Check(False, f"the panel reports {caps.describe()}; the kernel uses the VESA interface there")
+        return Check(True, f"the panel reports {caps.describe()}, which the kernel leaves unused by default")
+
+    def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
+        lines = _karg_live_state(ctx, self.karg, self.id)
+        caps = ctx.edp_caps
+        if caps is not None:
+            lines.append(f"panel: {caps.describe()}")
+        return lines
+
+
 class XeDsbFix(_KargFix):
     id = "xe-dsb-off"
     group = DISPLAY
@@ -560,6 +623,7 @@ ALL_FIXES: list[Fix] = [
     NvmeResumeFix(),
     OledProfileFix(),
     XePanelReplayFix(),
+    XeHdrBacklightFix(),
     XeDsbFix(),
 ]
 

@@ -98,6 +98,66 @@ def parse_edid(data: bytes) -> Optional[EdidInfo]:
     return EdidInfo(vendor=vendor, product=product, name=name)
 
 
+# Intel's eDP HDR backlight ("TCON") capability registers, as used by the
+# kernel's intel_dp_aux_backlight.c.
+DPCD_INTEL_HDR_TCON_CAP = 0x340
+DPCD_EDP_REV = 0x700
+TCON_BRIGHTNESS_NITS_CAP = 0x10
+TCON_2084_DECODE_CAP = 0x01
+EDP_14B = 0x05
+
+
+@dataclass
+class EdpCaps:
+    aux_device: str
+    edp_rev: int
+    tcon: bytes
+
+    @property
+    def intel_hdr_backlight(self) -> bool:
+        """The panel offers Intel's HDR backlight interface with nits-based brightness."""
+        return self.tcon[0] >= 1 and bool(self.tcon[1] & TCON_BRIGHTNESS_NITS_CAP)
+
+    @property
+    def kernel_can_use_intel_hdr(self) -> bool:
+        # The kernel only tries the Intel interface on eDP 1.4b and older.
+        return self.intel_hdr_backlight and self.edp_rev <= EDP_14B
+
+    def describe(self) -> str:
+        revs = {0: "1.1", 1: "1.2", 2: "1.3", 3: "1.4", 4: "1.4a", 5: "1.4b", 6: "1.5"}
+        rev = revs.get(self.edp_rev, hex(self.edp_rev))
+        if self.intel_hdr_backlight:
+            pq = ", PQ decode" if self.tcon[1] & TCON_2084_DECODE_CAP else ""
+            hdr = f"Intel HDR backlight interface v{self.tcon[0]}{pq}"
+        else:
+            hdr = "no Intel HDR backlight interface"
+        return f"eDP {rev}, {hdr}"
+
+
+@dataclass
+class ResumeEvidence:
+    nvme_reset_failure: bool = False  # this boot or the previous one
+    unfinished_resume: bool = False  # previous boot: suspend logged, nothing after it
+    simple_suspend: bool = False  # firmware asked for ACPI simple suspend on an NVMe drive
+
+    def lines(self) -> list[str]:
+        out = []
+        if self.nvme_reset_failure:
+            out.append("the kernel log shows the SSD failing to come back from sleep "
+                       "('Disabling device after reset failure')")
+        if self.unfinished_resume:
+            out.append("the previous boot logged a suspend and nothing after it: whatever happened after "
+                       "waking was never written to disk, which is what a dead SSD looks like")
+        if self.simple_suspend:
+            out.append("the firmware puts the SSD into ACPI 'simple suspend', the path that fails on the OXP3")
+        return out
+
+
+def _unfinished_resume(log: str) -> bool:
+    entry = log.rfind("PM: suspend entry")
+    return entry != -1 and log.find("PM: suspend exit", entry) == -1
+
+
 @dataclass
 class NvmeDrive:
     name: str
@@ -413,6 +473,38 @@ class Context:
     @property
     def has_gm7(self) -> bool:
         return any(d.is_gm7 for d in self.nvme_drives)
+
+    # -- kernel logs -----------------------------------------------------
+
+    def kernel_log(self, boot: int) -> str:
+        """Kernel messages of a boot (0 = this one, -1 = the previous one); empty if unavailable."""
+        cache = self.__dict__.setdefault("_kernel_logs", {})
+        if boot not in cache:
+            res = self.sys.run(["journalctl", "-k", "-b", str(boot), "--no-pager", "-o", "short-monotonic"],
+                               timeout=120)
+            cache[boot] = res.stdout if res.ok else ""
+        return cache[boot]
+
+    @cached_property
+    def resume_evidence(self) -> ResumeEvidence:
+        now, prev = self.kernel_log(0), self.kernel_log(-1)
+        return ResumeEvidence(
+            nvme_reset_failure="Disabling device after reset failure" in now + prev,
+            unfinished_resume=_unfinished_resume(prev),
+            simple_suspend="platform quirk: setting simple suspend" in now,
+        )
+
+    @cached_property
+    def edp_caps(self) -> Optional[EdpCaps]:
+        """Read-only DPCD probe of the internal panel (needs root)."""
+        for conn in self.sys.glob("/sys/class/drm/card*-eDP-*"):
+            for aux in self.sys.glob(f"{conn}/drm_dp_aux*"):
+                dev = "/dev/" + aux.rsplit("/", 1)[-1]
+                tcon = self.sys.read_at(dev, DPCD_INTEL_HDR_TCON_CAP, 4)
+                rev = self.sys.read_at(dev, DPCD_EDP_REV, 1)
+                if tcon is not None and rev is not None:
+                    return EdpCaps(dev, rev[0], tcon)
+        return None
 
     # -- input hardware --------------------------------------------------
 
