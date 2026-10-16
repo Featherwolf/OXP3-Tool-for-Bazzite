@@ -212,9 +212,9 @@ class ButtonsFix(Fix):
         "(--defaults resets it). Apply again after `ujust configure-opengamepadui` switches\n"
         "Game Mode input. The override replaces the whole stock map, so it is only\n"
         "recommended while the stock map is the 0.82.0 one it was written for.\n"
-        "InputPlumber is restarted."
+        "InputPlumber is restarted when the map changes."
     )
-    takes_effect = "immediately (InputPlumber restarts; restart Steam if buttons do nothing)"
+    takes_effect = "immediately (InputPlumber restarts when the map changes; restart Steam if buttons do nothing)"
     OSK_UNIT = templates.OSK_KEY_UNIT_NAME
 
     def check(self, ctx: Context) -> Check:
@@ -266,11 +266,12 @@ class ButtonsFix(Fix):
             files=[FileSpec(map_path, content.encode())],
             options={"actions": actions},
             notes={"upstream_map": ip.upstream_map, "upstream_sha256": upstream_sha, "map_id": ip.map_id,
-                   "game_mode_input": session,
-                   "restart_pending": not restart, "restart_pending_boot": None if restart else ctx.boot_id},
+                   "game_mode_input": session},
             # Without the restart InputPlumber keeps the old map, which may still need a dropped helper.
             stop_dropped_units=restart,
         )
+        # The engine records a restart as pending while it is due and clears it once it ran.
+        map_changes = ctx.sys.sha256(map_path) != sha256_bytes(content.encode())
         if session == OGUI:
             plan.messages.append(
                 "Game Mode runs Steam behind the OpenGamepadUI overlay, so the map is written for it. If you "
@@ -282,7 +283,8 @@ class ButtonsFix(Fix):
                     "controller for native Steam Input only when Game Mode starts, and the InputPlumber restart "
                     "resets it.") if session == NATIVE_STEAM else ""
             plan.post.append(_restart_inputplumber(only_if_changed=(map_path,), note=note))
-        else:
+        elif map_changes:
+            plan.notes.update(restart_pending=True, restart_pending_boot=ctx.boot_id)
             plan.messages.append("InputPlumber was not restarted; the new map loads on the next reboot.")
         if not self._stock_map_known(ctx):
             plan.messages.append(
@@ -352,7 +354,8 @@ class ButtonsFix(Fix):
                 ctx, entry, self.OSK_UNIT, osk_helper.SEND_FAILED,
                 "the last keyboard request could not be handed to Steam",
                 {templates.OSK_KEY_HELPER_PATH: templates.osk_key_helper_script().encode(),
-                 templates.OSK_KEY_UNIT_PATH: templates.OSK_KEY_UNIT.encode()}, "buttons", ok=osk_helper.SENT)
+                 templates.OSK_KEY_UNIT_PATH: templates.OSK_KEY_UNIT.encode()}, "buttons",
+                ok=osk_helper.SENT_GREP)
         for user in ctx.steam_screen_reader_users:
             lines.append(f"warning: Steam's screen reader is on for {user}; it replaces the Steam button shortcuts "
                          "(Steam+X keyboard, Steam+R1 screenshot). See README > Common problems to turn it off")

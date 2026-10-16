@@ -294,7 +294,7 @@ class OskFixTest(unittest.TestCase):
         def runner(argv, timeout=None):
             if argv[0] == "journalctl" and self.UNIT in argv:
                 # journalctl -r --grep A|B -n 1: the newest line matching either marker.
-                self.assertEqual(argv[argv.index("--grep") + 1], f"{osk_helper.SEND_FAILED}|{osk_helper.SENT}")
+                self.assertEqual(argv[argv.index("--grep") + 1], f"{osk_helper.SEND_FAILED}|{osk_helper.SENT_GREP}")
                 self.assertIn("-r", argv)
                 return CommandResult(0, log[-1] + "\n") if log else CommandResult(1)
             return real_run(argv, timeout)
@@ -306,8 +306,12 @@ class OskFixTest(unittest.TestCase):
         log.append(osk_helper.SENT + " (uid 1000)")  # a later press worked
         rc, out, _ = self.cli("status", system=System(self.root, runner))
         self.assertNotIn(warning, out)
-        for marker in (osk_helper.SENT, osk_helper.SEND_FAILED):
+        for marker in (osk_helper.SENT_GREP, osk_helper.SEND_FAILED):
             self.assertRegex(marker, r"^[A-Za-z ]+$")  # plain text inside journalctl's regex
+        # The success line of this helper and of its first version both match; the failure line does not.
+        self.assertIn(osk_helper.SENT_GREP, osk_helper.SENT + " (uid 1000)")
+        self.assertIn(osk_helper.SENT_GREP, "asked Steam (uid 1000) to open the keyboard")
+        self.assertNotIn(osk_helper.SENT_GREP, osk_helper.SEND_FAILED + ": writing ~/.steam/steam.pipe failed")
         with mock.patch.object(templates, "osk_key_helper_script", lambda: "#!/usr/bin/python3 -I\n# new\n"):
             rc, out, _ = self.cli("status")
             self.assertIn("installed by an older oxp3-tool; run `sudo oxp3-tool apply buttons`", out)
@@ -327,6 +331,30 @@ class OskFixTest(unittest.TestCase):
         rc, out, _ = self.cli("apply", "--yes", "buttons")
         self.assertIn("finish the InputPlumber restart skipped earlier", out)
         self.assertIn("systemctl try-restart inputplumber.service", self.calls())
+
+    def test_failed_apply_keeps_the_restart_pending(self):
+        self.f.runner.fail.add(f"systemctl enable {self.UNIT}")
+        rc, _, _ = self.cli("apply", "--yes", "buttons")
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("systemctl try-restart inputplumber.service", self.calls())
+        self.f.runner.fail.clear()
+        rc, out, err = self.cli("apply", "--yes", "buttons")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("systemctl try-restart inputplumber.service", self.calls())
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("InputPlumber has not been restarted", out)
+
+    def test_no_restart_helper_update_is_not_a_pending_restart(self):
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        with mock.patch.object(templates, "osk_key_helper_script", lambda: "#!/usr/bin/python3 -I\n# new\n"):
+            rc, out, _ = self.cli("apply", "--yes", "buttons", "--no-restart")
+            self.assertNotIn("InputPlumber was not restarted", out)
+            rc, out, _ = self.cli("status")
+            self.assertNotIn("InputPlumber has not been restarted", out)
+            self.f.runner.calls.clear()
+            rc, out, _ = self.cli("apply", "--yes", "buttons")
+        self.assertIn("already applied, nothing to change", out)
+        self.assertNotIn("systemctl try-restart inputplumber.service", self.calls())
 
     def test_helper_update_leaves_inputplumber_alone(self):
         self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
@@ -371,6 +399,22 @@ class OskFixTest(unittest.TestCase):
                 self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
         self.assertEqual(self.cli("apply", "--yes", "buttons", "xbox-key")[0], 0)
         self.assertEqual(self.cli("revert", "--yes", "--all")[0], 0)
+        self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
+
+    def test_shared_directory_with_state_from_the_first_version(self):
+        import json
+        from oxp3_tool.state import STATE_FILE
+        from .test_xbox_key import IP_LOG
+        self.f.mcu_hidraw()
+        self.f.runner.ip_journal = IP_LOG
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "xbox-key")[0], 0)
+        path = self.root / STATE_FILE.lstrip("/")
+        data = json.loads(path.read_text())
+        data["fixes"]["xbox-key"]["dirs_created"] = []  # recorded only by the fix that created it
+        path.write_text(json.dumps(data))
+        self.assertEqual(self.cli("revert", "--yes", "buttons")[0], 0)
+        self.assertTrue((self.root / "usr/local/libexec/oxp3-tool").exists())
+        self.assertEqual(self.cli("revert", "--yes", "xbox-key")[0], 0)
         self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
 
     def test_lost_state_still_owns_the_unit(self):

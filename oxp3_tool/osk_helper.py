@@ -43,6 +43,7 @@ PIPE_LINE = f"'~/.steam/root/ubuntu12_32/steam' '{URL}'\n"
 # Logged per press; oxp3-tool status warns when the last one was a failure. A
 # success only means the request reached Steam's pipe, not that Steam showed its keyboard.
 SENT = "asked Steam to open the keyboard"
+SENT_GREP = "to open the keyboard"  # also matches the first version's "asked Steam (uid N) to open the keyboard"
 SEND_FAILED = "could not hand the keyboard request to Steam"
 OWNER_RECHECK = 1.0  # seconds between two lookups of InputPlumber's bus name
 

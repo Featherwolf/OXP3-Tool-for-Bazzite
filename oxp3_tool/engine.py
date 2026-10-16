@@ -278,8 +278,14 @@ class Engine:
 
         post: list[PostStep] = []
         done: list[Fix] = []
+        restarting: list[Fix] = []
         for fix, plan in todo:
             due = self._due_steps(fix, plan)
+            gated = any(s.only_if_changed for s in due)
+            if gated:
+                # Write-ahead: a failed or interrupted run leaves the restart pending, so the next run does it.
+                self.state.entry(fix.id)["notes"].update(restart_pending=True, restart_pending_boot=self.ctx.boot_id)
+                self.state.save()
             try:
                 dropped = self._apply_local(fix, plan)
             except OSError as e:
@@ -293,6 +299,8 @@ class Engine:
             post += due
             outcome.messages += plan.messages + [s.note for s in due if s.note]
             done.append(fix)
+            if gated:
+                restarting.append(fix)
 
         if wanted_kargs:
             self._apply_kargs([(f, p) for f, p in todo if f in done], outcome)
@@ -300,6 +308,10 @@ class Engine:
         if post:
             self.out("Finishing up:")
             self._run_post(post, outcome)
+        for fix in restarting:
+            self.state.entry(fix.id)["notes"].update(restart_pending=False, restart_pending_boot=None)
+        if restarting:
+            self.state.save()
         for fix in done:
             outcome.messages += fix.after_apply(self.ctx)
         outcome.messages = self.notes + outcome.messages
@@ -540,9 +552,12 @@ class Engine:
                     self._disable_unit(unit)
                     entry["units_enabled"].remove(unit)
                     self.state.save()
-                for rec in list(entry.get("files", [])):
+                records = list(entry.get("files", []))
+                for rec in records:
                     self._drop_file(fix_id, entry, rec)
-                for d in sorted(entry.get("dirs_created", []), key=len, reverse=True):
+                # Also for state from before every fix recorded the shared directories.
+                tool_dirs = [d for d in TOOL_DIRS if any(r["path"].startswith(d + "/") for r in records)]
+                for d in sorted(set(entry.get("dirs_created", []) + tool_dirs), key=len, reverse=True):
                     self.sys.rmdir_if_empty(d)
                 entry["dirs_created"] = []  # a directory still in use is no longer ours to remove
             except OSError as e:
