@@ -50,8 +50,10 @@ _LIST_MODE_RE = re.compile(r"^\t\t" + _MODE + "$")
 _PSR_MODE_RE = re.compile(r"^PSR mode: (?P<mode>.*)$", re.M)
 _DMC_VERSION_RE = re.compile(r"^version: (\d+)\.(\d+)$", re.M)
 _DMC_LOADED_RE = re.compile(r"^fw loaded: (yes|no)$", re.M)
-# "xe 0000:00:02.0: [drm] Finished loading DMC firmware i915/xe3lpd_dmc.bin (v2.36)"
-_DMC_LOG_RE = re.compile(r"(\S+): \[drm\] Finished loading DMC firmware \S+ \(v(\d+)\.(\d+)\)")
+# "xe 0000:00:02.0: [drm] Finished loading DMC firmware i915/xe3lpd_dmc.bin (v2.36)"; the
+# literal prefix keeps the scan fast on logs flooded with DSB errors.
+_DMC_LOG_RE = re.compile(r"Finished loading DMC firmware \S+ \(v(\d+)\.(\d+)\)")
+_DMC_LOG_DEV_RE = re.compile(r"(\S+): \[drm\] $")
 _DSB_ERROR_RE = re.compile(r"DSB \d+ poll error")
 _PSR_ERROR_RE = re.compile(r"Selective fetch area calculation failed|Timed out waiting PSR idle state|PSR aux error")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -151,8 +153,14 @@ def parse_dmc_info(text: str) -> tuple[Optional[bool], Optional[tuple[int, int]]
 
 def dmc_version_from_log(kernel_log: str, device: Optional[str] = None) -> Optional[tuple[int, int]]:
     """The last display firmware version the kernel loaded this boot, for ``device`` (PCI address) if given."""
-    found = [(int(major), int(minor)) for dev, major, minor in _DMC_LOG_RE.findall(kernel_log)
-             if device is None or dev == device]
+    found = []
+    for m in _DMC_LOG_RE.finditer(kernel_log):
+        if device is not None:
+            line_start = kernel_log.rfind("\n", 0, m.start()) + 1
+            dev = _DMC_LOG_DEV_RE.search(kernel_log, line_start, m.start())
+            if not dev or dev.group(1) != device:
+                continue
+        found.append((int(m.group(1)), int(m.group(2))))
     return found[-1] if found else None
 
 
@@ -164,12 +172,43 @@ def count_psr_errors(kernel_log: str) -> int:
     return len(_PSR_ERROR_RE.findall(kernel_log))
 
 
+def _kwin_int(value: object) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2 ** 31 else None
+
+
+def _kwin_mode_mhz(mode: dict) -> Optional[int]:
+    """Saved refresh rate in mHz, read the way KWin does.
+
+    KWin 6.8 writes {"cvt": {clock, htotal, vtotal, vscan, flags, ...}} or
+    {"basic": {refreshRate, ...}}; 6.7 and older wrote a top-level refreshRate.
+    """
+    cvt = mode.get("cvt")
+    if isinstance(cvt, dict) and cvt:
+        clock, htotal, vtotal = (_kwin_int(cvt.get(k)) for k in ("clock", "htotal", "vtotal"))
+        if clock and htotal and vtotal:
+            mhz = (clock * 1_000_000 // htotal + vtotal // 2) // vtotal  # CvtModeline::refreshRate()
+            flags = cvt.get("flags") if isinstance(cvt.get("flags"), int) else 0
+            if flags & 0x10:  # DRM_MODE_FLAG_INTERLACE
+                mhz *= 2
+            if flags & 0x20:  # DRM_MODE_FLAG_DBLSCAN
+                mhz //= 2
+            vscan = _kwin_int(cvt.get("vscan"))
+            if vscan and vscan > 1:
+                mhz //= vscan
+            return mhz
+    basic = mode.get("basic")
+    if isinstance(basic, dict) and _kwin_int(basic.get("refreshRate")):
+        return basic["refreshRate"]
+    return _kwin_int(mode.get("refreshRate"))
+
+
 @dataclass
 class KwinOutput:
     refresh_mhz: Optional[int]
     vrr_policy: Optional[str]  # "Never", "Automatic", "Always" or None (not saved)
     hdr: Optional[bool]
     user: Optional[str] = None
+    wcg: Optional[bool] = None  # wide color gamut
 
     @property
     def refresh_hz(self) -> Optional[float]:
@@ -181,7 +220,7 @@ class KwinOutput:
             vrr = f"Adaptive Sync {self.vrr_policy}"
         else:
             vrr = "Adaptive Sync not saved (KWin's default is Never)"
-        hdr = ", HDR on" if self.hdr else ""
+        hdr = ", HDR on" if self.hdr else ", wide color gamut on" if self.wcg else ""
         return f"{rate}, {vrr}{hdr}"
 
 
@@ -228,15 +267,17 @@ def parse_kwin_outputs(data: bytes, panel_vendor: str, panel_product: int,
             else:
                 continue
             mode = out.get("mode") if isinstance(out.get("mode"), dict) else {}
-            rate = mode.get("refreshRate")
-            valid_rate = isinstance(rate, int) and not isinstance(rate, bool) and 0 < rate <= 1_000_000
+            rate = _kwin_mode_mhz(mode)
+            valid_rate = rate is not None and 0 < rate <= 1_000_000
             policy = out.get("vrrPolicy")
             hdr = out.get("highDynamicRange")
+            wcg = out.get("wideColorGamut")
             target.append(KwinOutput(
                 refresh_mhz=rate if valid_rate else None,
                 vrr_policy=policy if policy in ("Never", "Automatic", "Always") else None,
                 hdr=hdr if isinstance(hdr, bool) else None,
                 user=user,
+                wcg=wcg if isinstance(wcg, bool) else None,
             ))
         break  # KWin reads only the first "outputs" section
     return by_id or by_connector
@@ -257,6 +298,7 @@ class RefreshState:
     dsb_errors: int = 0
     psr_errors: int = 0
     kwin: list[KwinOutput] = field(default_factory=list)
+    kwin_is_mine: bool = False  # kwin holds only the invoking user's settings
     game_mode: bool = True
     awaiting_reboot: frozenset = frozenset()  # kernel arguments set for the next boot only
     panel_replay_blocked: bool = False  # PSR kargs set that xe-panel-replay-off refuses to combine with
@@ -285,7 +327,7 @@ class RefreshState:
 
     def _label(self, out: KwinOutput) -> str:
         users = {k.user for k in self.kwin}
-        return f" ({out.user})" if out.user and len(users) > 1 else ""
+        return f" ({out.user})" if out.user and (len(users) > 1 or not self.kwin_is_mine) else ""
 
     def summary(self) -> list[str]:
         lines = []
@@ -346,7 +388,7 @@ class RefreshState:
         if risk:
             if self.dc_balance_on:
                 cause = ("xe.enable_dc_balance=1 turns VRR DC balance back on, so variable refresh holds the screen "
-                         f"far below {full} Hz. Remove it (`sudo rpm-ostree kargs --delete=xe.enable_dc_balance=1`)"
+                         f"far below {full} Hz. Remove it (`sudo rpm-ostree kargs --delete=xe.enable_dc_balance`)"
                          " or keep variable refresh off.")
             else:
                 cause = (f"On this kernel with this display firmware, variable refresh holds the screen far below "
@@ -377,6 +419,14 @@ class RefreshState:
         if self.dmc_loaded is False:
             out.append("The display firmware (DMC) did not load (see `journalctl -k | grep DMC`), so the display's "
                        "power saving is off.")
+        for k in self.kwin:
+            if k.hdr or k.wcg:
+                what = "HDR" if k.hdr else "wide color gamut"
+                out.append(f"Desktop Mode{self._label(k)} has {what} switched on for the built-in screen. On this "
+                           "panel with the Intel driver that turns the screen black (KDE bug 525650, no fix yet). "
+                           f"Switch it off, over SSH if the screen is black: `kscreen-doctor output.{name}.hdr.disable "
+                           f"output.{name}.wcg.disable`.")
+                break
         if self.dsb_errors:
             if DSB_OFF_KARG in self.awaiting_reboot:
                 out.append(f"The kernel logged {self.dsb_errors} 'DSB poll error' messages this boot; xe-dsb-off "

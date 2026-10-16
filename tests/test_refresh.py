@@ -95,6 +95,17 @@ class ParseTest(unittest.TestCase):
         self.assertEqual((outs[0].refresh_hz, outs[0].vrr_policy, outs[0].hdr, outs[0].user),
                          (60.0, "Automatic", True, "gamer"))
 
+    def test_kwin_68_mode_format(self):
+        doc = [{"name": "outputs", "data": [
+            {"edidIdentifier": "SDC 17153 0 1 2025 0", "connectorName": "eDP-1",
+             "mode": {"flags": 1, "cvt": {"clock": 380160, "hdisplay": 1920, "htotal": 2000, "vdisplay": 1200,
+                                          "vtotal": 3168, "vscan": 0, "flags": 10}}}]}]
+        outs = display.parse_kwin_outputs(json.dumps(doc).encode(), "SDC", 0x4301)
+        self.assertEqual(round(outs[0].refresh_hz), 60)
+        doc[0]["data"][0]["mode"] = {"basic": {"width": 1920, "height": 1200, "refreshRate": 143999}}
+        outs = display.parse_kwin_outputs(json.dumps(doc).encode(), "SDC", 0x4301)
+        self.assertEqual(outs[0].refresh_mhz, 143999)
+
     def test_kwin_connector_only_entry(self):
         doc = [{"name": "outputs", "data": [{"connectorName": "eDP-1"}, {"connectorName": "eDP-1"}]}]
         outs = display.parse_kwin_outputs(json.dumps(doc).encode(), "SDC", 0x4301)
@@ -170,7 +181,14 @@ class RefreshStateTest(unittest.TestCase):
         self.assertTrue(self.state().dc_balance_risk)
         out = self.status()
         self.assertIn("xe.enable_dc_balance=1 turns the variable-refresh bug back on", out)
-        self.assertIn("rpm-ostree kargs --delete=xe.enable_dc_balance=1", out)
+        self.assertIn("rpm-ostree kargs --delete=xe.enable_dc_balance`", out)
+
+    def test_dc_balance_on_from_cmdline_without_root(self):
+        self.f.display_debugfs()
+        self.f.mkdir("/sys/module/xe/parameters/enable_dc_balance")  # exists but unreadable as a file
+        self.f.runner.kargs.append("xe.enable_dc_balance=1")
+        self.f.boot()
+        self.assertTrue(self.state().dc_balance_on)
 
     def test_older_firmware_gives_no_vrr_warning(self):
         self.f.display_debugfs(dmc="2.32")
@@ -313,6 +331,24 @@ class RefreshStateTest(unittest.TestCase):
             st = self.state()
         self.assertEqual(sorted(k.user for k in st.kwin), ["gamer", "guest"])
         self.assertIn("Desktop Mode (guest) is set to 60 Hz.", st.advice()[0])
+
+    def test_other_users_settings_are_labelled(self):
+        if os.geteuid() != 0:
+            self.skipTest("needs root to give the home another owner")
+        self.f.kwin_config("guest", refresh_mhz=60000, vrr="Never")
+        os.chown(self.root / "var/home/guest", os.getuid() + 1, -1)
+        with mock.patch.dict(os.environ, {"SUDO_UID": str(os.getuid())}):
+            st = self.state()
+        self.assertFalse(st.kwin_is_mine)
+        self.assertIn("Desktop Mode (guest) is set to 60 Hz.", st.advice()[0])
+
+    def test_saved_hdr_is_flagged(self):
+        self.f.display_debugfs()
+        self.f.kwin_config(vrr="Never", hdr=True)
+        out = " ".join(self.status().split())
+        self.assertIn("Desktop Mode setting: 144 Hz, Adaptive Sync Never, HDR on", out)
+        self.assertIn("Desktop Mode has HDR switched on for the built-in screen", out)
+        self.assertIn("`kscreen-doctor output.eDP-1.hdr.disable output.eDP-1.wcg.disable`", out)
 
     def test_read_regular(self):
         sys = self.f.system()

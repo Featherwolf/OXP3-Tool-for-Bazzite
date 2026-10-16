@@ -13,8 +13,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import templates
+from . import templates, xbox_helper
 from .detect import IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
+from .system import sha256_bytes
 
 CONTROLLER = "controller"
 DISPLAY = "display"
@@ -282,7 +283,7 @@ class XboxKeyFix(Fix):
     group = CONTROLLER
     level = OPTIONAL
     title = "Xbox key as the Steam button"
-    summary = "Helper that makes the Xbox key (vendor button 0x25) work as the Steam button"
+    summary = "Helper that makes the Xbox key (vendor button 0x25) tap the Steam button"
     details = (
         "On some OXP3 units the controller reports the Xbox key (the lit logo key below\n"
         "Home) only on its vendor interface, as button 0x25. InputPlumber 0.82 cannot\n"
@@ -291,8 +292,10 @@ class XboxKeyFix(Fix):
         "controller (OneXConsole on Windows can change it); on others the key arrives as\n"
         "the normal Xbox guide button and works without this fix.\n"
         "This installs a small helper and a systemd service that read that interface\n"
-        "(read-only: nothing is written to the controller) and send the Steam button to\n"
-        "InputPlumber over D-Bus while the key is held, so Steam+button shortcuts work too.\n"
+        "(read-only: nothing is written to the controller) and, on each press, ask\n"
+        "InputPlumber over D-Bus for a Steam button tap (opens the Steam menu). Holding\n"
+        "the key for Steam+button shortcuts does not work this way (InputPlumber 0.82's\n"
+        "hold-capable D-Bus call is broken); use Home for those.\n"
         f"Files: {templates.XBOX_KEY_HELPER_PATH} and {templates.XBOX_KEY_UNIT_PATH}.\n"
         "Recommended when InputPlumber's log shows button 25 this boot (press the key\n"
         "once, then run `sudo oxp3-tool status`). The key always sends the Steam button\n"
@@ -310,6 +313,9 @@ class XboxKeyFix(Fix):
             return Check(False, "the controller's vendor interface (1a86:fe00, interface 2) was not found")
         if not ctx.sys.exists("/usr/bin/busctl"):
             return Check(False, "busctl is not installed")
+        if ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH):
+            # Keeps a plain `apply` after a tool update refreshing the installed helper.
+            return Check(True, "the helper is installed", recommended=True)
         seen = ctx.ip_undecoded_buttons
         if seen and XBOX_KEY_BUTTON in seen:
             return Check(True, "InputPlumber logged the Xbox key as button 0x25 this boot, which it cannot read",
@@ -335,7 +341,8 @@ class XboxKeyFix(Fix):
         state = ctx.unit_state(self.UNIT)
         if state != "active":
             return [f"{self.UNIT} is {state or 'not running'}; see `journalctl -u {self.UNIT}`"]
-        return []
+        return ["Press the Xbox key in Game Mode; if nothing happens, `sudo oxp3-tool status` shows "
+                "whether the helper could reach InputPlumber."]
 
     def revert_post(self, ctx: Context) -> list[PostStep]:
         return [
@@ -348,7 +355,18 @@ class XboxKeyFix(Fix):
         line = f"{self.UNIT} is {state}"
         if state != "active":
             line += f"; see `journalctl -u {self.UNIT}`"
-        return [line]
+        lines = [line]
+        res = ctx.sys.run(["journalctl", "-u", self.UNIT, "-b", "0", "--no-pager", "-q", "-o", "cat",
+                           "--grep", xbox_helper.SEND_FAILED, "-n", "1"], timeout=30)
+        if xbox_helper.SEND_FAILED in res.stdout:
+            lines.append("warning: the helper could not deliver the Xbox key to InputPlumber this boot; "
+                         f"see `journalctl -u {self.UNIT}`")
+        wanted = {templates.XBOX_KEY_HELPER_PATH: templates.xbox_key_helper_script().encode(),
+                  templates.XBOX_KEY_UNIT_PATH: templates.XBOX_KEY_UNIT.encode()}
+        recorded = {r["path"]: r.get("sha256") for r in (entry or {}).get("files", [])}
+        if any(recorded.get(p) == ctx.sys.sha256(p) != sha256_bytes(c) for p, c in wanted.items()):
+            lines.append("installed by an older oxp3-tool; run `sudo oxp3-tool apply xbox-key` to update it")
+        return lines
 
 
 class VolumeKeysFix(Fix):
@@ -598,7 +616,8 @@ class OledProfileFix(Fix):
         "that keeps the panel in its native gamma 2.2 mode (the Steam Deck OLED approach):\n"
         "HDR still works through gamescope's tone mapping. It also lists the panel's\n"
         "48-144 Hz refresh rates; --min-refresh=30 extends that down to 30 Hz (untested,\n"
-        "kept when you apply again). Only Game Mode (bazzite-deck images) uses it."
+        "kept when you apply again). Only Game Mode (bazzite-deck images) uses it; it does\n"
+        "not change HDR in Desktop Mode, where KDE always sends PQ (keep HDR off there)."
     )
     takes_effect = "next time Game Mode starts"
     LUA = "/etc/gamescope/scripts/90-oxp3-tool-oled.lua"
@@ -680,15 +699,17 @@ class XeHdrBacklightFix(_KargFix):
     id = "xe-hdr-backlight"
     group = DISPLAY
     level = EXPERIMENTAL
-    title = "Let the kernel drive the OLED's HDR mode"
-    summary = "xe.enable_dpcd_backlight=3 so enabling HDR may stop blanking the panel"
+    title = "Force Intel's panel backlight interface"
+    summary = "xe.enable_dpcd_backlight=3 (not shown to fix HDR blanking; n/a on eDP 1.5 panels)"
     details = (
-        "Turning HDR on (Desktop Mode display settings or Game Mode) leaves the OXP3 panel\n"
-        "black. If the panel has Intel's eDP HDR backlight interface, which switches it\n"
-        "into HDR decoding and sets its brightness in nits, the kernel only uses it when\n"
-        "the firmware's video BIOS table asks for it; otherwise the panel never gets its\n"
-        "HDR controls. xe.enable_dpcd_backlight=3 makes the kernel use the interface.\n"
-        "Only offered when the panel reports it (read-only DPCD check, needs root).\n"
+        "Makes the kernel use Intel's eDP HDR backlight interface, which switches the\n"
+        "panel into HDR decoding and sets its brightness in nits. Only offered when the\n"
+        "panel reports the interface and eDP 1.4b or older (read-only DPCD check, needs\n"
+        "root): the kernel never uses it on eDP 1.5 panels, which is what OXP3 panels have\n"
+        "reported so far. No report shows it fixing the Desktop Mode HDR black screen,\n"
+        "which also happens on other Intel OLED laptops (KDE bug 525650); on a Panther\n"
+        "Lake Dell XPS 14 OLED it left brightness dead. The kernel log hint suggesting\n"
+        "enable_dpcd_backlight=3 is not a reliable sign that it helps.\n"
         "Untested on the OXP3: HDR brightness moves to the panel's AUX channel, and SDR\n"
         "brightness too if the panel reports 'SDR brightness over AUX' (otherwise it stays\n"
         "on the SoC's PWM output, and a slider that works today may stop working). Before\n"
@@ -714,7 +735,7 @@ class XeHdrBacklightFix(_KargFix):
             return Check(False, f"the panel reports {caps.describe()}; forcing the interface would change nothing")
         if not caps.kernel_can_use_intel_hdr:
             return Check(False, f"the panel reports {caps.describe()}; the kernel uses the VESA interface there")
-        return Check(True, f"the panel reports {caps.describe()}, which the kernel leaves unused by default")
+        return Check(True, f"the panel reports {caps.describe()}; untested, not shown to fix HDR")
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
         lines = _karg_live_state(ctx, self.karg, self.id)

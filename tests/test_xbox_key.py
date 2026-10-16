@@ -67,9 +67,36 @@ class HelperTest(unittest.TestCase):
             sender.send(True)
         sends = [c for c in calls if c[0] == "call"]
         self.assertEqual(len(sends), 2)  # first failed (InputPlumber restarted), looked up again, sent
+        # SendEvent panics inside InputPlumber 0.82; SendButtonChord gives a tap.
         self.assertEqual(sends[-1][2:], ("/org/shadowblip/InputPlumber/CompositeDevice1",
-                                         xbox_helper.IFACE, "SendEvent", "sv", "Gamepad:Button:Guide", "b", "true"))
+                                         xbox_helper.IFACE, "SendButtonChord", "as", "1", "Gamepad:Button:Guide"))
         self.assertTrue(sender.pressed)
+
+    def test_one_tap_per_press(self):
+        calls = []
+
+        def fake_busctl(*args):
+            calls.append(args)
+            if args[0] == "--list":
+                return "/org/shadowblip/InputPlumber/CompositeDevice0\n"
+            if args[0] == "get-property":
+                return 's "ONEXPLAYER 3"\n'
+            return ""
+
+        with mock.patch.object(xbox_helper, "busctl", fake_busctl):
+            sender = xbox_helper.Sender()
+            for state in (True, True, False, False, True, False):
+                sender.send(state)
+        self.assertEqual(len([c for c in calls if c[0] == "call"]), 2)
+        self.assertEqual(len([c for c in calls if c[0] == "--list"]), 1)  # the device path is kept
+
+    def test_failure_is_logged_with_the_marker_status_reads(self):
+        stderr = io.StringIO()
+        with mock.patch.object(xbox_helper, "busctl", lambda *a: None), contextlib.redirect_stderr(stderr):
+            sender = xbox_helper.Sender()
+            sender.send(True)
+        self.assertIn(xbox_helper.SEND_FAILED, stderr.getvalue())
+        self.assertTrue(sender.pressed)  # tracked from the frames, so the release is not mistaken for a press
 
     def test_installed_script_is_standalone(self):
         script = templates.xbox_key_helper_script()
@@ -146,6 +173,30 @@ class XboxKeyFixTest(unittest.TestCase):
         self.assertFalse(unit.exists())
         self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
         self.assertEqual(self.f.runner.unit_enabled[templates.XBOX_KEY_UNIT_NAME], "disabled")
+
+    def test_status_reports_delivery_failures_and_stale_helper(self):
+        self.f.mcu_hidraw()
+        self.f.runner.ip_journal = IP_LOG
+        self.assertEqual(self.cli("apply", "--yes", "xbox-key")[0], 0)
+        real_run = self.f.runner.__call__
+
+        def runner(argv, timeout=None):
+            if argv[0] == "journalctl" and templates.XBOX_KEY_UNIT_NAME in argv:
+                from oxp3_tool.system import CommandResult
+                return CommandResult(0, xbox_helper.SEND_FAILED + "\n")
+            return real_run(argv, timeout)
+
+        from oxp3_tool.system import System
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main(["status"], system=System(self.root, runner))
+        self.assertIn("could not deliver the Xbox key to InputPlumber", out.getvalue())
+        # An older tool's helper: same recorded sha as on disk, different from the current template.
+        with mock.patch.object(templates, "xbox_key_helper_script", lambda: "#!/usr/bin/python3 -I\n# new\n"):
+            rc, out, _ = self.cli("status")
+            self.assertIn("installed by an older oxp3-tool", out)
+            rc, out, _ = self.cli("apply", "--dry-run")
+            self.assertIn(f"update {templates.XBOX_KEY_HELPER_PATH}", out)
 
     def test_recommended_apply_includes_it_when_needed(self):
         self.f.mcu_hidraw()

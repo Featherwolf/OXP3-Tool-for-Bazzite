@@ -4,8 +4,10 @@ On some OXP3 units the controller MCU reports the Xbox key only on its vendor
 HID interface, as button 0x25 (frame ``b2 3f 01 01 1f 80 25 ...``), and
 InputPlumber 0.82 cannot decode that id, so the key does nothing. This helper
 reads the same vendor interface (read-only: it never writes to the controller)
-and sends Gamepad:Button:Guide press and release events to InputPlumber's
-ONEXPLAYER 3 composite device over D-Bus (SendEvent).
+and, on each press, asks InputPlumber's ONEXPLAYER 3 composite device over
+D-Bus for a Steam button tap (SendButtonChord: press, then release 80 ms
+later). SendEvent, which could hold the button, panics inside InputPlumber
+0.82 (blocking_send on a tokio worker), so holds are not possible this way.
 
 The xbox-key fix installs this file as a standalone script and runs it as a
 systemd service. It only uses the standard library and busctl.
@@ -33,6 +35,8 @@ IFACE = "org.shadowblip.Input.CompositeDevice"
 BUSCTL = "/usr/bin/busctl"
 PACKET_SIZE = 64
 RETRY_SECONDS = 2.0
+# Logged when a press could not be delivered; oxp3-tool status looks for it.
+SEND_FAILED = "could not send the Steam button to InputPlumber"
 
 _COMPOSITE_RE = re.compile(r"^/org/shadowblip/InputPlumber/CompositeDevice\d+$")
 
@@ -77,11 +81,15 @@ def parse_report(data: bytes) -> Optional[bool]:
 
 def busctl(*args: str) -> Optional[str]:
     try:
-        res = subprocess.run([BUSCTL, "--system", *args], capture_output=True, text=True, timeout=5)
+        res = subprocess.run([BUSCTL, "--system", "--timeout=2", *args], capture_output=True, text=True,
+                             timeout=5)
     except (OSError, subprocess.TimeoutExpired) as e:
-        log(f"busctl failed: {e}")
+        log(f"busctl {args[0]} failed: {e}")
         return None
-    return res.stdout if res.returncode == 0 else None
+    if res.returncode != 0:
+        log(f"busctl {args[0]} failed: {res.stderr.strip()[:200]}")
+        return None
+    return res.stdout
 
 
 def find_composite() -> Optional[str]:
@@ -101,20 +109,21 @@ def find_composite() -> Optional[str]:
 class Sender:
     def __init__(self) -> None:
         self.path: Optional[str] = None
-        self.pressed = False
+        self.pressed = False  # the key's state from the frames
 
     def send(self, pressed: bool) -> None:
+        was, self.pressed = self.pressed, pressed
+        if not pressed or was:
+            return  # the tap already includes the release
         for _ in range(2):
             if self.path is None:
                 self.path = find_composite()
                 if self.path is None:
-                    log("InputPlumber has no ONEXPLAYER 3 device right now")
-                    return
-            value = "true" if pressed else "false"
-            if busctl("call", BUS, self.path, IFACE, "SendEvent", "sv", EVENT, "b", value) is not None:
-                self.pressed = pressed
+                    break
+            if busctl("call", BUS, self.path, IFACE, "SendButtonChord", "as", "1", EVENT) is not None:
                 return
             self.path = None  # InputPlumber restarted: look the device up again
+        log(SEND_FAILED)
 
 
 def run() -> int:
@@ -152,12 +161,10 @@ def run() -> int:
                 log(f"{node}: {e}; reopening")
             finally:
                 os.close(fd)
-            if sender.pressed:
-                sender.send(False)
+            sender.pressed = False
             time.sleep(RETRY_SECONDS)
     finally:
-        if sender.pressed:
-            sender.send(False)
+        sender.pressed = False
 
 
 if __name__ == "__main__":

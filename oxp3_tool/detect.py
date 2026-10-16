@@ -608,8 +608,16 @@ class Context:
             st.dmc_version = dmc_version_from_log(self.kernel_log(0), device)
         if self.xe_loaded:
             st.dc_balance_param = self.sys.exists(DC_BALANCE_PARAM)
-            # 0400, so only root sees the value; the default is off.
-            st.dc_balance_on = self.sys.read_attr(DC_BALANCE_PARAM) in ("Y", "1")
+            # 0400, so only root sees the value (the default is off); without root
+            # fall back to the kernel command line, where a bare bool parameter means on.
+            value = self.sys.read_attr(DC_BALANCE_PARAM)
+            if value is None:
+                for k in self.active_kargs:
+                    key, _, v = k.partition("=")
+                    if key.replace("-", "_") == "xe.enable_dc_balance":
+                        value = v or "Y"
+            value = (value or "").strip()
+            st.dc_balance_on = value[:1] in ("Y", "y", "1", "T", "t") or value.lower() == "on"
         log = self.kernel_log(0)
         st.dsb_errors = count_dsb_errors(log)
         st.psr_errors = count_psr_errors(log)
@@ -617,7 +625,7 @@ class Context:
                                        if self.karg_pending(k) and not self.karg_active(k))
         st.panel_replay_blocked = any(self.karg_active(k) or self.karg_pending(k)
                                       for k in ("xe.enable_psr=0", "xe.enable_psr2_sel_fetch=0"))
-        st.kwin = self._kwin_outputs(panel[1] if panel else None)
+        st.kwin, st.kwin_is_mine = self._kwin_outputs(panel[1] if panel else None)
         return st
 
     @property
@@ -625,8 +633,9 @@ class Context:
         """The refresh checks are written for the OXP3 panel on xe; other panels are skipped."""
         return bool(self.xe_loaded or self.refresh_state.kwin) and self.panel_is_known is not False
 
-    def _kwin_outputs(self, edid: Optional[EdidInfo]) -> list[KwinOutput]:
-        """KWin's saved settings for the panel; only the invoking user's when they have any."""
+    def _kwin_outputs(self, edid: Optional[EdidInfo]) -> tuple[list[KwinOutput], bool]:
+        """KWin's saved settings for the panel: only the invoking user's when they have any
+        (then True), otherwise every user's."""
         vendor, product = (edid.vendor, edid.product) if edid else (OXP3_PANEL_VENDOR, OXP3_PANEL_PRODUCT)
         try:
             me = int(os.environ.get("SUDO_UID") or os.environ.get("PKEXEC_UID") or os.getuid())
@@ -646,8 +655,8 @@ class Context:
                         mine.append(user)
                 except OSError:
                     pass
-        users = [u for u in mine if by_user[u]] or list(by_user)
-        return [out for u in users for out in by_user[u]]
+        users = [u for u in mine if by_user[u]]
+        return [out for u in (users or by_user) for out in by_user[u]], bool(users)
 
     # -- Game Mode -------------------------------------------------------
 
