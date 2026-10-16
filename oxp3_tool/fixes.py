@@ -119,6 +119,14 @@ def _karg_live_state(ctx: Context, karg: str, fix_id: str) -> list[str]:
     return [f"{karg} is not set (a system update installed before rebooting can drop it); {again}"]
 
 
+def restart_pending(ctx: Context, notes: dict[str, Any]) -> bool:
+    """An InputPlumber restart skipped with --no-restart that no reboot has done since."""
+    if not notes.get("restart_pending"):
+        return False
+    boot = notes.get("restart_pending_boot")
+    return boot is None or boot == ctx.boot_id
+
+
 def _restart_inputplumber() -> PostStep:
     return PostStep("restart-inputplumber", ["systemctl", "try-restart", "inputplumber.service"],
                     "restart InputPlumber so it loads the capability map", order=60)
@@ -192,7 +200,7 @@ class ButtonsFix(Fix):
             files=[FileSpec(f"{IP_ETC_CAPABILITY_MAPS}/{upstream_name}", content.encode())],
             options={"actions": actions},
             notes={"upstream_map": ip.upstream_map, "upstream_sha256": upstream_sha, "map_id": ip.map_id,
-                   "restart_pending": not restart},
+                   "restart_pending": not restart, "restart_pending_boot": None if restart else ctx.boot_id},
         )
         if restart:
             plan.post.append(_restart_inputplumber())
@@ -225,7 +233,7 @@ class ButtonsFix(Fix):
             )
         if ip.effective_map and override and ip.effective_map != override:
             lines.append(f"warning: InputPlumber loads {ip.effective_map} instead of this override")
-        if entry.get("notes", {}).get("restart_pending"):
+        if restart_pending(ctx, entry.get("notes", {})):
             lines.append("InputPlumber has not been restarted since; reboot or run `sudo oxp3-tool apply buttons`")
         return lines
 

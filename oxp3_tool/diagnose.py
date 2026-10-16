@@ -226,7 +226,15 @@ def write_bundle(bundle: Bundle, path: str, owner: Optional[tuple[int, int]] = N
     """Create ``path`` exclusively (never through a symlink) and hand it to ``owner``."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        if owner:
-            os.fchown(f.fileno(), owner[0], owner[1])
-        bundle.write(f)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            if owner:
+                os.fchown(f.fileno(), owner[0], owner[1])
+            bundle.write(f)
+    except BaseException:
+        # Leave nothing half-written behind to block a retry (O_EXCL).
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise

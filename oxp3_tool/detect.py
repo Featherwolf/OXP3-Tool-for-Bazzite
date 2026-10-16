@@ -200,6 +200,10 @@ class Context:
         return name if isinstance(name, str) else None
 
     @cached_property
+    def boot_id(self) -> Optional[str]:
+        return self.sys.read_attr("/proc/sys/kernel/random/boot_id")
+
+    @cached_property
     def kernel_release(self) -> Optional[str]:
         return self.sys.read_attr("/proc/sys/kernel/osrelease")
 

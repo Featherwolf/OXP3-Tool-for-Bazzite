@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import sys
 from pathlib import Path
@@ -50,6 +51,9 @@ def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
                 problems.append(f"{fs.path} is missing")
             elif not fs.matches:
                 problems.append(f"{fs.path} was changed by something else")
+        for unit in entry.get("units_enabled", []):
+            if ctx.unit_enabled(unit) != "enabled":
+                problems.append(f"{unit} is not enabled any more")
         label = "applied" if not problems else "damaged"
         return label, problems + fix.live_state(ctx, entry)
     check = fix.check(ctx)
@@ -313,6 +317,9 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
     except FileExistsError:
         _err(f"error: {path} already exists; choose another name with --output")
         return 1
+    except OSError as e:
+        _err(f"error: cannot write {path}: {e.strerror or e}")
+        return 1
     _out(f"Wrote {path}")
     if findings:
         _out("Known problem patterns in the kernel logs (this boot and the previous one):")
@@ -382,6 +389,23 @@ COMMANDS = {
 
 
 MUTATING = ("apply", "revert")
+LOCK_FILE = "/run/oxp3-tool.lock"
+
+
+def acquire_lock(system: System) -> Optional[int]:
+    """Non-blocking exclusive lock; None if another run holds it. Released at exit."""
+    path = system.path(LOCK_FILE)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) -> int:
@@ -393,12 +417,18 @@ def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) 
         else:
             system = System(args.root, SimulatedRunner(args.root))
     ctx = Context(system, force=args.force)
+    lock = None
     try:
-        mutating = args.command in MUTATING
-        state = State(system, tolerant=not mutating)
-        if reconcile(ctx, state) and mutating and not getattr(args, "dry_run", False):
-            if not system.is_real_root or os.geteuid() == 0:
-                state.save()
+        mutating = args.command in MUTATING and not getattr(args, "dry_run", False)
+        if not system.is_real_root or os.geteuid() == 0:
+            lock = acquire_lock(system)
+        if mutating and lock is None:
+            raise EngineError("another oxp3-tool run is changing the system; try again when it is done")
+        state = State(system, tolerant=args.command not in MUTATING)
+        # Persist settled kernel-argument bookkeeping whenever this run may write.
+        if reconcile(ctx, state) and lock is not None and not state.load_error \
+                and not getattr(args, "dry_run", False):
+            state.save()
         return COMMANDS[args.command](ctx, state, args)
     except (EngineError, StateError) as e:
         _err(f"error: {e}")
@@ -406,3 +436,6 @@ def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) 
     except KeyboardInterrupt:
         _err("Interrupted.")
         return 130
+    finally:
+        if lock is not None:
+            os.close(lock)

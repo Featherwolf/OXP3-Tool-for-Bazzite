@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .detect import Context
-from .fixes import BY_ID, Fix, FixError, Plan, PostStep
+from .fixes import BY_ID, Fix, FixError, Plan, PostStep, restart_pending
 from .state import BACKUP_DIR, STATE_DIR, State, backup_path_for
 from .system import sha256_bytes
 from .templates import OWN_MARKER
@@ -68,17 +68,20 @@ def reconcile(ctx: Context, state: State) -> bool:
     """Settle kernel-argument bookkeeping against the system; returns True if state changed.
 
     - an addition whose outcome was unknown (interrupted run) is owned if the
-      argument is in the next boot's arguments, and dropped otherwise;
+      argument is in the next boot's arguments, and dropped otherwise (not
+      while an rpm-ostree transaction is still running);
     - a removal is finished once the argument is neither pending nor active;
     - an entry that records nothing and never completed is forgotten.
     """
     pending = ctx.pending_kargs
     if pending is None:
         return False
+    # A transaction still running may yet add the argument: settle it later.
+    busy = ctx.rpm_ostree_busy
     changed = False
     for fix_id in list(state.fixes):
         entry = state.fixes[fix_id]
-        for karg in list(entry.get("kargs_pending_add", [])):
+        for karg in [] if busy else list(entry.get("kargs_pending_add", [])):
             entry["kargs_pending_add"].remove(karg)
             if karg in pending and karg not in entry.setdefault("kargs", []):
                 entry["kargs"].append(karg)
@@ -109,6 +112,7 @@ class Engine:
         self.sys = ctx.sys
         self.state = state
         self.out = out
+        self.notes: list[str] = []
 
     # -- helpers ---------------------------------------------------------
 
@@ -194,6 +198,9 @@ class Engine:
                 continue
             if current is None:
                 lines.append(f"create {spec.path}")
+            elif spec.path in recorded and current != recorded[spec.path].get("sha256"):
+                lines.append(f"replace {spec.path} (edited since it was installed; your version is "
+                             f"saved to {STATE_DIR}/modified/)")
             elif spec.path in recorded or self._is_ours(spec.path):
                 lines.append(f"update {spec.path}")
             else:
@@ -208,13 +215,13 @@ class Engine:
             elif removal:
                 lines.append(f"keep kernel argument {karg} (cancels the pending removal)")
         for unit in plan.enable_units:
-            if unit not in (entry or {}).get("units_enabled", []) and self.ctx.unit_enabled(unit) != "enabled":
+            if self.ctx.unit_enabled(unit) != "enabled":
                 lines.append(f"enable {unit}")
         old_opts = (entry or {}).get("options", {})
         for key, value in plan.options.items():
             if entry and old_opts.get(key) != value:
                 lines.append(f"change {key}: {old_opts.get(key)} -> {value}")
-        if entry and entry.get("notes", {}).get("restart_pending") and plan.post:
+        if entry and restart_pending(self.ctx, entry.get("notes", {})) and plan.post:
             lines.append("finish the InputPlumber restart skipped earlier")
         if entry is None or not entry.get("applied_at") or entry.get("reverted"):
             if not lines:
@@ -239,6 +246,7 @@ class Engine:
 
     def apply(self, plans: list[tuple[Fix, Plan]]) -> Outcome:
         outcome = Outcome()
+        self.notes = []
         todo = [(fix, plan) for fix, plan in plans if self.changes(fix, plan)]
         wanted_kargs = [k for _, p in todo for k in p.kargs]
         if wanted_kargs:
@@ -266,6 +274,7 @@ class Engine:
             self._run_post(post, outcome)
         for fix in done:
             outcome.messages += fix.after_apply(self.ctx)
+        outcome.messages = self.notes + outcome.messages
         return outcome
 
     def _apply_local(self, fix: Fix, plan: Plan) -> None:
@@ -291,15 +300,15 @@ class Engine:
         planned = {s.path for s in plan.files}
         for rec in [r for r in entry["files"] if r["path"] not in planned]:
             # Written by an earlier apply, no longer wanted.
-            self._remove_file(fix.id, rec)
-            entry["files"].remove(rec)
-            self.state.save()
+            self._drop_file(fix.id, entry, rec)
 
         for spec in plan.files:
             rec = next((r for r in entry["files"] if r["path"] == spec.path), None)
             wanted = sha256_bytes(spec.content)
             current = self.sys.sha256(spec.path)
             backup = rec.get("backup") if rec else None
+            if rec is not None and current not in (None, rec.get("sha256"), wanted):
+                self._save_edited(fix.id, spec.path)
             if rec is None and current is not None and current != wanted and not self._is_ours(spec.path):
                 backup = self._backup(fix.id, spec.path)
             elif rec is None and current is not None:
@@ -323,32 +332,51 @@ class Engine:
                 self._restorecon(spec.path)
                 self.out(f"  wrote {spec.path}")
 
+    def _free_path(self, base: str) -> str:
+        """``base`` or the first free ``base.N``: earlier copies are never overwritten."""
+        if not self.sys.exists(base):
+            return base
+        n = 1
+        while self.sys.exists(f"{base}.{n}"):
+            n += 1
+        return f"{base}.{n}"
+
     def _backup(self, fix_id: str, path: str) -> str:
-        backup = backup_path_for(fix_id, path)
-        if self.sys.exists(backup):
-            # Never overwrite an earlier backup; it may be the only copy of the original.
-            n = 1
-            while self.sys.exists(f"{backup}.{n}"):
-                n += 1
-            backup = f"{backup}.{n}"
+        backup = self._free_path(backup_path_for(fix_id, path))
         self.sys.copy(path, backup)
         self.out(f"  backed up {path} to {backup}")
         return backup
 
+    def _save_edited(self, fix_id: str, path: str) -> None:
+        saved = self._free_path(f"{STATE_DIR}/modified/{fix_id}{path}")
+        self.sys.copy(path, saved)
+        self.notes.append(f"{path} had been edited since it was installed; a copy was kept at {saved}")
+
+    def _drop_file(self, fix_id: str, entry: dict, rec: dict) -> None:
+        """Undo one recorded file. The backup is deleted only after the saved
+        manifest no longer points at it, so an interrupted revert can never
+        lose the user's original."""
+        backup = self._remove_file(fix_id, rec)
+        entry["files"].remove(rec)
+        self.state.save()
+        if backup:
+            self.sys.remove(backup)
+
     def _apply_units(self, plan: Plan, entry: dict) -> None:
         for unit in plan.enable_units:
-            if unit in entry["units_enabled"]:
-                continue
+            recorded = unit in entry["units_enabled"]
             if self.ctx.unit_enabled(unit) == "enabled":
-                pre = entry["notes"].setdefault("units_already_enabled", [])
-                if unit not in pre:
-                    pre.append(unit)
+                if not recorded:
+                    pre = entry["notes"].setdefault("units_already_enabled", [])
+                    if unit not in pre:
+                        pre.append(unit)
                 continue
-            entry["units_enabled"].append(unit)
-            self.state.save()  # write-ahead
+            if not recorded:
+                entry["units_enabled"].append(unit)
+                self.state.save()  # write-ahead
             res = self.sys.run(["systemctl", "enable", unit], timeout=60)
             if not res.ok:
-                if self.ctx.unit_enabled(unit) != "enabled":
+                if not recorded and self.ctx.unit_enabled(unit) != "enabled":
                     entry["units_enabled"].remove(unit)
                 raise OSError(f"systemctl enable {unit} failed: {res.stderr.strip()[:300]}")
             self.out(f"  enabled {unit}")
@@ -360,9 +388,11 @@ class Engine:
             entry = self.state.entry(fix.id)
             for karg in plan.kargs:
                 if karg in entry["kargs_removal_pending"]:
+                    # Still ours: active in the booted deployment even if the
+                    # next boot no longer has it.
                     entry["kargs_removal_pending"].remove(karg)
-                    if karg in pending and karg not in entry["kargs"]:
-                        entry["kargs"].append(karg)  # removal never reached a boot
+                    if karg not in entry["kargs"]:
+                        entry["kargs"].append(karg)
                 if karg in pending:
                     if karg not in entry["kargs"]:
                         pre = entry["notes"].setdefault("kargs_already_set", [])
@@ -373,6 +403,8 @@ class Engine:
                     missing.append(karg)
                 if karg not in entry["kargs_pending_add"]:
                     entry["kargs_pending_add"].append(karg)
+            if all(k in pending for k in plan.kargs):
+                self.state.stamp(fix.id)  # nothing to add; record it before reconcile runs
         self.state.save()  # write-ahead
 
         if missing:
@@ -397,28 +429,52 @@ class Engine:
     # -- revert ----------------------------------------------------------
 
     def _remove_file(self, fix_id: str, rec: dict) -> Optional[str]:
+        """Remove or restore one file; returns the backup to delete once the record is gone."""
         path = rec["path"]
         current = self.sys.sha256(path)
-        note = None
-        if current is not None and current != rec.get("sha256"):
-            saved = f"{STATE_DIR}/modified/{fix_id}{path}"
-            self.sys.copy(path, saved)
-            note = f"{path} had been edited since it was installed; a copy was kept at {saved}"
         backup = rec.get("backup")
+        edited = current is not None and current != rec.get("sha256")
+        if backup and not self.sys.exists(backup) and edited:
+            # An interrupted revert already put the original back.
+            self.out(f"  kept {path} (the original was already restored)")
+            return None
+        if edited:
+            self._save_edited(fix_id, path)
         if backup and self.sys.exists(backup):
             self.sys.copy(backup, path)
             self._restorecon(path)
-            self.sys.remove(backup)
             self.out(f"  restored {path} from {backup}")
-        elif current is not None:
+            return backup
+        if current is not None:
             self.sys.remove(path)
             self.out(f"  removed {path}")
-        return note
+        return None
+
+    def _needs_kargs_change(self, entry: dict) -> bool:
+        return bool(entry.get("kargs") or entry.get("kargs_pending_add")) or any(
+            self.ctx.karg_pending(k) for k in entry.get("kargs_removal_pending", [])
+        )
+
+    def _disable_unit(self, unit: str) -> None:
+        res = self.sys.run(["systemctl", "disable", unit], timeout=60)
+        if res.ok:
+            self.out(f"  disabled {unit}")
+            return
+        if self.ctx.unit_enabled(unit) != "enabled" and not self.ctx.unit_file_exists(unit):
+            self.notes.append(f"{unit} is no longer installed; nothing to disable")
+            return
+        raise OSError(f"systemctl disable {unit} failed: {res.stderr.strip()[:300]}")
 
     def revert(self, fix_ids: list[str]) -> Outcome:
         outcome = Outcome()
+        self.notes = []
         post: list[PostStep] = []
         karg_fixes: list[str] = []
+
+        # Refuse up front, before anything is removed, if kernel arguments
+        # cannot be changed right now.
+        if any(self._needs_kargs_change(self.state.get(i)) for i in fix_ids if self.state.get(i)):
+            outcome.messages += self._check_kargs_preconditions()
 
         for fix_id in fix_ids:
             entry = self.state.get(fix_id)
@@ -429,22 +485,14 @@ class Engine:
             self.out(f"{fix_id}:")
             try:
                 for rec in list(entry.get("files", [])):
-                    note = self._remove_file(fix_id, rec)
-                    if note:
-                        outcome.messages.append(note)
-                    entry["files"].remove(rec)
-                    self.state.save()
+                    self._drop_file(fix_id, entry, rec)
                 for d in sorted(entry.get("dirs_created", []), key=len, reverse=True):
                     self.sys.rmdir_if_empty(d)
-                    if not self.sys.exists(d):
-                        entry["dirs_created"].remove(d)
                 entry["dirs_created"] = []  # a directory still in use is no longer ours to remove
                 for unit in list(entry.get("units_enabled", [])):
-                    res = self.sys.run(["systemctl", "disable", unit], timeout=60)
-                    if not res.ok:
-                        raise OSError(f"systemctl disable {unit} failed: {res.stderr.strip()[:300]}")
+                    self._disable_unit(unit)
                     entry["units_enabled"].remove(unit)
-                    self.out(f"  disabled {unit}")
+                    self.state.save()
             except OSError as e:
                 outcome.ok = False
                 outcome.errors.append(f"{fix_id}: {e}")
@@ -453,7 +501,7 @@ class Engine:
             outcome.changed = True
             entry["reverted"] = True
             entry["options"] = {}
-            if entry.get("kargs") or entry.get("kargs_removal_pending"):
+            if entry.get("kargs") or entry.get("kargs_pending_add") or entry.get("kargs_removal_pending"):
                 karg_fixes.append(fix_id)
             elif entry_is_empty(entry):
                 self.state.forget(fix_id)
@@ -469,22 +517,28 @@ class Engine:
             self.out("Finishing up:")
             self._run_post(post, outcome)
         self.sys.prune_empty_dirs(BACKUP_DIR)
+        outcome.messages = self.notes + outcome.messages
         return outcome
 
     def _revert_kargs(self, fix_ids: list[str], outcome: Outcome) -> None:
         try:
-            outcome.messages += self._check_kargs_preconditions()
+            self._check_kargs_preconditions()
         except EngineError as e:
             outcome.ok = False
             outcome.errors.append(str(e))
+            for fix_id in fix_ids:
+                self.state.fixes[fix_id].pop("reverted", None)
+            self.state.save()
             return
         pending = self.ctx.pending_kargs or []
         for fix_id in fix_ids:
             entry = self.state.fixes[fix_id]
-            for karg in entry.get("kargs", []):
+            # kargs_pending_add only ever holds arguments that were missing before.
+            for karg in entry.get("kargs", []) + entry.get("kargs_pending_add", []):
                 if karg not in entry["kargs_removal_pending"]:
                     entry["kargs_removal_pending"].append(karg)
             entry["kargs"] = []
+            entry["kargs_pending_add"] = []
         self.state.save()  # write-ahead
 
         present = sorted({k for f in fix_ids for k in self.state.fixes[f]["kargs_removal_pending"] if k in pending})
@@ -504,7 +558,8 @@ class Engine:
                         if karg in still:
                             entry["kargs_removal_pending"].remove(karg)
                             entry["kargs"].append(karg)
-                    entry.pop("reverted", None)
+                    if entry["kargs"]:
+                        entry.pop("reverted", None)
             else:
                 outcome.reboot_needed = True
                 outcome.messages.append(KARGS_UPDATE_WARNING)
