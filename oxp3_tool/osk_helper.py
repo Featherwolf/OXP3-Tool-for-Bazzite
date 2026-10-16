@@ -31,15 +31,20 @@ ACTION = "ui_osk"
 URL = "steam://open/keyboard"
 BUS = "org.shadowblip.InputPlumber"
 SIGNAL_IFACE = "org.shadowblip.Input.DBusDevice"
-MATCH = f"type='signal',interface='{SIGNAL_IFACE}',member='InputEvent'"
+# sender= makes the bus drop look-alike signals from anyone else (dbus-daemon and
+# dbus-broker both match a well-known sender name against its current owner).
+MATCH = f"type='signal',sender='{BUS}',interface='{SIGNAL_IFACE}',member='InputEvent'"
 BUSCTL = "/usr/bin/busctl"
 PYTHON = "/usr/bin/python3"
 MIN_INTERVAL = 0.3  # seconds between two opens (key bounce, repeated chords)
 RETRY_SECONDS = 2.0
 # Valve's writer puts a fixed program path first; Steam ignores it.
 PIPE_LINE = f"'~/.steam/root/ubuntu12_32/steam' '{URL}'\n"
-# Logged when Steam is running but did not take the request; oxp3-tool status looks for it.
+# Logged per press; oxp3-tool status warns when the last one was a failure. A
+# success only means the request reached Steam's pipe, not that Steam showed its keyboard.
+SENT = "asked Steam to open the keyboard"
 SEND_FAILED = "could not hand the keyboard request to Steam"
+OWNER_RECHECK = 1.0  # seconds between two lookups of InputPlumber's bus name
 
 # Runs as the Steam user. Exit codes: 0 sent, 3 nobody reads the pipe, 1 other errors.
 _WRITE = r"""
@@ -145,7 +150,7 @@ def open_keyboard(uids: list[int]) -> bool:
     for uid in uids:
         code = send_as(uid)
         if code == 0:
-            log(f"asked Steam (uid {uid}) to open the keyboard")
+            log(f"{SENT} (uid {uid})")
             return True
         codes.append(code)
     why = "Steam is not reading ~/.steam/steam.pipe" if all(c == NOT_READING for c in codes) \
@@ -157,6 +162,7 @@ def open_keyboard(uids: list[int]) -> bool:
 class Watcher:
     def __init__(self) -> None:
         self.owner: Optional[str] = None
+        self.looked_up = float("-inf")
         self.last = float("-inf")
 
     def handle(self, line: str) -> bool:
@@ -167,12 +173,17 @@ class Watcher:
         sender, action, value = event
         if action != ACTION or value < 0.5:
             return False  # other actions, and releases
+        now = time.monotonic()
         if sender != self.owner:
+            # InputPlumber restarted (new unique name), or a look-alike sender:
+            # look the owner up again, at most once per OWNER_RECHECK.
+            if now - self.looked_up < OWNER_RECHECK:
+                return False
+            self.looked_up = now
             self.owner = name_owner()
             if sender != self.owner:
                 log(f"ignoring {ACTION} from {sender or 'an unknown sender'}: not {BUS}")
                 return False
-        now = time.monotonic()
         if now - self.last < MIN_INTERVAL:
             return False
         self.last = now

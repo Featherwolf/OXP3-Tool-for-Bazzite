@@ -54,6 +54,10 @@ class PostStep:
     argv: list[str]
     description: str
     order: int = 50  # steps run in ascending order
+    # When set, the step runs only if the apply changes one of these files, or
+    # finishes a restart that an earlier --no-restart skipped.
+    only_if_changed: tuple[str, ...] = ()
+    note: str = ""  # message shown when the step runs
 
 
 @dataclass
@@ -65,6 +69,9 @@ class Plan:
     options: dict[str, Any] = field(default_factory=dict)
     notes: dict[str, Any] = field(default_factory=dict)
     messages: list[str] = field(default_factory=list)
+    # Units an earlier apply enabled and this plan drops are disabled; False
+    # leaves them running until the next boot.
+    stop_dropped_units: bool = True
 
 
 @dataclass
@@ -137,9 +144,13 @@ def restart_pending(ctx: Context, notes: dict[str, Any]) -> bool:
     return boot is None or boot == ctx.boot_id
 
 
-def _restart_inputplumber() -> PostStep:
-    return PostStep("restart-inputplumber", ["systemctl", "try-restart", "inputplumber.service"],
-                    "restart InputPlumber so it loads the capability map", order=60)
+RESTART_INPUTPLUMBER = "restart-inputplumber"
+
+
+def _restart_inputplumber(only_if_changed: tuple[str, ...] = (), note: str = "") -> PostStep:
+    return PostStep(RESTART_INPUTPLUMBER, ["systemctl", "try-restart", "inputplumber.service"],
+                    "restart InputPlumber so it loads the capability map", order=60,
+                    only_if_changed=only_if_changed, note=note)
 
 
 def _daemon_reload() -> PostStep:
@@ -147,15 +158,19 @@ def _daemon_reload() -> PostStep:
 
 
 def _helper_live_state(ctx: Context, entry: Optional[dict[str, Any]], unit: str, failed: str, warning: str,
-                       wanted: dict[str, bytes], fix_id: str) -> list[str]:
-    """Status of a helper service: unit state, delivery failures this boot, stale files."""
+                       wanted: dict[str, bytes], fix_id: str, ok: str = "") -> list[str]:
+    """Status of a helper service: unit state, delivery failures this boot, stale files.
+
+    With ``ok`` (a success line the helper logs) only a failure after the last success is reported.
+    """
     state = ctx.unit_state(unit) or "unknown"
     line = f"{unit} is {state}"
     if state != "active":
         line += f"; see `journalctl -u {unit}`"
     lines = [line]
-    res = ctx.sys.run(["journalctl", "-u", unit, "-b", "0", "--no-pager", "-q", "-o", "cat",
-                       "--grep", failed, "-n", "1"], timeout=30)
+    # Both markers are plain text, so they are safe in journalctl's regular expression.
+    res = ctx.sys.run(["journalctl", "-u", unit, "-b", "0", "--no-pager", "-q", "-o", "cat", "-r",
+                       "--grep", f"{failed}|{ok}" if ok else failed, "-n", "1"], timeout=30)
     if failed in res.stdout:
         lines.append(f"warning: {warning} this boot; see `journalctl -u {unit}`")
     recorded = {r["path"]: r.get("sha256") for r in (entry or {}).get("files", [])}
@@ -191,7 +206,9 @@ class ButtonsFix(Fix):
         "(steam://open/keyboard, as HHD does). keyboard-chord sends Steam+X instead.\n"
         "Check each key with `inputplumber device 0 test` (press q to quit; closing the\n"
         "window instead leaves InputPlumber in test mode until\n"
-        "`sudo systemctl restart inputplumber`). Your choice is kept when you apply again\n"
+        "`sudo systemctl restart inputplumber`). A key that goes to the helper shows\n"
+        f"nothing there; `journalctl -u {templates.OSK_KEY_UNIT_NAME} -f` logs its presses.\n"
+        "Your choice is kept when you apply again\n"
         "(--defaults resets it). Apply again after `ujust configure-opengamepadui` switches\n"
         "Game Mode input. The override replaces the whole stock map, so it is only\n"
         "recommended while the stock map is the 0.82.0 one it was written for.\n"
@@ -243,26 +260,28 @@ class ButtonsFix(Fix):
         upstream_sha = ctx.sys.sha256(ip.upstream_map)
         session = ctx.game_mode_input
         content = templates.capability_map_yaml(ip.map_id, actions, ip.upstream_map, upstream_sha, session)
+        map_path = f"{IP_ETC_CAPABILITY_MAPS}/{upstream_name}"
         restart = opts.get("restart", True)
         plan = Plan(
-            files=[FileSpec(f"{IP_ETC_CAPABILITY_MAPS}/{upstream_name}", content.encode())],
+            files=[FileSpec(map_path, content.encode())],
             options={"actions": actions},
             notes={"upstream_map": ip.upstream_map, "upstream_sha256": upstream_sha, "map_id": ip.map_id,
                    "game_mode_input": session,
                    "restart_pending": not restart, "restart_pending_boot": None if restart else ctx.boot_id},
+            # Without the restart InputPlumber keeps the old map, which may still need a dropped helper.
+            stop_dropped_units=restart,
         )
         if session == OGUI:
             plan.messages.append(
                 "Game Mode runs Steam behind the OpenGamepadUI overlay, so the map is written for it. If you "
                 "switch with `ujust configure-opengamepadui`, run `sudo oxp3-tool apply buttons` again."
             )
-        elif session == NATIVE_STEAM and restart:
-            plan.messages.append(
-                "Reboot (or leave Game Mode and start it again) afterwards: Bazzite selects the Steam Deck "
-                "controller for native Steam Input only when Game Mode starts, and the InputPlumber restart resets it."
-            )
         if restart:
-            plan.post.append(_restart_inputplumber())
+            # Only when the map changes: a helper-only update leaves InputPlumber alone.
+            note = ("Reboot (or leave Game Mode and start it again) afterwards: Bazzite selects the Steam Deck "
+                    "controller for native Steam Input only when Game Mode starts, and the InputPlumber restart "
+                    "resets it.") if session == NATIVE_STEAM else ""
+            plan.post.append(_restart_inputplumber(only_if_changed=(map_path,), note=note))
         else:
             plan.messages.append("InputPlumber was not restarted; the new map loads on the next reboot.")
         if not self._stock_map_known(ctx):
@@ -331,9 +350,9 @@ class ButtonsFix(Fix):
         if any(r.get("path") == templates.OSK_KEY_UNIT_PATH for r in entry.get("files", [])):
             lines += _helper_live_state(
                 ctx, entry, self.OSK_UNIT, osk_helper.SEND_FAILED,
-                "Steam did not take the keyboard request",
+                "the last keyboard request could not be handed to Steam",
                 {templates.OSK_KEY_HELPER_PATH: templates.osk_key_helper_script().encode(),
-                 templates.OSK_KEY_UNIT_PATH: templates.OSK_KEY_UNIT.encode()}, "buttons")
+                 templates.OSK_KEY_UNIT_PATH: templates.OSK_KEY_UNIT.encode()}, "buttons", ok=osk_helper.SENT)
         for user in ctx.steam_screen_reader_users:
             lines.append(f"warning: Steam's screen reader is on for {user}; it replaces the Steam button shortcuts "
                          "(Steam+X keyboard, Steam+R1 screenshot). See README > Common problems to turn it off")

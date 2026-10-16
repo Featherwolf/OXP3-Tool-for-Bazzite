@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .detect import Context
-from .fixes import BY_ID, Fix, FixError, Plan, PostStep, restart_pending
+from .fixes import BY_ID, RESTART_INPUTPLUMBER, Fix, FixError, Plan, PostStep, restart_pending
 from .state import BACKUP_DIR, STATE_DIR, State, backup_path_for
 from .system import sha256_bytes
 from .templates import OWN_MARKER
@@ -22,6 +22,10 @@ from .templates import OWN_MARKER
 Printer = Callable[[str], None]
 
 HARDWARE_SETUP_UNIT = "bazzite-hardware-setup.service"
+UNIT_DIR = "/etc/systemd/system"
+# Directories only this tool writes to. Every fix that writes into one records
+# it, so whichever is reverted last removes it.
+TOOL_DIRS = ("/usr/local/libexec/oxp3-tool",)
 
 KARGS_UPDATE_WARNING = (
     "Reboot before installing a system update: an update installed first is built from the "
@@ -219,12 +223,14 @@ class Engine:
                 lines.append(f"enable {unit}")
         for unit in (entry or {}).get("units_enabled", []):
             if unit not in plan.enable_units:
-                lines.append(f"stop and disable {unit}")
+                lines.append(f"stop and disable {unit}" if plan.stop_dropped_units
+                             else f"disable {unit} (it keeps running until the next boot)")
         old_opts = (entry or {}).get("options", {})
         for key, value in plan.options.items():
             if entry and old_opts.get(key) != value:
                 lines.append(f"change {key}: {old_opts.get(key)} -> {value}")
-        if entry and restart_pending(self.ctx, entry.get("notes", {})) and plan.post:
+        if entry and restart_pending(self.ctx, entry.get("notes", {})) and \
+                any(s.key == RESTART_INPUTPLUMBER for s in plan.post):
             lines.append("finish the InputPlumber restart skipped earlier")
         if entry is None or not entry.get("applied_at") or entry.get("reverted"):
             if not lines:
@@ -240,10 +246,25 @@ class Engine:
                 lines.append("    already applied, nothing to change")
                 continue
             lines += [f"    {c}" for c in changes]
-            for step in sorted(plan.post, key=lambda s: s.order):
+            for step in sorted(self._due_steps(fix, plan), key=lambda s: s.order):
                 lines.append(f"    then {step.description}")
             lines.append(f"    takes effect: {fix.takes_effect}")
         return lines
+
+    def _due_steps(self, fix: Fix, plan: Plan) -> list[PostStep]:
+        """The post steps applying ``plan`` runs; call it before any file is written."""
+        entry = self.state.get(fix.id)
+        pending = bool(entry) and restart_pending(self.ctx, entry.get("notes", {}))
+        wanted = {s.path: sha256_bytes(s.content) for s in plan.files}
+        recorded = {r["path"] for r in (entry or {}).get("files", [])}
+
+        def changes(path: str) -> bool:
+            if path in wanted:
+                return self.sys.sha256(path) != wanted[path]
+            return path in recorded and self.sys.exists(path)  # removed
+
+        return [s for s in plan.post
+                if not s.only_if_changed or pending or any(changes(p) for p in s.only_if_changed)]
 
     # -- apply -----------------------------------------------------------
 
@@ -258,6 +279,7 @@ class Engine:
         post: list[PostStep] = []
         done: list[Fix] = []
         for fix, plan in todo:
+            due = self._due_steps(fix, plan)
             try:
                 dropped = self._apply_local(fix, plan)
             except OSError as e:
@@ -268,8 +290,8 @@ class Engine:
             if dropped:
                 post.append(PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units",
                                      order=10))
-            post += plan.post
-            outcome.messages += plan.messages
+            post += due
+            outcome.messages += plan.messages + [s.note for s in due if s.note]
             done.append(fix)
 
         if wanted_kargs:
@@ -309,10 +331,10 @@ class Engine:
         return dropped
 
     def _drop_units(self, plan: Plan, entry: dict) -> bool:
-        """Stop and disable units an earlier apply enabled that ``plan`` no longer wants."""
+        """Disable (and stop) units an earlier apply enabled that ``plan`` no longer wants."""
         dropped = False
         for unit in [u for u in entry["units_enabled"] if u not in plan.enable_units]:
-            self._disable_unit(unit, now=True)
+            self._disable_unit(unit, now=plan.stop_dropped_units)
             entry["units_enabled"].remove(unit)
             self.state.save()
             dropped = True
@@ -339,7 +361,8 @@ class Engine:
                 earlier = backup_path_for(fix.id, spec.path)
                 backup = earlier if self.sys.exists(earlier) else None
             new_dirs = _missing_dirs(self.ctx, spec.path)
-            for d in new_dirs:
+            parent = spec.path.rsplit("/", 1)[0]
+            for d in new_dirs + ([parent] if parent in TOOL_DIRS else []):
                 if d not in entry["dirs_created"]:
                     entry["dirs_created"].append(d)
             if rec is None:
@@ -388,7 +411,13 @@ class Engine:
         for unit in plan.enable_units:
             recorded = unit in entry["units_enabled"]
             if self.ctx.unit_enabled(unit) == "enabled":
-                if not recorded:
+                if recorded:
+                    continue
+                if any(s.path == f"{UNIT_DIR}/{unit}" for s in plan.files):
+                    # Our own unit file, enabled by a run whose record was lost.
+                    entry["units_enabled"].append(unit)
+                    self.state.save()
+                else:
                     pre = entry["notes"].setdefault("units_already_enabled", [])
                     if unit not in pre:
                         pre.append(unit)

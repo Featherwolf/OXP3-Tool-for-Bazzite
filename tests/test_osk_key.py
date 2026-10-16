@@ -74,16 +74,28 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(len(self.opened), 2)
 
     def test_only_inputplumber_may_send_it(self):
+        self.assertIn("sender='org.shadowblip.InputPlumber'", osk_helper.MATCH)
         w = osk_helper.Watcher()
         self.assertFalse(w.handle(signal_line(sender=":1.99")))
+        self.clock += 1
         self.assertFalse(w.handle(signal_line(sender=None)))
         self.assertEqual(self.opened, [])
         # InputPlumber restarted with a new unique name: looked up again.
         osk_helper.name_owner.return_value = ":1.99"
+        self.clock += 1
         self.assertTrue(w.handle(signal_line(sender=":1.99")))
         osk_helper.name_owner.return_value = None
         self.clock += 1
         self.assertFalse(w.handle(signal_line(sender=":1.7")))
+
+    def test_owner_lookups_are_rate_limited(self):
+        w = osk_helper.Watcher()
+        for _ in range(100):
+            self.assertFalse(w.handle(signal_line(sender=":1.66")))
+        self.assertEqual(osk_helper.name_owner.call_count, 1)
+        self.assertEqual(osk_helper.log.call_count, 1)
+        self.clock += osk_helper.OWNER_RECHECK
+        self.assertTrue(w.handle(signal_line()))  # the real sender still gets through
 
 
 class WriteTest(unittest.TestCase):
@@ -148,7 +160,7 @@ class OpenKeyboardTest(unittest.TestCase):
         self.assertNotIn(osk_helper.SEND_FAILED, log)
         ok, log = self.run_open([1000, 1001], [1, 0])
         self.assertTrue(ok)
-        self.assertIn("uid 1001", log)
+        self.assertIn(osk_helper.SENT + " (uid 1001)", log)
         ok, log = self.run_open([1000], [osk_helper.NOT_READING])
         self.assertFalse(ok)
         self.assertIn(osk_helper.SEND_FAILED + ": Steam is not reading", log)
@@ -277,19 +289,99 @@ class OskFixTest(unittest.TestCase):
     def test_status_reports_failures_and_stale_helper(self):
         self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
         real_run = self.f.runner.__call__
+        log = []
 
         def runner(argv, timeout=None):
             if argv[0] == "journalctl" and self.UNIT in argv:
-                return CommandResult(0, osk_helper.SEND_FAILED + ": Steam is not reading ~/.steam/steam.pipe\n")
+                # journalctl -r --grep A|B -n 1: the newest line matching either marker.
+                self.assertEqual(argv[argv.index("--grep") + 1], f"{osk_helper.SEND_FAILED}|{osk_helper.SENT}")
+                self.assertIn("-r", argv)
+                return CommandResult(0, log[-1] + "\n") if log else CommandResult(1)
             return real_run(argv, timeout)
 
+        warning = "warning: the last keyboard request could not be handed to Steam this boot"
+        log.append(osk_helper.SEND_FAILED + ": Steam is not reading ~/.steam/steam.pipe")
         rc, out, _ = self.cli("status", system=System(self.root, runner))
-        self.assertIn("warning: Steam did not take the keyboard request this boot", out)
+        self.assertIn(warning, out)
+        log.append(osk_helper.SENT + " (uid 1000)")  # a later press worked
+        rc, out, _ = self.cli("status", system=System(self.root, runner))
+        self.assertNotIn(warning, out)
+        for marker in (osk_helper.SENT, osk_helper.SEND_FAILED):
+            self.assertRegex(marker, r"^[A-Za-z ]+$")  # plain text inside journalctl's regex
         with mock.patch.object(templates, "osk_key_helper_script", lambda: "#!/usr/bin/python3 -I\n# new\n"):
             rc, out, _ = self.cli("status")
             self.assertIn("installed by an older oxp3-tool; run `sudo oxp3-tool apply buttons`", out)
             rc, out, _ = self.cli("apply", "--dry-run")
             self.assertIn(f"update {templates.OSK_KEY_HELPER_PATH}", out)
+
+    def test_no_restart_twice_changes_nothing(self):
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "--no-restart")[0], 0)
+        self.f.runner.calls.clear()
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "--no-restart")
+        self.assertIn("already applied, nothing to change", out)
+        self.assertNotIn("finish the InputPlumber restart", out)
+        changing = ("systemctl enable", "systemctl disable", "systemctl restart", "systemctl try-restart",
+                    "systemctl stop", "systemctl daemon-reload")
+        self.assertEqual([c for c in self.calls() if c.startswith(changing)], [])
+        # A later apply without --no-restart finishes the skipped restart.
+        rc, out, _ = self.cli("apply", "--yes", "buttons")
+        self.assertIn("finish the InputPlumber restart skipped earlier", out)
+        self.assertIn("systemctl try-restart inputplumber.service", self.calls())
+
+    def test_helper_update_leaves_inputplumber_alone(self):
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        self.f.runner.calls.clear()
+        with mock.patch.object(templates, "osk_key_helper_script", lambda: "#!/usr/bin/python3 -I\n# new\n"):
+            rc, out, _ = self.cli("apply", "--dry-run", "buttons")
+            self.assertIn("then start the on-screen keyboard helper", out)
+            self.assertNotIn("restart InputPlumber", out)
+            rc, out, err = self.cli("apply", "--yes", "buttons")
+        self.assertEqual(rc, 0, err)
+        calls = self.calls()
+        self.assertNotIn("systemctl try-restart inputplumber.service", calls)
+        self.assertIn(f"systemctl restart {self.UNIT}", calls)
+        self.assertNotIn("Reboot (or leave Game Mode", out)
+        # A map change still restarts InputPlumber, with the reboot note.
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "--home", "quick-access")
+        self.assertIn("systemctl try-restart inputplumber.service", self.calls())
+        self.assertIn("Reboot (or leave Game Mode", out)
+
+    def test_no_restart_keeps_dropped_helper_running(self):
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        rc, out, _ = self.cli("apply", "--dry-run", "buttons", "--no-restart", "--keyboard-key", "keyboard-chord")
+        self.assertIn(f"disable {self.UNIT} (it keeps running until the next boot)", out)
+        self.f.runner.calls.clear()
+        rc, out, err = self.cli("apply", "--yes", "buttons", "--no-restart", "--keyboard-key", "keyboard-chord")
+        self.assertEqual(rc, 0, err)
+        calls = self.calls()
+        self.assertIn(f"systemctl disable {self.UNIT}", calls)
+        self.assertNotIn(f"systemctl disable --now {self.UNIT}", calls)
+        self.assertEqual(self.f.runner.unit_active[self.UNIT], "active")
+        self.assertEqual(self.f.runner.unit_enabled[self.UNIT], "disabled")
+
+    def test_shared_directory_is_removed_by_the_last_revert(self):
+        from .test_xbox_key import IP_LOG
+        for order in (["buttons", "xbox-key"], ["xbox-key", "buttons"]):
+            with self.subTest(order=order):
+                self.f.mcu_hidraw()
+                self.f.runner.ip_journal = IP_LOG
+                self.assertEqual(self.cli("apply", "--yes", "buttons", "xbox-key")[0], 0)
+                for fix in order:
+                    self.assertEqual(self.cli("revert", "--yes", fix)[0], 0)
+                self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "xbox-key")[0], 0)
+        self.assertEqual(self.cli("revert", "--yes", "--all")[0], 0)
+        self.assertFalse((self.root / "usr/local/libexec/oxp3-tool").exists())
+
+    def test_lost_state_still_owns_the_unit(self):
+        from oxp3_tool.state import STATE_FILE
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        (self.root / STATE_FILE.lstrip("/")).unlink()
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        self.f.runner.calls.clear()
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "--keyboard-key", "keyboard-chord")[0], 0)
+        self.assertIn(f"systemctl disable --now {self.UNIT}", self.calls())
+        self.assertEqual(self.f.runner.unit_active[self.UNIT], "inactive")
 
     def test_missing_busctl(self):
         (self.root / "usr/bin/busctl").unlink()
