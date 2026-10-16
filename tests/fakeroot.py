@@ -271,10 +271,23 @@ class FakeOxp3:
     def panel_dpcd(self, tcon: bytes = b"\x01\x13\x00\x00", edp_rev: int = 0x03) -> None:
         """Expose the eDP AUX channel with Intel HDR backlight caps at 0x340 and eDP rev at 0x700."""
         regs = bytearray(0x800)
+        regs[0x300:0x303] = b"\x00\xaa\x01"  # Intel source OUI, written by the kernel
         regs[0x340:0x344] = tcon
         regs[0x700] = edp_rev
         self.write("/dev/drm_dp_aux0", bytes(regs))
         self.mkdir("/sys/class/drm/card1-eDP-1/drm_dp_aux0")
+        self.write("/sys/class/drm/card1-eDP-1/dpms", "On\n")
+
+    def ogui_overlay(self, disabled_for: Optional[str] = None) -> None:
+        """Bazzite deck Game Mode: Steam behind the OpenGamepadUI overlay, optionally
+        switched off for one user with `ujust configure-opengamepadui disable`."""
+        self.write("/usr/share/gamescope-session-plus/sessions.d/ogui-steam",
+                   '/usr/libexec/hwsupport/non-valve-handheld-hardware && CLIENTCMD="opengamepadui '
+                   '--accessibility disabled --overlay-mode --steam-input --steamos-manager --skip-update-pack '
+                   '-- $CLIENTCMD"\n')
+        if disabled_for:
+            self.write(f"/var/home/{disabled_for}/.config/gamescope-session-plus/sessions.d/ogui-steam",
+                       "source steam session\n")
 
     def update_before_reboot(self) -> None:
         """Simulate `bootc upgrade` staging an update built from the booted kernel arguments."""

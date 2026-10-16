@@ -11,46 +11,70 @@ OWN_MARKER = "Installed by oxp3-tool ("
 
 # -- InputPlumber capability map --------------------------------------------
 
-# User-facing action name -> (InputPlumber gamepad button, description)
-BUTTON_ACTIONS: dict[str, tuple[str, str]] = {
-    "guide": ("Guide", "Steam / Guide button (opens the Steam menu)"),
-    "quick-access": ("QuickAccess", "Quick Access menu (the '...' button)"),
-    "keyboard": ("Keyboard", "on-screen keyboard"),
-    "screenshot": ("QuickAccess2", "screenshot (InputPlumber QuickAccess2)"),
+# Where an action has to go depends on how Game Mode feeds Steam:
+# - native Steam Input loads InputPlumber's default profile, which turns
+#   gamepad Keyboard into Guide+North (Steam+X, the on-screen keyboard) and
+#   QuickAccess2 into a screenshot;
+# - the OpenGamepadUI overlay (Bazzite's default on non-Valve handhelds) loads
+#   its own profile instead: Keyboard goes to OGUI and is lost on the Steam
+#   Deck target, QuickAccess2 opens the OGUI menu, and LeftTop becomes
+#   Guide+North, so the keyboard action is sent as LeftTop there.
+# The Steam Deck target turns Screenshot into Steam+R1 by itself in both.
+OGUI_SESSION = "ogui"
+
+# User-facing action name -> (button, button under the OGUI overlay, description)
+BUTTON_ACTIONS: dict[str, tuple[str, str, str]] = {
+    "guide": ("Guide", "Guide", "Steam button (opens the Steam menu)"),
+    "quick-access": ("QuickAccess", "QuickAccess", "Quick Access menu (the '...' button)"),
+    "keyboard": ("Keyboard", "LeftTop", "Steam on-screen keyboard"),
+    "screenshot": ("Screenshot", "Screenshot", "Steam screenshot"),
+    "ogui-menu": ("QuickAccess2", "QuickAccess2",
+                  "OpenGamepadUI menu (with native Steam Input this takes a screenshot instead)"),
 }
 
-# The four face keys and InputPlumber's stock (0.82.0, map "oxp9") actions.
+
+def action_button(action: str, session: Optional[str]) -> str:
+    native, ogui, _ = BUTTON_ACTIONS[action]
+    return ogui if session == OGUI_SESSION else native
+
+
+# The four face keys, what InputPlumber 0.82.0's stock map "oxp9" does with
+# them, and this tool's defaults.
 BUTTON_KEYS = {
     "onex": "ONEX / console key (sends Ctrl+Alt+Meta)",
     "keyboard": "keyboard key (sends Ctrl+Meta+O)",
     "home": "home key (MCU button 0x24, decoded by InputPlumber as gamepad Keyboard)",
     "xbox": "Xbox key (arrives as the gamepad Guide button)",
 }
-STOCK_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "screenshot", "home": "keyboard", "xbox": "guide"}
+STOCK_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "ogui-menu", "home": "keyboard", "xbox": "guide"}
 DEFAULT_BUTTON_ACTIONS = {"onex": "quick-access", "keyboard": "keyboard", "home": "guide", "xbox": "guide"}
 
 _CHORDS = {
     "onex": ("ONEX", ["KeyLeftCtrl", "KeyLeftAlt", "KeyLeftMeta"]),
     "keyboard": ("Keyboard", ["KeyLeftCtrl", "KeyLeftMeta", "KeyO"]),
 }
+# Native events of the other two keys.
+_NATIVE = {"home": "Keyboard", "xbox": "Guide"}
 
 
 def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Optional[str],
-                        upstream_sha256: Optional[str]) -> str:
+                        upstream_sha256: Optional[str], session: Optional[str] = None) -> str:
     for key, action in actions.items():
         if key not in BUTTON_KEYS:
             raise ValueError(f"unknown key {key!r}")
         if action not in BUTTON_ACTIONS:
             raise ValueError(f"unknown action {action!r} for {key}")
+    mode = "OpenGamepadUI overlay" if session == OGUI_SESSION else "native Steam Input"
     lines = [
         f"# Installed by oxp3-tool ({PROJECT_URL}).",
         "# Do not edit: change it with `sudo oxp3-tool apply buttons --home=... --keyboard-key=... --onex-key=...",
-        "# --xbox-key=...`",
-        "# and remove it with `sudo oxp3-tool revert buttons`.",
+        "# --xbox-key=...` and remove it with `sudo oxp3-tool revert buttons`.",
         "#",
         f"# Replaces InputPlumber's stock capability map {map_id!r} for the ONEXPLAYER 3.",
         "# A map in /etc/inputplumber/capability_maps.d with the same file name and id",
         "# is loaded after the stock one and takes its place.",
+        f"# Written for Game Mode with {mode}; apply again after switching.",
+        "# " + ", ".join(f"{k}: {actions.get(k, DEFAULT_BUTTON_ACTIONS[k])}" for k in BUTTON_KEYS),
     ]
     if upstream_path:
         lines.append(f"# Stock map: {upstream_path}" + (f" (sha256 {upstream_sha256})" if upstream_sha256 else ""))
@@ -63,7 +87,7 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
     ]
     for key in ("onex", "keyboard"):
         name, chord = _CHORDS[key]
-        button = BUTTON_ACTIONS[actions[key]][0]
+        button = action_button(actions[key], session)
         lines.append(f"  - name: {name}")
         lines.append("    source_events:")
         lines += [f"      - keyboard: {k}" for k in chord]
@@ -71,8 +95,9 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
     # The home key already arrives as gamepad Keyboard and the Xbox key as
     # gamepad Guide. Translated events are not translated again, so these do
     # not touch the chords above (or each other).
-    for name, key, native in (("Home", "home", "Keyboard"), ("Xbox", "xbox", "Guide")):
-        target = BUTTON_ACTIONS[actions.get(key, DEFAULT_BUTTON_ACTIONS[key])][0]
+    for name, key in (("Home", "home"), ("Xbox", "xbox")):
+        native = _NATIVE[key]
+        target = action_button(actions.get(key, DEFAULT_BUTTON_ACTIONS[key]), session)
         if target != native:
             lines += [
                 f"  - name: {name}",

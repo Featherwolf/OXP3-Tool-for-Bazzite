@@ -8,11 +8,12 @@ changes is recorded so ``revert`` can undo exactly what was done.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import templates
-from .detect import IP_ETC_CAPABILITY_MAPS, Context
+from .detect import IP_ETC_CAPABILITY_MAPS, OGUI, Context
 
 CONTROLLER = "controller"
 DISPLAY = "display"
@@ -142,17 +143,23 @@ class ButtonsFix(Fix):
     title = "Chassis buttons do what their labels say"
     summary = "Keyboard key opens the on-screen keyboard, Home opens Steam (InputPlumber map)"
     details = (
-        "InputPlumber 0.82 supports the OXP3 controller, but its stock map (id oxp9) sends\n"
-        "the keyboard key to QuickAccess2, which takes a screenshot, and the home key to\n"
-        "the on-screen keyboard. This installs a replacement map with the same id in\n"
-        f"{IP_ETC_CAPABILITY_MAPS}. Defaults: ONEX/console -> Quick Access, keyboard key\n"
-        "-> on-screen keyboard, home -> Steam/Guide, Xbox key -> Steam/Guide (as stock).\n"
-        "Choose others with --onex-key, --keyboard-key, --home and --xbox-key (guide,\n"
-        "quick-access, keyboard, screenshot); check each key with\n"
-        "`inputplumber device 0 test` (exits with Ctrl+C). Your\n"
-        "choice is kept when you apply again (--defaults resets it). The override\n"
-        "replaces the whole stock map, so it is only recommended while the stock map is\n"
-        "the 0.82.0 one it was written for. InputPlumber is restarted."
+        "InputPlumber 0.82 supports the OXP3 controller, but its stock map (id oxp9)\n"
+        "sends the keyboard key to QuickAccess2 and the home key to gamepad Keyboard.\n"
+        "In Bazzite's default Game Mode, which runs Steam behind the OpenGamepadUI\n"
+        "overlay, that makes the keyboard key open the OpenGamepadUI menu and the home key\n"
+        "do nothing; with native Steam Input they take a screenshot and open the keyboard.\n"
+        "This installs a replacement map with the same id in\n"
+        f"{IP_ETC_CAPABILITY_MAPS}, written for the Game Mode input in use.\n"
+        "Defaults: ONEX/console -> Quick Access, keyboard key -> Steam on-screen keyboard,\n"
+        "home -> Steam menu, Xbox key -> Steam menu (as stock). Choose others with\n"
+        "--onex-key, --keyboard-key, --home and --xbox-key (guide, quick-access, keyboard,\n"
+        "screenshot, ogui-menu). Check each key with `inputplumber device 0 test` (press q\n"
+        "to quit; closing the window instead leaves InputPlumber in test mode until\n"
+        "`sudo systemctl restart inputplumber`). Your choice is kept when you apply again\n"
+        "(--defaults resets it). Apply again after `ujust configure-opengamepadui` switches\n"
+        "Game Mode input. The override replaces the whole stock map, so it is only\n"
+        "recommended while the stock map is the 0.82.0 one it was written for.\n"
+        "InputPlumber is restarted."
     )
     takes_effect = "immediately (InputPlumber restarts; restart Steam if buttons do nothing)"
 
@@ -197,14 +204,21 @@ class ButtonsFix(Fix):
             raise FixError("InputPlumber's stock OXP3 capability map was not found")
         upstream_name = ip.upstream_map.rsplit("/", 1)[-1]
         upstream_sha = ctx.sys.sha256(ip.upstream_map)
-        content = templates.capability_map_yaml(ip.map_id, actions, ip.upstream_map, upstream_sha)
+        session = ctx.game_mode_input
+        content = templates.capability_map_yaml(ip.map_id, actions, ip.upstream_map, upstream_sha, session)
         restart = opts.get("restart", True)
         plan = Plan(
             files=[FileSpec(f"{IP_ETC_CAPABILITY_MAPS}/{upstream_name}", content.encode())],
             options={"actions": actions},
             notes={"upstream_map": ip.upstream_map, "upstream_sha256": upstream_sha, "map_id": ip.map_id,
+                   "game_mode_input": session,
                    "restart_pending": not restart, "restart_pending_boot": None if restart else ctx.boot_id},
         )
+        if session == OGUI:
+            plan.messages.append(
+                "Game Mode runs Steam behind the OpenGamepadUI overlay, so the map is written for it. If you "
+                "switch with `ujust configure-opengamepadui`, run `sudo oxp3-tool apply buttons` again."
+            )
         if restart:
             plan.post.append(_restart_inputplumber())
         else:
@@ -236,6 +250,10 @@ class ButtonsFix(Fix):
             )
         if ip.effective_map and override and ip.effective_map != override:
             lines.append(f"warning: InputPlumber loads {ip.effective_map} instead of this override")
+        written_for = entry.get("notes", {}).get("game_mode_input")
+        if "game_mode_input" in entry.get("notes", {}) and written_for != ctx.game_mode_input:
+            lines.append("Game Mode input changed since this was applied (OpenGamepadUI overlay or native "
+                         "Steam Input); run `sudo oxp3-tool apply buttons` again")
         if restart_pending(ctx, entry.get("notes", {})):
             lines.append("InputPlumber has not been restarted since; reboot or run `sudo oxp3-tool apply buttons`")
         return lines
@@ -428,16 +446,21 @@ class NvmeResumeFix(_KargFix):
     takes_effect = "after reboot"
     karg = "nvme.noacpi=1"
 
-    @staticmethod
-    def _evidence(ctx: Context) -> list[str]:
+    def _evidence(self, ctx: Context) -> list[str]:
         ev = ctx.resume_evidence
         out = []
         if ctx.has_gm7:
-            out.append("the Predator GM7 SSD is installed")
+            out.append("the Predator GM7 SSD is installed (the hardware-tested case)")
         if ev.nvme_reset_failure:
             out.append("the kernel log shows the SSD failing to come back from sleep")
         if ev.simple_suspend:
-            out.append("the firmware uses ACPI simple suspend for the SSD")
+            out.append("the firmware puts the SSD slot into ACPI simple suspend, the path the GM7 fails on; "
+                       "only the GM7 is confirmed to fail")
+        if ctx.karg_active(self.karg) or ctx.karg_pending(self.karg) \
+                or ctx.sys.read_attr("/sys/module/nvme/parameters/noacpi") == "Y":
+            # nvme.noacpi=1 hides the firmware's simple-suspend message, so
+            # the fix's own effect stands in for that evidence.
+            out.append("nvme.noacpi=1 is set, which hides the firmware's simple-suspend request")
         return out
 
     def _check(self, ctx: Context) -> Check:
@@ -449,11 +472,14 @@ class NvmeResumeFix(_KargFix):
 
     def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
         any_ssd = bool(opts.get("any_ssd") or prev.get("any_ssd"))
-        evidence = self._evidence(ctx)
+        evidence = self._evidence(ctx) or list(prev.get("evidence") or [])
         if not evidence and not any_ssd:
             raise FixError("no sign of the SSD sleep problem on this unit; pass --any-ssd to apply anyway")
         plan = super().plan(ctx, opts, prev)
-        if any_ssd and not evidence:
+        # Remember why, since the fix itself hides the firmware's message.
+        if evidence:
+            plan.options["evidence"] = list(prev.get("evidence") or evidence)
+        if any_ssd:
             plan.options["any_ssd"] = True
         return plan
 
@@ -567,7 +593,9 @@ class XeHdrBacklightFix(_KargFix):
         "the firmware's video BIOS table asks for it; otherwise the panel never gets its\n"
         "HDR controls. xe.enable_dpcd_backlight=3 makes the kernel use the interface.\n"
         "Only offered when the panel reports it (read-only DPCD check, needs root).\n"
-        "Untested on the OXP3: brightness control moves to the panel's AUX channel. Before\n"
+        "Untested on the OXP3: HDR brightness moves to the panel's AUX channel, and SDR\n"
+        "brightness too if the panel reports 'SDR brightness over AUX' (otherwise it stays\n"
+        "on the SoC's PWM output, and a slider that works today may stop working). Before\n"
         "trying it, run `ujust configure-grub show` so the boot menu can start the previous\n"
         "version if the screen stays dark (you need a keyboard there), or keep SSH ready.\n"
         "Test in Desktop Mode (System Settings > Display > HDR). Game Mode keeps HDR\n"
@@ -581,9 +609,11 @@ class XeHdrBacklightFix(_KargFix):
                  if k.startswith("xe.enable_dpcd_backlight=") and k != self.karg]
         if other:
             return Check(False, f"{other[0]} is already set")
-        caps = ctx.edp_caps
+        caps, why = ctx.edp_probe
         if caps is None:
-            return Check(True, "could not read the panel's capabilities (run `sudo oxp3-tool status`)")
+            if ctx.sys.is_real_root and os.geteuid() != 0:
+                return Check(True, "run `sudo oxp3-tool status` to check whether the panel supports this")
+            return Check(False, f"could not check the panel: {why}")
         if not caps.intel_hdr_backlight:
             return Check(False, f"the panel reports {caps.describe()}; forcing the interface would change nothing")
         if not caps.kernel_can_use_intel_hdr:

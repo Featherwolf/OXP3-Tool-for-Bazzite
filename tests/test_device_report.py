@@ -19,6 +19,20 @@ SUSPEND_NO_EXIT = "[  700.000] PM: suspend entry (s2idle)\n[  700.100] Filesyste
 
 
 class NvmeEvidenceTest(Base):
+    def test_reapply_after_fix_hid_the_evidence(self):
+        self.fake(gm7=False)
+        self.f.runner.journal["0"] = SIMPLE_SUSPEND
+        self.assertTrue(self.apply(["nvme-resume"]).ok)
+        self.f.boot()
+        self.f.runner.journal["0"] = ""  # nvme.noacpi=1 suppresses the message
+        self.assertTrue(self.check().recommended)
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume", "buttons")
+        self.assertEqual(rc, 0, err)
+        self.revert(["nvme-resume"])
+        self.f.boot()
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 1)  # reverted and the evidence is gone: needs --any-ssd again
+
     def check(self):
         return BY_ID["nvme-resume"].check(self.engine()[1])
 
@@ -41,13 +55,13 @@ class NvmeEvidenceTest(Base):
         self.f.runner.journal["-1"] = SUSPEND_NO_EXIT
         self.assertFalse(self.check().recommended)
         rc, out, _ = self.cli("status")
-        self.assertIn("logged a suspend and nothing after it", out)
+        self.assertIn("saved log ends during a suspend", out)
 
     def test_finished_resume_is_not_flagged(self):
         self.fake(gm7=False)
         self.f.runner.journal["-1"] = SUSPEND_NO_EXIT + "[  760.000] PM: suspend exit\n"
         rc, out, _ = self.cli("status")
-        self.assertNotIn("nothing after it", out)
+        self.assertNotIn("ends during a suspend", out)
 
     def test_no_evidence_needs_flag(self):
         self.fake(gm7=False)
@@ -66,7 +80,7 @@ class HdrBacklightTest(Base):
         check = self.check()
         self.assertTrue(check.applicable)
         self.assertFalse(check.recommended)
-        self.assertIn("Intel HDR backlight interface v1, PQ decode", check.reason)
+        self.assertIn("Intel HDR backlight interface v1, PQ decode, SDR brightness over PWM", check.reason)
         self.assertTrue(self.apply(["xe-hdr-backlight"]).ok)
         self.assertIn("xe.enable_dpcd_backlight=3", self.f.runner.kargs)
         rc, out, _ = self.cli("status")
@@ -82,11 +96,33 @@ class HdrBacklightTest(Base):
         self.f.panel_dpcd(edp_rev=0x06)
         self.assertFalse(self.check().applicable)
 
-    def test_unreadable_panel_is_still_available(self):
+    def test_unreadable_panel_is_refused(self):
         self.fake()
         check = self.check()
-        self.assertTrue(check.applicable)
-        self.assertIn("could not read", check.reason)
+        self.assertFalse(check.applicable)
+        self.assertIn("could not check the panel", check.reason)
+
+    def test_panel_off_is_unknown_not_negative(self):
+        self.fake()
+        self.f.panel_dpcd()
+        self.f.write("/sys/class/drm/card1-eDP-1/dpms", "Off\n")
+        check = self.check()
+        self.assertFalse(check.applicable)
+        self.assertIn("panel is off", check.reason)
+
+    def test_missing_source_oui_is_unknown(self):
+        self.fake()
+        self.f.panel_dpcd(tcon=b"\x00\x00\x00\x00")
+        regs = bytearray((self.root / "dev/drm_dp_aux0").read_bytes())
+        regs[0x300:0x303] = b"\x00\x00\x00"
+        (self.root / "dev/drm_dp_aux0").write_bytes(bytes(regs))
+        check = self.check()
+        self.assertIn("source OUI", check.reason)
+
+    def test_sdr_aux_bit_is_reported(self):
+        self.fake()
+        self.f.panel_dpcd(tcon=b"\x01\x13\x01\x00")
+        self.assertIn("SDR brightness over AUX", self.check().reason)
 
     def test_conflicting_karg(self):
         self.fake(kargs=["rhgb", "xe.enable_dpcd_backlight=1"])
@@ -100,6 +136,47 @@ class HdrBacklightTest(Base):
         from oxp3_tool.detect import Context
         bundle, _ = diagnose.collect(Context(self.f.system()), "status")
         self.assertIn(b"eDP DPCD: /dev/drm_dp_aux0: eDP 1.4, Intel HDR", bundle.files["hardware.txt"])
+
+
+@unittest.skipIf(yaml is None, "PyYAML not installed")
+class GameModeSessionTest(Base):
+    def maps(self):
+        doc = yaml.safe_load(self.read(CAP_MAP))
+        return {m["name"]: m["target_event"]["gamepad"]["button"] for m in doc["mapping"]}
+
+    def test_ogui_overlay_sends_keyboard_as_lefttop(self):
+        self.fake()
+        self.f.ogui_overlay()
+        out = self.apply(["buttons"])
+        self.assertEqual(self.maps(), {"ONEX": "QuickAccess", "Keyboard": "LeftTop", "Home": "Guide"})
+        self.assertTrue(any("OpenGamepadUI overlay" in m for m in out.messages))
+        rc, status, _ = self.cli("status")
+        self.assertIn("Game Mode: Steam behind the OpenGamepadUI overlay", status)
+
+    def test_ogui_home_keyboard_needs_mapping(self):
+        self.fake()
+        self.f.ogui_overlay()
+        self.apply(["buttons"], home="keyboard", xbox_key="ogui-menu")
+        self.assertEqual(self.maps()["Home"], "LeftTop")
+        self.assertEqual(self.maps()["Xbox"], "QuickAccess2")
+
+    def test_native_steam_input(self):
+        self.fake()
+        self.f.ogui_overlay(disabled_for="gamer")
+        self.apply(["buttons"])
+        self.assertEqual(self.maps(), {"ONEX": "QuickAccess", "Keyboard": "Keyboard", "Home": "Guide"})
+        rc, status, _ = self.cli("status")
+        self.assertIn("Game Mode: native Steam Input", status)
+
+    def test_session_switch_is_reported_and_reapplied(self):
+        self.fake()
+        self.f.ogui_overlay()
+        self.apply(["buttons"])
+        self.f.write("/var/home/gamer/.config/gamescope-session-plus/sessions.d/ogui-steam", "x\n")
+        rc, status, _ = self.cli("status")
+        self.assertIn("Game Mode input changed", status)
+        self.apply(["buttons"])
+        self.assertEqual(self.maps()["Keyboard"], "Keyboard")
 
 
 @unittest.skipIf(yaml is None, "PyYAML not installed")

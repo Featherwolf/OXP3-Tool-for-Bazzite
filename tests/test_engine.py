@@ -103,7 +103,7 @@ class EngineTest(unittest.TestCase):
         out = self.apply(["buttons"], home="quick-access", keyboard_key="screenshot")
         self.assertTrue(out.changed)
         text = self.read(CAP_MAP)
-        self.assertIn("button: QuickAccess2", text)
+        self.assertIn("button: Screenshot", text)
         self.assertEqual(self.state()["fixes"]["buttons"]["files"][0]["backup"], None)
 
     def test_existing_file_is_backed_up_and_restored(self):

@@ -8,6 +8,7 @@ OXP3 has shipped with several BIOS versions and GPU PCI IDs.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -104,7 +105,20 @@ DPCD_INTEL_HDR_TCON_CAP = 0x340
 DPCD_EDP_REV = 0x700
 TCON_BRIGHTNESS_NITS_CAP = 0x10
 TCON_2084_DECODE_CAP = 0x01
+TCON_SDR_BRIGHTNESS_AUX_CAP = 0x01  # in the third capability byte
 EDP_14B = 0x05
+# Intel's source OUI, which the kernel writes to the panel; the Intel registers
+# read as zero without it (e.g. while the panel is powered off).
+DPCD_SOURCE_OUI = 0x300
+INTEL_SOURCE_OUI = b"\x00\xaa\x01"
+
+# Game Mode on Bazzite's deck images runs Steam behind the OpenGamepadUI
+# overlay; `ujust configure-opengamepadui disable` creates the per-user file
+# below, which switches back to native Steam Input.
+OGUI_SESSION = "/usr/share/gamescope-session-plus/sessions.d/ogui-steam"
+OGUI_USER_OVERRIDE = ".config/gamescope-session-plus/sessions.d/ogui-steam"
+OGUI = "ogui"
+NATIVE_STEAM = "steam"
 
 
 @dataclass
@@ -123,12 +137,18 @@ class EdpCaps:
         # The kernel only tries the Intel interface on eDP 1.4b and older.
         return self.intel_hdr_backlight and self.edp_rev <= EDP_14B
 
+    @property
+    def sdr_brightness_aux(self) -> bool:
+        """With the Intel interface, SDR brightness also goes over AUX (else the SoC PWM)."""
+        return bool(self.tcon[2] & TCON_SDR_BRIGHTNESS_AUX_CAP)
+
     def describe(self) -> str:
         revs = {0: "1.1", 1: "1.2", 2: "1.3", 3: "1.4", 4: "1.4a", 5: "1.4b", 6: "1.5"}
         rev = revs.get(self.edp_rev, hex(self.edp_rev))
         if self.intel_hdr_backlight:
             pq = ", PQ decode" if self.tcon[1] & TCON_2084_DECODE_CAP else ""
-            hdr = f"Intel HDR backlight interface v{self.tcon[0]}{pq}"
+            sdr = "AUX" if self.sdr_brightness_aux else "PWM"
+            hdr = f"Intel HDR backlight interface v{self.tcon[0]}{pq}, SDR brightness over {sdr}"
         else:
             hdr = "no Intel HDR backlight interface"
         return f"eDP {rev}, {hdr}"
@@ -146,10 +166,11 @@ class ResumeEvidence:
             out.append("the kernel log shows the SSD failing to come back from sleep "
                        "('Disabling device after reset failure')")
         if self.unfinished_resume:
-            out.append("the previous boot logged a suspend and nothing after it: whatever happened after "
-                       "waking was never written to disk, which is what a dead SSD looks like")
+            out.append("the previous boot's saved log ends during a suspend: the device was powered off "
+                       "while asleep or soon after waking, hung while waking, or the SSD dropped out")
         if self.simple_suspend:
-            out.append("the firmware puts the SSD into ACPI 'simple suspend', the path that fails on the OXP3")
+            out.append("the firmware puts the SSD slot into ACPI 'simple suspend', the path the Predator GM7 "
+                       "fails to wake from")
         return out
 
 
@@ -495,16 +516,60 @@ class Context:
         )
 
     @cached_property
-    def edp_caps(self) -> Optional[EdpCaps]:
-        """Read-only DPCD probe of the internal panel (needs root)."""
-        for conn in self.sys.glob("/sys/class/drm/card*-eDP-*"):
+    def edp_probe(self) -> tuple[Optional[EdpCaps], str]:
+        """Read-only DPCD probe of the internal panel: (caps, why not) - needs root and a lit panel.
+
+        The Intel registers only read correctly while the panel is powered and
+        carries Intel's source OUI, so anything else is reported as unknown,
+        never as "no interface".
+        """
+        conns = self.sys.glob("/sys/class/drm/card*-eDP-*")
+        if not conns:
+            return None, "no internal eDP panel found"
+        for conn in conns:
+            if (self.sys.read_attr(f"{conn}/dpms") or "On") != "On":
+                return None, "the panel is off; check again while the screen is on"
             for aux in self.sys.glob(f"{conn}/drm_dp_aux*"):
                 dev = "/dev/" + aux.rsplit("/", 1)[-1]
+                if not self.sys.exists(dev) or not os.access(self.sys.path(dev), os.R_OK):
+                    return None, "cannot read the panel's DPCD (needs root)"
+                oui = self.sys.read_at(dev, DPCD_SOURCE_OUI, 3)
                 tcon = self.sys.read_at(dev, DPCD_INTEL_HDR_TCON_CAP, 4)
                 rev = self.sys.read_at(dev, DPCD_EDP_REV, 1)
-                if tcon is not None and rev is not None:
-                    return EdpCaps(dev, rev[0], tcon)
-        return None
+                if oui is None or tcon is None or rev is None:
+                    return None, f"reading the panel's DPCD through {dev} failed"
+                if oui != INTEL_SOURCE_OUI:
+                    return None, "the panel does not carry Intel's source OUI right now; check again later"
+                return EdpCaps(dev, rev[0], tcon), ""
+        return None, "no DP AUX device for the eDP panel (/dev/drm_dp_aux*)"
+
+    @property
+    def edp_caps(self) -> Optional[EdpCaps]:
+        return self.edp_probe[0]
+
+    # -- Game Mode -------------------------------------------------------
+
+    @cached_property
+    def game_mode_input(self) -> Optional[str]:
+        """OGUI when Game Mode runs Steam behind the OpenGamepadUI overlay, NATIVE_STEAM
+        when it uses native Steam Input, None without a Game Mode session."""
+        if not self.has_game_mode:
+            return None
+        text = self.sys.read_text(OGUI_SESSION) or ""
+        if "--overlay-mode" not in text:
+            return NATIVE_STEAM
+        if self.ogui_disabled_for:
+            return NATIVE_STEAM
+        return OGUI
+
+    @cached_property
+    def ogui_disabled_for(self) -> list[str]:
+        """Users who ran `ujust configure-opengamepadui disable`."""
+        users = set()
+        for root in ("/home", "/var/home"):
+            for p in self.sys.glob(f"{root}/*/{OGUI_USER_OVERRIDE}"):
+                users.add(p.split("/")[-5])
+        return sorted(users)
 
     # -- input hardware --------------------------------------------------
 

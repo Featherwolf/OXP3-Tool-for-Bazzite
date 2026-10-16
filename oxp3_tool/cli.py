@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from . import PROJECT_URL, __version__, diagnose, templates
-from .detect import Context
+from .detect import NATIVE_STEAM, OGUI, Context
 from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
 from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix
 from .state import State, StateError
@@ -133,9 +133,16 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(f"Sleep:    mem_sleep {sleep}")
     for note in ctx.resume_evidence.lines():
         lines.append(f"          {note}")
-    caps = ctx.edp_caps
+    caps, why = ctx.edp_probe
     if caps is not None:
         lines.append(f"Panel:    {caps.describe()}")
+    elif not ctx.sys.is_real_root or os.geteuid() == 0:
+        lines.append(f"Panel:    not checked: {why}")
+    game = {OGUI: "Steam behind the OpenGamepadUI overlay (Bazzite default; "
+                  "`ujust configure-opengamepadui disable` switches to native Steam Input)",
+            NATIVE_STEAM: "native Steam Input"}.get(ctx.game_mode_input or "")
+    if game:
+        lines.append(f"Game Mode: {game}")
 
     if state.load_error:
         lines.append("")
@@ -174,7 +181,7 @@ def cmd_list(ctx: Context, state: State, args: argparse.Namespace) -> int:
         _out(f"  Takes effect: {fix.takes_effect}")
         _out()
     _out("Button actions for --onex-key, --keyboard-key, --home and --xbox-key:")
-    for name, (_, desc) in templates.BUTTON_ACTIONS.items():
+    for name, (_, _, desc) in templates.BUTTON_ACTIONS.items():
         _out(f"  {name:<13} {desc}")
     return 0
 
