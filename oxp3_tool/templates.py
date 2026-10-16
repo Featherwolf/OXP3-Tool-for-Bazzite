@@ -176,6 +176,21 @@ WantedBy=multi-user.target
 """
 
 
+# -- gamescope HDR switch ----------------------------------------------------------
+
+OLED_DISPLAY_KEY = "oxp3_tool_sdc_oled"
+GAMESCOPE_HDR_ENV = "/etc/environment.d/90-oxp3-tool-gamescope-hdr.conf"
+GAMESCOPE_HDR_CONF = f"""\
+# Installed by oxp3-tool ({PROJECT_URL}).
+# Remove with `sudo oxp3-tool revert gamescope-hdr`, then restart Game Mode.
+#
+# gamescope-session-plus starts gamescope with --hdr-enabled only when this is
+# set, and Steam offers Settings > Display > HDR only then. oxp3-tool's
+# oled-profile keeps the ONEXPLAYER 3 panel in gamma 2.2 mode while HDR is on.
+ENABLE_GAMESCOPE_HDR=1
+"""
+
+
 # -- modprobe: IMU -------------------------------------------------------------
 
 IMU_MODPROBE = f"""\
@@ -255,7 +270,7 @@ local oxp3_tool_refresh_rates = {{
 {rates_lua}
 }}
 
-gamescope.config.known_displays.oxp3_tool_sdc_oled = {{
+gamescope.config.known_displays.{OLED_DISPLAY_KEY} = {{
     pretty_name = "ONEXPLAYER 3 OLED (oxp3-tool)",
     hdr = {{
         supported = true,
@@ -283,7 +298,7 @@ gamescope.config.known_displays.oxp3_tool_sdc_oled = {{
     end,
     matches = function(display)
         if display.vendor == "SDC" and display.product == 0x4301 then
-            debug("[oxp3_tool_sdc_oled] Matched vendor: "..display.vendor.." product: "..display.product)
+            debug("[{OLED_DISPLAY_KEY}] Matched vendor: "..display.vendor.." product: "..display.product)
             return 5100
         end
         return -1

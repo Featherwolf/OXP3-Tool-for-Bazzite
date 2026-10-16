@@ -69,6 +69,8 @@ IP_ETC_CAPABILITY_MAPS = "/etc/inputplumber/capability_maps.d"
 _PRODUCT_RE = re.compile(r"""^\s*product_name:\s*["']?ONEXPLAYER 3["']?\s*(#.*)?$""", re.M)
 _MAP_ID_RE = re.compile(r"""^capability_map_id:\s*["']?([A-Za-z0-9_.-]+)["']?\s*(#.*)?$""", re.M)
 _ID_RE = re.compile(r"""^id:\s*["']?([A-Za-z0-9_.-]+)["']?\s*(#.*)?$""", re.M)
+# gamescope DRM backend: "Got known display: <key> (<pretty name>)"
+_KNOWN_DISPLAY_RE = re.compile(r"Got known display: ([A-Za-z0-9_.-]+) \(")
 # InputPlumber 0.82 oxp_hid: "failed to parse B2 report: <err>: [b2 3f 01 01 1f 80 25 ...]" (byte 6 = button id)
 _UNDECODED_RE = re.compile(r"failed to parse B2 report: .*?\[b2 3f(?: [0-9a-f]{2}){4} ([0-9a-f]{2})")
 
@@ -657,6 +659,14 @@ class Context:
                     pass
         users = [u for u in mine if by_user[u]]
         return [out for u in (users or by_user) for out in by_user[u]], bool(users)
+
+    @cached_property
+    def gamescope_known_display(self) -> Optional[str]:
+        """The gamescope display profile Game Mode used this boot ("Got known display: <name>"), if logged."""
+        res = self.sys.run(["journalctl", "-b", "0", "--no-pager", "-q", "-o", "cat",
+                            "--grep", "Got known display", "-n", "20"], timeout=60)
+        found = _KNOWN_DISPLAY_RE.findall(res.stdout)
+        return found[-1] if found else None
 
     # -- Game Mode -------------------------------------------------------
 

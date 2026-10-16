@@ -122,6 +122,7 @@ class FakeRunner:
         self.packages = {"inputplumber": "0.82.0"}
         self.journal: dict[str, str] = {}  # boot ("0", "-1") -> kernel log
         self.ip_journal = ""  # this boot's inputplumber.service messages
+        self.session_journal = ""  # this boot's other messages (gamescope)
         self.bmi270_aliases = "i2c:bmi270\nacpi*:BMI0260:*\nacpi*:10EC5280:*\n"
 
     def _failing(self, argv: Sequence[str]) -> bool:
@@ -146,6 +147,10 @@ class FakeRunner:
         if cmd == "journalctl" and "-k" in argv:
             boot = argv[argv.index("-b") + 1]
             return CommandResult(0, self.journal.get(boot, ""))
+        if cmd == "journalctl" and "--grep" in argv and "-u" not in argv:
+            pattern = argv[argv.index("--grep") + 1]
+            lines = [ln for ln in self.session_journal.splitlines() if pattern in ln]
+            return CommandResult(0 if lines else 1, "".join(ln + "\n" for ln in lines))
         if cmd == "journalctl" and "inputplumber.service" in argv:
             pattern = argv[argv.index("--grep") + 1] if "--grep" in argv else ""
             lines = [ln for ln in self.ip_journal.splitlines() if pattern in ln]

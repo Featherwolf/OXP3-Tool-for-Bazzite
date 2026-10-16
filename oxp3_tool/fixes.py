@@ -662,7 +662,59 @@ class OledProfileFix(Fix):
         if not edid:
             return lines + [f"{name}: EDID not readable"]
         model = f" ({edid.name})" if edid.name else ""
-        return lines + [f"{name}: {edid.vendor} 0x{edid.product:04x}{model}"]
+        lines.append(f"{name}: {edid.vendor} 0x{edid.product:04x}{model}")
+        used = ctx.gamescope_known_display
+        if used == templates.OLED_DISPLAY_KEY:
+            lines.append("Game Mode used this profile this boot")
+        elif used:
+            lines.append(f"warning: Game Mode used the {used!r} display profile this boot, not this one; "
+                         "restart Game Mode")
+        return lines
+
+
+class GamescopeHdrFix(Fix):
+    id = "gamescope-hdr"
+    group = DISPLAY
+    level = EXPERIMENTAL
+    title = "HDR switch in Game Mode"
+    summary = "Start Game Mode with HDR support so Steam offers HDR (gamma 2.2 via oled-profile)"
+    details = (
+        "Bazzite starts gamescope with --hdr-enabled only when ENABLE_GAMESCOPE_HDR=1 is\n"
+        "set, and it does not set it, so Steam shows no HDR switch in Game Mode. This sets\n"
+        f"it in {templates.GAMESCOPE_HDR_ENV}, which Game Mode reads at start.\n"
+        "Only offered while oled-profile is installed and gamescope's log shows Game Mode\n"
+        "used it this boot: that profile keeps the panel in gamma 2.2 with HDR on (tested\n"
+        "on an OXP3 under SteamOS), while gamescope's stock profile for this panel sends\n"
+        "PQ, which leaves the screen black. Not yet tested on Bazzite. Steam remembers the\n"
+        "HDR switch, so if the screen goes black after turning it on: hold the power\n"
+        "button to switch off, then from Desktop Mode, SSH or a text console (Ctrl+Alt+F3\n"
+        "on a USB keyboard) run `sudo oxp3-tool revert gamescope-hdr` and reboot; without\n"
+        "this setting Game Mode starts without HDR whatever Steam remembers."
+    )
+    takes_effect = "next time Game Mode starts (restart Game Mode or reboot), then Steam > Settings > Display"
+
+    def check(self, ctx: Context) -> Check:
+        if not ctx.has_game_mode:
+            return Check(False, "no gamescope Game Mode session on this image")
+        lua = ctx.sys.read_text(OledProfileFix.LUA) or ""
+        if templates.OWN_MARKER not in lua or templates.OLED_DISPLAY_KEY not in lua:
+            return Check(False, "needs oled-profile (without it gamescope sends PQ HDR, which blanks the panel)")
+        used = ctx.gamescope_known_display
+        if used is None:
+            return Check(False, "start Game Mode once with oled-profile applied, then check again")
+        if used != templates.OLED_DISPLAY_KEY:
+            return Check(False, f"Game Mode used display profile {used!r}, not oled-profile's; restart it")
+        return Check(True, "Game Mode uses oled-profile, which keeps HDR in gamma 2.2")
+
+    def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
+        return Plan(
+            files=[FileSpec(templates.GAMESCOPE_HDR_ENV, templates.GAMESCOPE_HDR_CONF.encode())],
+            messages=["Restart Game Mode (or reboot), then turn HDR on in Steam > Settings > Display. "
+                      "If the screen goes black, see `oxp3-tool list` under gamescope-hdr for recovery."],
+        )
+
+    def revert_messages(self) -> list[str]:
+        return ["Restart Game Mode (or reboot) so gamescope starts without HDR."]
 
 
 class XePanelReplayFix(_KargFix):
@@ -774,6 +826,7 @@ ALL_FIXES: list[Fix] = [
     InputPlumberSuspendFix(),
     NvmeResumeFix(),
     OledProfileFix(),
+    GamescopeHdrFix(),
     XePanelReplayFix(),
     XeHdrBacklightFix(),
     XeDsbFix(),
