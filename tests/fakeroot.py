@@ -210,7 +210,8 @@ class FakeOxp3:
     def build(self, dmi: Optional[dict] = None, os_id: str = "bazzite", image: str = "bazzite-deck",
               inputplumber: bool = True, gamescope: bool = True, gm7: bool = True,
               edid: Optional[bytes] = None, force_release: str = "369-370",
-              imu_driver: Optional[str] = "bmi160_i2c", iio: Sequence[str] = ()) -> None:
+              imu_driver: Optional[str] = "bmi160_i2c", iio: Sequence[str] = (),
+              game_mode: bool = True) -> None:
         for k, v in (dmi or OXP3_DMI).items():
             self.write(f"/sys/class/dmi/id/{k}", v + "\n")
         self.write("/etc/os-release", f'NAME="Bazzite"\nID={os_id}\nPRETTY_NAME="Bazzite 44 (FROM Fedora Kinoite)"\n')
@@ -228,6 +229,8 @@ class FakeOxp3:
             self.write("/usr/lib/systemd/system/inputplumber-suspend.service", "[Service]\n")
         if gamescope:
             self.write("/usr/bin/gamescope", "")
+        if gamescope and game_mode:
+            self.write("/usr/bin/gamescope-session-plus", "")
         self.write("/sys/class/drm/card1-eDP-1/edid", make_edid() if edid is None else edid)
         self.write("/sys/class/drm/card1-eDP-1/status", "connected\n")
         self.mkdir("/sys/module/xe")
@@ -260,3 +263,7 @@ class FakeOxp3:
     def boot(self) -> None:
         """Simulate a reboot: the pending kernel arguments become active."""
         self.write("/proc/cmdline", " ".join(self.runner.kargs) + "\n")
+
+    def update_before_reboot(self) -> None:
+        """Simulate `bootc upgrade` staging an update built from the booted kernel arguments."""
+        self.runner.kargs = (self.root / "proc/cmdline").read_text().split()

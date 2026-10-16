@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 from typing import Optional, Sequence
 
 from . import PROJECT_URL, __version__, diagnose, templates
 from .detect import Context
-from .engine import Engine, EngineError, Outcome, file_statuses
-from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, Fix
+from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
+from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix
 from .state import State, StateError
 from .system import SimulatedRunner, System
 
@@ -27,7 +28,21 @@ def _err(line: str) -> None:
 
 
 def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
+    if state.load_error:
+        return "unknown", []
     entry = state.get(fix.id)
+    if entry and entry.get("reverted"):
+        lines = []
+        for karg in entry.get("kargs_removal_pending", []):
+            if ctx.karg_pending(karg):
+                lines.append(f"{karg} came back with a system update installed before the reboot; "
+                             f"run `sudo oxp3-tool revert {fix.id}` again")
+            else:
+                lines.append(f"{karg} is removed from the next boot (reboot to finish)")
+        return "reverting", lines
+    if entry and not entry.get("applied_at"):
+        return "incomplete", [f"an earlier run did not finish; run `sudo oxp3-tool apply {fix.id}` "
+                              f"or `sudo oxp3-tool revert {fix.id}`"]
     if entry:
         problems = []
         for fs in file_statuses(ctx, entry):
@@ -35,12 +50,17 @@ def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
                 problems.append(f"{fs.path} is missing")
             elif not fs.matches:
                 problems.append(f"{fs.path} was changed by something else")
-        label = "applied" if not problems else "applied, damaged"
+        label = "applied" if not problems else "damaged"
         return label, problems + fix.live_state(ctx, entry)
     check = fix.check(ctx)
     if not check.applicable:
         return "n/a", [check.reason]
-    label = "recommended" if check.recommended else fix.level
+    if check.recommended:
+        label = "recommended"
+    elif fix.level == RECOMMENDED:
+        label = OPTIONAL  # e.g. nvme-resume without the GM7 SSD
+    else:
+        label = fix.level
     return label, ([check.reason] if check.reason else [])
 
 
@@ -61,7 +81,8 @@ def status_text(ctx: Context, state: State) -> str:
 
     os_name = ctx.os_release.get("PRETTY_NAME") or ctx.os_release.get("NAME") or "unknown OS"
     image = f", image {ctx.image_name}" if ctx.image_name else ""
-    lines.append(f"OS:       {os_name}{image}, kernel {ctx.kernel_release or '?'}")
+    not_bazzite = "" if ctx.is_bazzite else (" - NOT Bazzite (--force)" if ctx.force else " - NOT Bazzite")
+    lines.append(f"OS:       {os_name}{image}, kernel {ctx.kernel_release or '?'}{not_bazzite}")
 
     ip = ctx.inputplumber
     if ip.installed:
@@ -83,14 +104,18 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(f"          hid-oxp bound to {len(ctx.hid_oxp_devices)} MCU interface(s)")
 
     panel = ctx.internal_panel
-    if panel:
-        name, edid = panel
-        p = f"{name}: {edid.vendor} 0x{edid.product:04x}" + (f" ({edid.name})" if edid and edid.name else "") \
-            if edid else f"{name}: EDID unreadable"
-    else:
+    if not panel:
         p = "no eDP panel found"
+    elif panel[1] is None:
+        p = f"{panel[0]}: EDID unreadable"
+    else:
+        name, edid = panel
+        p = f"{name}: {edid.vendor} 0x{edid.product:04x}" + (f" ({edid.name})" if edid.name else "")
     gpu = "xe loaded" if ctx.xe_loaded else "xe not loaded"
-    gs = "gamescope installed" if ctx.gamescope_installed else "no gamescope"
+    if ctx.has_game_mode:
+        gs = "gamescope Game Mode"
+    else:
+        gs = "gamescope installed, no Game Mode session" if ctx.gamescope_installed else "no gamescope"
     lines.append(f"Display:  {p}; {gpu}; {gs}")
 
     drives = ", ".join(
@@ -103,6 +128,11 @@ def status_text(ctx: Context, state: State) -> str:
     if sleep:
         lines.append(f"Sleep:    mem_sleep {sleep}")
 
+    if state.load_error:
+        lines.append("")
+        lines.append(f"warning: {state.load_error}")
+        lines.append("Which fixes are applied is unknown until that file is fixed or moved aside.")
+
     for group, title in ((CONTROLLER, "Controller fixes"), (DISPLAY, "Display and wake-from-sleep fixes")):
         lines.append("")
         lines.append(title)
@@ -114,7 +144,7 @@ def status_text(ctx: Context, state: State) -> str:
             for note in notes:
                 lines.append(f"  {'':14} {'':21} {note}")
     lines.append("")
-    if not ctx.device_ok:
+    if not (ctx.device_ok and ctx.os_ok):
         lines.append("This tool only changes anything on a ONEXPLAYER 3 running Bazzite.")
     else:
         lines.append("`sudo oxp3-tool apply` applies the recommended fixes; `oxp3-tool list` explains each one.")
@@ -202,6 +232,7 @@ def cmd_apply(ctx: Context, state: State, args: argparse.Namespace) -> int:
         "min_refresh": args.min_refresh,
         "any_ssd": args.any_ssd,
         "restart": not args.no_restart,
+        "defaults": args.defaults,
     }
     engine = Engine(ctx, state, out=_out)
     plans = engine.plan(fixes, opts)
@@ -214,6 +245,9 @@ def cmd_apply(ctx: Context, state: State, args: argparse.Namespace) -> int:
     rc = _need_root(ctx.sys)
     if rc is not None:
         return rc
+    if not any(engine.changes(fix, plan) for fix, plan in plans):
+        _out("Nothing to change.")
+        return 0
     if not _confirm("Apply these changes?", args.yes):
         _out("Cancelled.")
         return 1
@@ -245,7 +279,9 @@ def cmd_revert(ctx: Context, state: State, args: argparse.Namespace) -> int:
             _out(f"    {verb} {rec['path']}")
         for unit in entry.get("units_enabled", []):
             _out(f"    disable {unit}")
-        for karg in entry.get("kargs", []):
+        for karg in entry.get("kargs", []) + [
+            k for k in entry.get("kargs_removal_pending", []) if ctx.karg_pending(k)
+        ]:
             _out(f"    remove kernel argument {karg} (reboot needed)")
     if args.dry_run:
         _out("(dry run: nothing changed)")
@@ -268,13 +304,15 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
         _out("Not running as root: kernel debug files and some logs will be missing (use sudo for a full report).")
     bundle, findings = diagnose.collect(ctx, status_text(ctx, state))
     path = args.output or diagnose.default_output_name()
-
-    def chown(p: str) -> None:
-        uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
-        if uid and gid and os.geteuid() == 0:
-            os.chown(p, int(uid), int(gid))
-
-    diagnose.write_bundle(bundle, path, chown)
+    owner = None
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if uid and gid and os.geteuid() == 0:
+        owner = (int(uid), int(gid))
+    try:
+        diagnose.write_bundle(bundle, path, owner)
+    except FileExistsError:
+        _err(f"error: {path} already exists; choose another name with --output")
+        return 1
     _out(f"Wrote {path}")
     if findings:
         _out("Known problem patterns in the kernel logs (this boot and the previous one):")
@@ -282,7 +320,8 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
             _out(f"  {line}")
     else:
         _out("No known problem patterns in the kernel logs.")
-    _out("The archive contains system logs; look through it before sharing it publicly.")
+    _out("Serial numbers and MAC addresses were replaced, but the archive still contains system logs "
+         "(hostnames, Wi-Fi network names); look through it before sharing it publicly.")
     return 0
 
 
@@ -318,6 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar=f"{{{templates.PANEL_MIN_HZ}..{templates.LEGIONGO2_MIN_HZ}}}",
                    help="oled-profile: lowest refresh rate offered (default 48; below 48 is untested)")
     a.add_argument("--any-ssd", action="store_true", help="nvme-resume: apply even without a Predator GM7")
+    a.add_argument("--defaults", action="store_true",
+                   help="ignore the options remembered from the last apply (button actions, --min-refresh)")
 
     r = sub.add_parser("revert", help="undo fixes applied by this tool")
     r.add_argument("fixes", nargs="*", metavar="FIX")
@@ -340,14 +381,24 @@ COMMANDS = {
 }
 
 
+MUTATING = ("apply", "revert")
+
+
 def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) -> int:
     args = build_parser().parse_args(argv)
     if system is None:
-        runner = None if args.root == "/" else SimulatedRunner(args.root)
-        system = System(args.root, runner)
+        # Simulate commands only for a fake root; any spelling of / is the real system.
+        if Path(args.root).resolve() == Path("/"):
+            system = System("/")
+        else:
+            system = System(args.root, SimulatedRunner(args.root))
     ctx = Context(system, force=args.force)
     try:
-        state = State(system)
+        mutating = args.command in MUTATING
+        state = State(system, tolerant=not mutating)
+        if reconcile(ctx, state) and mutating and not getattr(args, "dry_run", False):
+            if not system.is_real_root or os.geteuid() == 0:
+                state.save()
         return COMMANDS[args.command](ctx, state, args)
     except (EngineError, StateError) as e:
         _err(f"error: {e}")

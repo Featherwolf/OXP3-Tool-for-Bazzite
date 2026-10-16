@@ -52,22 +52,37 @@ def subprocess_runner(argv: Sequence[str], timeout: Optional[int] = None) -> Com
 class SimulatedRunner:
     """Runner for --root: never runs host commands, just records them.
 
-    ``rpm-ostree kargs`` answers with the fake root's /proc/cmdline so kernel
-    argument planning can be exercised; every other command "succeeds" with
-    no output.
+    ``rpm-ostree kargs`` is emulated: the next boot's arguments start as the
+    fake root's /proc/cmdline and changes are kept in ``<root>/.oxp3-sim-kargs``.
+    Every other command "succeeds" with no output.
     """
 
     def __init__(self, root: str | os.PathLike):
         self.root = Path(root)
         self.calls: list[list[str]] = []
 
-    def __call__(self, argv: Sequence[str], timeout: Optional[int] = None) -> CommandResult:
-        self.calls.append(list(argv))
-        if list(argv) == ["rpm-ostree", "kargs"]:
+    def _kargs(self) -> list[str]:
+        for name in (".oxp3-sim-kargs", "proc/cmdline"):
             try:
-                return CommandResult(0, (self.root / "proc/cmdline").read_text())
+                return (self.root / name).read_text().split()
             except OSError:
-                return CommandResult(0, "")
+                continue
+        return []
+
+    def __call__(self, argv: Sequence[str], timeout: Optional[int] = None) -> CommandResult:
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:2] == ["rpm-ostree", "kargs"]:
+            kargs = self._kargs()
+            for opt in argv[2:]:
+                key, _, value = opt.partition("=")
+                if key == "--append-if-missing" and value not in kargs:
+                    kargs.append(value)
+                elif key == "--delete-if-present":
+                    kargs = [k for k in kargs if k != value]
+            if len(argv) > 2:
+                (self.root / ".oxp3-sim-kargs").write_text(" ".join(kargs) + "\n")
+            return CommandResult(0, " ".join(kargs) + "\n")
         return CommandResult(0, "", "")
 
 

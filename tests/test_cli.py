@@ -63,8 +63,13 @@ class CliTest(unittest.TestCase):
         self.assertIn("nvme.noacpi=1 is active", out)
         rc, out, err = self.run_cli("revert", "--all", "--yes")
         self.assertEqual(rc, 0, err)
+        rc, out, _ = self.run_cli("status")
+        self.assertIn("[reverting   ] nvme-resume", out)
+        self.assertIn("nvme.noacpi=1 is removed from the next boot (reboot to finish)", out)
+        self.f.boot()
         rc, out, _ = self.run_cli("revert", "--all", "--yes")
         self.assertIn("Nothing applied", out)
+        self.assertFalse((self.root / "var/lib/oxp3-tool").exists())
 
     def test_unknown_fix(self):
         rc, _, err = self.run_cli("apply", "--dry-run", "nope")

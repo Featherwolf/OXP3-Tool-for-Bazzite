@@ -357,6 +357,14 @@ class Context:
         return self.sys.which("gamescope") is not None
 
     @cached_property
+    def has_game_mode(self) -> bool:
+        """A gamescope-session (Game Mode) exists; desktop images only run gamescope nested."""
+        return any(self.sys.exists(p) for p in (
+            "/usr/bin/gamescope-session-plus",
+            "/usr/share/gamescope-session-plus/gamescope-session-plus",
+        ))
+
+    @cached_property
     def internal_panel(self) -> Optional[tuple[str, Optional[EdidInfo]]]:
         """(connector, parsed EDID) of the first eDP connector found."""
         for conn in self.sys.glob("/sys/class/drm/card*-eDP-*"):

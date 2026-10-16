@@ -7,9 +7,10 @@ import io
 import os
 import re
 import tarfile
-from typing import Callable, Optional
+from typing import Optional
 
 from .detect import IMU_I2C_DEVICE, Context, parse_edid
+from .state import STATE_FILE
 
 # Kernel log patterns worth calling out, with what they usually mean.
 PATTERNS: list[tuple[str, str]] = [
@@ -78,22 +79,52 @@ DEBUGFS_GLOBS = [
 MAX_FILE = 4 * 1024 * 1024
 
 
+_SERIAL_RE = re.compile(r"(SerialNumber:\s*)\S.*")
+_UNIQ_RE = re.compile(r"^(U: Uniq=)\S.*$", re.M)
+_MAC_RE = re.compile(r"(?i)(?<![0-9a-f:])[0-9a-f]{2}(?::[0-9a-f]{2}){5}(?![0-9a-f:])")
+
+
+class Redactor:
+    """Removes USB serial numbers, input-device unique IDs and MAC addresses.
+
+    MAC addresses become stable per-archive tags (mac-1, mac-2, ...) so lines
+    stay comparable without exposing the address.
+    """
+
+    def __init__(self) -> None:
+        self.macs: dict[str, str] = {}
+
+    def _mac(self, m: re.Match) -> str:
+        key = m.group(0).lower()
+        if key == "00:00:00:00:00:00" or key == "ff:ff:ff:ff:ff:ff":
+            return m.group(0)
+        if key not in self.macs:
+            self.macs[key] = f"mac-{len(self.macs) + 1}"
+        return self.macs[key]
+
+    def __call__(self, text: str) -> str:
+        text = _SERIAL_RE.sub(r"\1<redacted>", text)
+        text = _UNIQ_RE.sub(r"\1<redacted>", text)
+        return _MAC_RE.sub(self._mac, text)
+
+
 class Bundle:
     def __init__(self) -> None:
         self.files: dict[str, bytes] = {}
+        self.redact = Redactor()
 
     def add(self, name: str, data: bytes | str) -> None:
-        if isinstance(data, str):
-            data = data.encode()
-        self.files[name] = data[:MAX_FILE]
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", errors="replace")
+        self.files[name] = self.redact(data).encode()[:MAX_FILE]
 
-    def write(self, path: str) -> None:
-        stamp = datetime.datetime.now().timestamp()
-        with tarfile.open(path, "w:gz") as tar:
+    def write(self, fileobj) -> None:
+        stamp = int(datetime.datetime.now().timestamp())
+        with tarfile.open(fileobj=fileobj, mode="w:gz") as tar:
             for name, data in sorted(self.files.items()):
                 info = tarfile.TarInfo(f"oxp3-diagnose/{name}")
                 info.size = len(data)
-                info.mtime = int(stamp)
+                info.mtime = stamp
                 info.mode = 0o644
                 tar.addfile(info, io.BytesIO(data))
 
@@ -111,6 +142,9 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     sys = ctx.sys
     bundle = Bundle()
     bundle.add("status.txt", status_text)
+    state = sys.read_bytes(STATE_FILE)
+    if state is not None:
+        bundle.add("files" + STATE_FILE, state)
 
     dmi_lines = []
     for f in DMI_PUBLIC:
@@ -188,8 +222,11 @@ def default_output_name() -> str:
     return f"oxp3-diagnose-{stamp}.tar.gz"
 
 
-def write_bundle(bundle: Bundle, path: str, chown: Optional[Callable[[str], None]] = None) -> None:
-    bundle.write(path)
-    os.chmod(path, 0o600)
-    if chown:
-        chown(path)
+def write_bundle(bundle: Bundle, path: str, owner: Optional[tuple[int, int]] = None) -> None:
+    """Create ``path`` exclusively (never through a symlink) and hand it to ``owner``."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        if owner:
+            os.fchown(f.fileno(), owner[0], owner[1])
+        bundle.write(f)

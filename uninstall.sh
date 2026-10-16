@@ -23,7 +23,18 @@ fi
 
 rm -f "$BIN"
 rm -rf "$DEST"
-if [[ ! -f "$STATE" ]]; then
-    rm -rf /var/lib/oxp3-tool
+
+# Keep anything revert left for the user (backups of their own files,
+# copies of files they had edited); remove the directory only when empty.
+SDIR=/var/lib/oxp3-tool
+if [[ ! -f "$STATE" && -d "$SDIR" ]]; then
+    find "$SDIR" -mindepth 1 -depth -type d -empty -delete
+    if [[ -n "$(find "$SDIR" -mindepth 1 -not -type d -print -quit)" ]]; then
+        echo "Kept $SDIR, which still holds copies of your files:"
+        find "$SDIR" -mindepth 1 -not -type d
+        echo "Delete it once you no longer need them: sudo rm -rf $SDIR"
+    else
+        rmdir "$SDIR" 2>/dev/null || true
+    fi
 fi
 echo "oxp3-tool removed."

@@ -6,6 +6,9 @@ from typing import Optional
 
 from . import PROJECT_URL
 
+# First-line marker of every file this tool writes.
+OWN_MARKER = "Installed by oxp3-tool ("
+
 # -- InputPlumber capability map --------------------------------------------
 
 # User-facing action name -> (InputPlumber gamepad button, description)

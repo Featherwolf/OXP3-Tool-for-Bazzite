@@ -18,6 +18,8 @@ sudo oxp3-tool apply        # apply the recommended fixes (asks first)
 systemctl reboot            # kernel arguments take effect at boot
 ```
 
+Reboot before you install a system update. A Bazzite update installed first is built from the kernel arguments the system booted with, so it drops the change. `oxp3-tool status` notices this, and running `apply` (or `revert`) again fixes it.
+
 You can also run it from the source folder without installing it: `sudo ./bin/oxp3-tool apply`.
 
 Run it in Desktop Mode (Konsole) or over SSH. The only requirement is Python 3, which Bazzite already includes.
@@ -26,10 +28,10 @@ Run it in Desktop Mode (Konsole) or over SSH. The only requirement is Python 3, 
 
 | Fix | Level | Problem | What it changes |
 |---|---|---|---|
-| `buttons` | recommended | On stock InputPlumber 0.82, the **keyboard key takes a screenshot** and the **home key opens the on-screen keyboard**. | Adds an InputPlumber capability map override in `/etc/inputplumber/capability_maps.d/`. Defaults: keyboard key opens the on-screen keyboard, home key opens Steam (Guide), ONEX key opens Quick Access. You can remap each key. |
-| `volume-keys` | recommended | The **volume rocker sticks**: the embedded controller drops the key-release, so volume keeps changing after you let go. | Adds a udev hwdb entry (`/etc/udev/hwdb.d/61-oxp3-tool-volume-keys.hwdb`) that forces key-release for both volume keys. Holding a key no longer auto-repeats. |
+| `buttons` | recommended | On stock InputPlumber 0.82, the **keyboard key takes a screenshot** and the **home key opens the on-screen keyboard**. | Adds an InputPlumber capability map override in `/etc/inputplumber/capability_maps.d/`. Defaults: keyboard key opens the on-screen keyboard, home key opens Steam (Guide), ONEX key opens Quick Access. You can remap each key. The override replaces the whole stock map, so it is only recommended while the stock map is the 0.82.0 one it was written for. |
+| `volume-keys` | recommended | The **volume rocker sticks**: the embedded controller drops the key-release, so volume keys keep changing after you let go. | Adds a udev hwdb entry (`/etc/udev/hwdb.d/61-oxp3-tool-volume-keys.hwdb`) that forces key-release for both volume keys. Holding a key no longer auto-repeats. Not offered while Handheld Daemon runs, because HHD then drops every volume press ([hhd#342](https://github.com/hhd-dev/hhd/issues/342)). |
 | `nvme-resume` | recommended with the Predator GM7 SSD | **Black or frozen screen after sleep.** The Acer Predator GM7 SSD (PCI `1dee:1602`) does not come back from s2idle. The kernel logs `Disabling device after reset failure: -19` and the root filesystem goes read-only. | Adds the kernel argument `nvme.noacpi=1`, which fixed resume in community testing on the OXP3. |
-| `oled-profile` | recommended | **Black panel in Game Mode** (after boot, a session switch or resume) and a dead brightness slider while HDR is on. gamescope drives this panel (the same Samsung panel as the Legion Go 2) with BT.2020/PQ, which the OXP3 does not display. | Adds a gamescope display profile (`/etc/gamescope/scripts/90-oxp3-tool-oled.lua`) that keeps the panel in gamma 2.2 mode, the way the Steam Deck OLED works. HDR still works through gamescope's tone mapping. It also lists the panel's 48–144 Hz refresh rates. |
+| `oled-profile` | recommended on bazzite-deck | **Black panel in Game Mode** (after boot, a session switch or resume) and a dead brightness slider while HDR is on. gamescope drives this panel (the same Samsung panel as the Legion Go 2) with BT.2020/PQ, which the OXP3 does not display. | Adds a gamescope display profile (`/etc/gamescope/scripts/90-oxp3-tool-oled.lua`) that keeps the panel in gamma 2.2 mode, the way the Steam Deck OLED works. HDR still works through gamescope's tone mapping. It also lists the panel's 48–144 Hz refresh rates. |
 | `xe-dsb-off` | optional | `DSB 0 poll error` floods the journal, and some users see cursor trails. | Kernel argument `xe.enable_dsb=0`. Cosmetic only. |
 | `xe-panel-replay-off` | experimental | Intermittent black or garbled screen (Panther Lake Panel Replay bugs). | Kernel argument `xe.enable_panel_replay=0`. Not shown to fix resume. Refused if `xe.enable_psr=0` or `xe.enable_psr2_sel_fetch=0` is set, because those combinations blank the OXP3 screen. |
 | `inputplumber-suspend` | experimental | Controller misbehaves after waking. | Enables `inputplumber-suspend.service`, which InputPlumber ships but Bazzite leaves disabled. |
@@ -44,7 +46,7 @@ sudo oxp3-tool apply oled-profile --min-refresh 40     # below 48 Hz is untested
 sudo oxp3-tool apply nvme-resume --any-ssd             # SSD other than the GM7 that fails to resume
 ```
 
-Button actions are `guide`, `quick-access`, `keyboard` (on-screen keyboard) and `screenshot`. `oxp3-tool list` explains every fix in detail.
+Button actions are `guide`, `quick-access`, `keyboard` (on-screen keyboard) and `screenshot`. Your button choices and `--min-refresh` are remembered when you apply again; `--defaults` resets them. `oxp3-tool list` explains every fix in detail.
 
 ## Commands
 
@@ -52,17 +54,19 @@ Button actions are `guide`, `quick-access`, `keyboard` (on-screen keyboard) and 
 |---|---|
 | `oxp3-tool status` | Device, OS image, InputPlumber, panel, SSD, gyro, and the state of every fix (default command). |
 | `oxp3-tool list` | Detailed description of every fix. |
-| `sudo oxp3-tool apply [FIX...]` | Shows the plan, asks, then applies. Takes `--dry-run`, `--yes` and the per-fix options above. Safe to run again. |
-| `sudo oxp3-tool revert FIX...` / `--all` | Undoes the tool's changes: restores any file it replaced, removes only the kernel arguments it added, disables only the units it enabled. |
-| `sudo oxp3-tool diagnose` | Writes `oxp3-diagnose-<time>.tar.gz` (status, kernel logs of this and the previous boot, InputPlumber and gamescope logs, display, backlight, SSD and IMU state) and points out known problem messages. Serial numbers are left out. The logs are otherwise complete, so look through the archive before posting it. |
+| `sudo oxp3-tool apply [FIX...]` | Shows the plan, asks, then applies. Takes `--dry-run`, `--yes`, `--defaults` and the per-fix options above. Safe to run again: it only changes what differs. |
+| `sudo oxp3-tool revert FIX...` / `--all` | Undoes the tool's changes. It restores any file it replaced and removes the directories it created. It removes only the kernel arguments it added and disables only the units it enabled. A file you edited after it was installed is saved to `/var/lib/oxp3-tool/modified/` before removal. |
+| `sudo oxp3-tool diagnose` | Writes `oxp3-diagnose-<time>.tar.gz` and points out known problem messages. The archive holds: status; kernel logs of this and the previous boot; InputPlumber and gamescope logs; display, backlight, SSD and IMU state. DMI serials, USB serial numbers, input-device unique IDs and MAC addresses are replaced. Hostnames and Wi-Fi network names can still appear, so look through the archive before posting it. |
 
 ## After applying
 
 - **`buttons`**: InputPlumber restarts at once. If the buttons do nothing, restart Steam or reboot.
 - **`oled-profile`**: switch to Desktop Mode and back, or reboot.
-- **Kernel arguments** (`nvme-resume`, `xe-*`): reboot. They stay through Bazzite updates.
-- `oxp3-tool status` shows whether each change is active: a kernel argument shows as *active* or *set for the next boot*, and volume keys show whether the kernel is forcing releases.
-- After a Bazzite update, run `oxp3-tool status`. It warns you if InputPlumber's stock OXP3 map changed under the button override.
+- **Kernel arguments** (`nvme-resume`, `xe-*`): reboot before installing a system update. Once booted, they stay through Bazzite updates.
+- `oxp3-tool status` shows whether each change is active:
+  - A kernel argument shows as *active* or *set for the next boot*. It also shows when an update dropped one.
+  - Volume keys show whether the kernel is forcing releases.
+- After a Bazzite update, run `oxp3-tool status`. It warns you if InputPlumber's stock OXP3 map changed under the button override. The override still replaces the new map until you revert it.
 
 ## What it deliberately does not do
 
@@ -79,14 +83,16 @@ These were ruled out because they break things on this hardware or on Bazzite:
 ## Requirements
 
 - A OneXPlayer 3. The DMI must read `sys_vendor=ONE-NETBOOK`, `product_name=ONEXPLAYER 3`. The tool changes nothing on any other device.
-- Bazzite. The `buttons` and `inputplumber-suspend` fixes need a **bazzite-deck** image, which ships InputPlumber 0.82.0 or newer. Desktop images do not ship InputPlumber.
+- Bazzite. The `buttons` and `inputplumber-suspend` fixes need a **bazzite-deck** image, which ships InputPlumber 0.82.0 or newer. `oled-profile` is only useful in Game Mode, which only deck images have. Desktop images do not ship InputPlumber.
 
 ## Files and state
 
 - Program (when installed): `/usr/local/lib/oxp3-tool`, `/usr/local/bin/oxp3-tool`
-- Record of applied changes: `/var/lib/oxp3-tool/state.json`, plus backups of any file it replaced in `/var/lib/oxp3-tool/backups/`
+- Record of applied changes: `/var/lib/oxp3-tool/state.json`
+- Backups of any file it replaced: `/var/lib/oxp3-tool/backups/`
+- Copies of files you edited before a revert: `/var/lib/oxp3-tool/modified/`
 
-To uninstall, run `sudo oxp3-tool revert --all`, reboot if kernel arguments were removed, then `sudo ./uninstall.sh`.
+To uninstall, run `sudo oxp3-tool revert --all`, reboot if kernel arguments were removed, then `sudo ./uninstall.sh`. `uninstall.sh` leaves `/var/lib/oxp3-tool` in place if it still holds copies of your files.
 
 ## Background
 
