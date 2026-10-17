@@ -8,7 +8,7 @@ import re
 from types import ModuleType
 from typing import Optional
 
-from . import PROJECT_URL, steam_session
+from . import PROJECT_URL, cdp, steam_session
 
 # First-line marker of every file this tool writes.
 OWN_MARKER = "Installed by oxp3-tool ("
@@ -199,7 +199,7 @@ XBOX_KEY_UNIT_PATH = f"/etc/systemd/system/{XBOX_KEY_UNIT_NAME}"
 def xbox_key_helper_script() -> str:
     from . import xbox_helper
 
-    return _bundle("Remove with `sudo oxp3-tool revert xbox-key`.", steam_session, xbox_helper)
+    return _bundle("Remove with `sudo oxp3-tool revert xbox-key`.", cdp, steam_session, xbox_helper)
 
 
 # ProtectHome=read-only, not yes, for helpers that act in the Steam user's
@@ -241,7 +241,7 @@ def steam_actions_helper_script() -> str:
     from . import steam_actions
 
     return _bundle("Remove with `sudo oxp3-tool revert buttons`, or give the keys other actions with "
-                   "`sudo oxp3-tool apply buttons ...`.", steam_session, steam_actions)
+                   "`sudo oxp3-tool apply buttons ...`.", cdp, steam_session, steam_actions)
 
 
 STEAM_ACTIONS_UNIT = f"""\
