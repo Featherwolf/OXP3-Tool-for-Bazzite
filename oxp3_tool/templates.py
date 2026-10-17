@@ -26,7 +26,7 @@ OWN_MARKER = "Installed by oxp3-tool ("
 # The Steam Deck target turns Screenshot into Steam+R1 by itself in both.
 # Some actions are not a button at all: the capability map sends them as an
 # InputPlumber D-Bus action (steam_session.DBUS_ACTIONS), which the Steam
-# actions helper (steam_actions.py) carries out as the Steam user. With native
+# actions helper (steam_actions.py) carries out in the Steam user's session. With native
 # Steam Input that includes the keyboard action, because Steam+X does nothing
 # on some setups; "keyboard-chord" keeps the Steam+X route.
 OGUI_SESSION = "ogui"

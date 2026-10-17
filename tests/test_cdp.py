@@ -4,6 +4,7 @@ import json
 import socket
 import struct
 import threading
+import time
 import unittest
 
 from oxp3_tool import cdp
@@ -72,6 +73,7 @@ class FakeSteam:
         self.port = self.server.getsockname()[1]
         self.targets = targets
         self.requests = []
+        self.hold = 0
         self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
@@ -120,6 +122,7 @@ class FakeSteam:
             read_frame(conn)  # the client's close frame
         except (EOFError, OSError, AssertionError):
             pass
+        time.sleep(self.hold)
 
     def close(self):
         self.server.close()
@@ -223,6 +226,71 @@ class CdpTest(unittest.TestCase):
         with self.assertRaisesRegex(cdp.CdpError, "not reachable") as caught:
             cdp.evaluate("x", port=port)
         self.assertFalse(caught.exception.maybe_ran)
+
+    def test_page_list_keeps_the_deadline(self):
+        # A listener that answers a byte at a time must not hold the helper past the deadline.
+        answer = b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n" + b" " * 100000
+        for data in (answer, b"HTTP/1.1 200 OK\r\n" + b"X-Pad: 1\r\n" * 10000):
+            port = self.trickle(data)
+            start = time.monotonic()
+            with self.assertRaisesRegex(cdp.CdpError, "in time") as caught:
+                cdp.evaluate("x", port=port, timeout=0.5)
+            self.assertLess(time.monotonic() - start, 1.5)
+            self.assertFalse(caught.exception.maybe_ran)
+
+    def test_page_list_answers_it_refuses(self):
+        for data, text in ((b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", "answered"),
+                           (b"HTTP/1.0 200 OK\r\n\r\n[]", "Content-Length"),
+                           (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n[]",
+                            "Content-Length"),
+                           (b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n", "too large"),
+                           (b"HTTP/1.1 200 OK\r\n" + b"X: " + b"y" * 20000 + b"\r\n\r\n", "too large")):
+            with self.subTest(text=text), self.assertRaisesRegex(cdp.CdpError, text) as caught:
+                cdp.evaluate("x", port=self.trickle(data, delay=0), timeout=2)
+            self.assertFalse(caught.exception.maybe_ran)
+
+    def trickle(self, data, delay=0.05):
+        """A server that sends ``data`` to each connection, one byte per ``delay`` (all at once for 0)."""
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        self.addCleanup(server.close)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
+                with conn:
+                    try:
+                        if not delay:
+                            conn.sendall(data)
+                            time.sleep(3)
+                        for i in range(len(data) if delay else 0):
+                            conn.sendall(data[i:i + 1])
+                            time.sleep(delay)
+                    except OSError:
+                        pass
+        threading.Thread(target=serve, daemon=True).start()
+        return server.getsockname()[1]
+
+    def test_page_gone_after_the_start(self):
+        for message in ("Inspected target navigated or closed", "Target crashed"):
+            def gone(request, message=message):
+                return [frame(0x1, json.dumps({"id": 1, "error": {"code": -32000, "message": message}}).encode())]
+            with self.subTest(message=message), self.assertRaises(cdp.CdpError) as caught:
+                cdp.evaluate("x", port=self.fake(gone).port)
+            self.assertTrue(caught.exception.maybe_ran)
+
+    def test_close_does_not_wait_out_the_deadline(self):
+        def answer_then_hold(request):
+            return answer(1)(request)
+        steam = self.fake(answer_then_hold)
+        steam.hold = 3  # the server keeps the connection open after the close frame
+        start = time.monotonic()
+        self.assertEqual(cdp.evaluate("x", port=steam.port, timeout=4), 1)
+        self.assertLess(time.monotonic() - start, 1.5)
 
     def test_silent_steam_times_out(self):
         def silent(request):

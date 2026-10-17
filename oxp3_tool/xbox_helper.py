@@ -10,7 +10,7 @@ and, on each press, does what the buttons fix chose for the Xbox key
   over D-Bus (SendButtonChord: press, then release 80 ms later). SendEvent,
   which could hold a button, panics inside InputPlumber 0.82
   (blocking_send on a tokio worker), so holds are not possible this way;
-- or a Steam action as the Steam user (steam_session.py): the on-screen
+- or a Steam action in the Steam user's session (steam_session.py): the on-screen
   keyboard, the Home screen, the frame limit toggle.
 
 The xbox-key fix installs this file, bundled with steam_session.py, as a

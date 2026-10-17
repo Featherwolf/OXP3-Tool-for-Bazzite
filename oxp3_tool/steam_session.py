@@ -2,8 +2,12 @@
 
 Shared by the Steam actions helper (steam_actions.py) and the Xbox key helper
 (xbox_helper.py); oxp3-tool bundles this file into each installed helper
-script. Whatever touches the user's files or sockets runs as the Steam user,
-never as root:
+script. What writes to the user's files or sockets (~/.steam/steam.pipe,
+gamescope's socket in /run/user) runs as the Steam user, never as root. The
+helper itself only reads gamescope's limiter state (without following links,
+and only a file the Steam user owns) and talks to Steam's remote debugging over
+TCP on 127.0.0.1:8080, only when the Steam user owns that listener, treating
+every answer as untrusted data:
 - steam:// URLs go to the running client the way Valve's
   steam-runtime-steam-remote does: one shell-quoted command line written to
   ~/.steam/steam.pipe. steam://open/keyboard opens the on-screen keyboard;
@@ -32,9 +36,10 @@ import stat
 import struct
 import subprocess
 import sys
+import time
 from typing import Optional
 
-from .cdp import CdpError, evaluate
+from .cdp import CDP_TIMEOUT, CdpError, evaluate
 from .steam_ui_js import STEAM_FPS_TOGGLE_JS
 
 PYTHON = "/usr/bin/python3"
@@ -46,6 +51,9 @@ ENVIRON_MAX = 1 << 20
 DEFAULT_FPS_LIMIT = 72  # half of 144 Hz: the panel keeps its mode with VRR off
 PANEL_MAX_FPS = 144  # for Steam's frame-limit script when gamescope's own list is not available
 STEAM_JS_BUDGET_MS = 1800  # the script's own time limit, well inside the DevTools deadline
+# A script Steam only starts this long after the press (its UI was busy) writes nothing: by then the
+# helper may have given up on the answer, and a change nobody reports should not land later.
+STEAM_JS_NOT_AFTER = CDP_TIMEOUT - 1.0
 # Steam's remote debugging port in /proc/net/tcp: 127.0.0.1:8080 (or any address), state LISTEN.
 DEBUG_PORT_ADDRESSES = ("0100007F:1F90", "00000000:1F90")
 MIN_FPS_LIMIT = 10
@@ -80,8 +88,13 @@ _DISPLAY_RE = re.compile(r"gamescope-[0-9]+")
 _LIMITER_RE = re.compile(r"/[A-Za-z0-9._/-]*/gamescope-limiter[.-][A-Za-z0-9]+")
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
 def log(message: str) -> None:
-    print(message, file=sys.stderr, flush=True)
+    # One journal line per call: text from Steam or /proc cannot start a line of its own
+    # (status reads the newest "ok: "/"failed: " line) or reach a terminal as escape codes.
+    print(_CONTROL.sub(" ", message), file=sys.stderr, flush=True)
 
 
 def pipe_line(url: str) -> str:
@@ -271,7 +284,8 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Optional[bool]:
         log("Steam's remote debugging is off (Decky Loader turns it on); setting the limit in gamescope, "
             "which Quick Access does not show")
         return None
-    opts = {"action": "toggle", "limitFps": int(fps), "maxFps": PANEL_MAX_FPS, "budgetMs": STEAM_JS_BUDGET_MS}
+    opts = {"action": "toggle", "limitFps": int(fps), "maxFps": PANEL_MAX_FPS, "budgetMs": STEAM_JS_BUDGET_MS,
+            "notAfter": int((time.time() + STEAM_JS_NOT_AFTER) * 1000)}
     try:
         value = evaluate(f"({STEAM_FPS_TOGGLE_JS})({json.dumps(opts)}).then(JSON.stringify)",
                          await_promise=True, eval_timeout_ms=1500)
@@ -295,6 +309,10 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Optional[bool]:
         if reply["wrote"]:
             log(f"failed: Steam's frame limit change failed ({error})")
             return False
+        if error == "too late":
+            # Steam is in charge of the limit and only slow: gamescope's limit would hide from Quick Access.
+            log("failed: Steam was too busy to change the frame limit; nothing was changed, press again")
+            return False
         if error == "per-game profile active":
             log("this game has its own performance profile in Steam, which the global frame limit does not "
                 "change; setting the limit in gamescope, which Quick Access does not show")
@@ -302,11 +320,21 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Optional[bool]:
             log(f"Steam's frame limit setting cannot be used ({error}); setting the limit in gamescope")
         return None
     target = reply.get("target")
-    if reply.get("limitedAfter") is True and isinstance(target, int) and not isinstance(target, bool):
-        line = f"ok: frame limit {target} fps in Steam (global, shown in Quick Access)"
+    fps_target = target if isinstance(target, int) and not isinstance(target, bool) else None
+    if reply.get("confirmed") is True:
+        if reply.get("limitedAfter") is True and fps_target is not None:
+            line = f"ok: frame limit {fps_target} fps in Steam (global, shown in Quick Access)"
+        else:
+            line = "ok: frame limit off in Steam (global)"
     else:
-        line = "ok: frame limit off in Steam (global)"
-    if not reply.get("confirmed"):
+        # Until Steam echoes the change, the state the script read back is the old one: report the request.
+        on = reply.get("on")
+        if not isinstance(on, bool):
+            on = reply.get("limitedBefore") is False  # this helper always toggles
+        if on and fps_target is not None:
+            line = f"ok: asked Steam for a frame limit of {fps_target} fps (global)"
+        else:
+            line = "ok: asked Steam to turn its frame limit off (global)"
         line += "; Steam has not confirmed it yet"
     warnings = reply.get("warnings")
     if isinstance(warnings, list) and warnings:

@@ -10,6 +10,9 @@ expression is sent, and the answer is treated as untrusted data.
 
 Every CdpError says whether the expression may have run (``maybe_ran``): only failures after
 the request was sent can have changed anything, so only those must not be retried another way.
+An exception in the expression, or Runtime.evaluate's own timeout, counts as not run: that holds
+for an expression whose code before its first await changes nothing and that never rejects, as
+steam_ui_js.py's.
 
 oxp3-tool bundles this file into its helper scripts.
 """
@@ -18,7 +21,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import http.client
 import json
 import os
 import re
@@ -36,7 +38,10 @@ MAX_HEADERS = 16384
 SHARED_CONTEXT_TITLES = ("SharedJSContext", "Steam Shared Context presented by Valve™", "Steam", "SP")
 STEAM_PAGE_URL = "https://steamloopback.host/"
 _PAGE_ID_RE = re.compile(r"[0-9A-F]{32}")
+_LENGTH_RE = re.compile(r"[0-9]{1,8}")
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# DevTools errors that come after the expression started: the page went away under it.
+_GONE_ERRORS = ("context was destroyed", "navigated or closed", "crashed")
 
 
 class CdpError(Exception):
@@ -64,20 +69,73 @@ class _Deadline:
         return left
 
 
+class _Connection:
+    """A TCP connection to the DevTools server whose every read and write keeps the one deadline."""
+
+    def __init__(self, host: str, port: int, deadline: _Deadline) -> None:
+        self.deadline = deadline
+        self.sent = False  # once the request is out, a failure may follow a change
+        self.buf = b""
+        try:
+            self.sock = socket.create_connection((host, port), timeout=deadline.left())
+        except OSError as e:
+            raise CdpError(f"Steam's remote debugging is not reachable ({type(e).__name__})") from e
+
+    def _recv(self, n: int) -> bytes:
+        self.sock.settimeout(self.deadline.left(self.sent))
+        try:
+            data = self.sock.recv(n)
+        except socket.timeout as e:
+            raise CdpError("Steam did not answer in time", self.sent) from e
+        except OSError as e:
+            raise CdpError(f"the connection to Steam failed ({type(e).__name__})", self.sent) from e
+        if not data:
+            raise CdpError("Steam closed the connection", self.sent)
+        return data
+
+    def _read(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            self.buf += self._recv(65536)
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return data
+
+    def _send(self, data: bytes) -> None:
+        self.sock.settimeout(self.deadline.left(self.sent))
+        self.sock.sendall(data)
+
+    def _read_head(self) -> tuple[str, dict[str, str]]:
+        """The status line and the (lower-cased) headers of an HTTP answer."""
+        while b"\r\n\r\n" not in self.buf:
+            if len(self.buf) > MAX_HEADERS:
+                raise CdpError("Steam's HTTP answer headers are too large")
+            self.buf += self._recv(4096)
+        head, _, self.buf = self.buf.partition(b"\r\n\r\n")
+        if len(head) > MAX_HEADERS:
+            raise CdpError("Steam's HTTP answer headers are too large")
+        lines = head.decode("latin-1").split("\r\n")
+        headers = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+        return lines[0], headers
+
+
 def list_targets(host: str, port: int, deadline: _Deadline) -> list[dict]:
-    conn = http.client.HTTPConnection(host, port, timeout=deadline.left())
+    conn = _Connection(host, port, deadline)
     try:
-        conn.request("GET", "/json/list", headers={"Accept": "application/json", "Accept-Encoding": "identity"})
-        res = conn.getresponse()
-        if res.status != 200:
-            raise CdpError(f"the page list answered {res.status}")
-        data = res.read(MAX_MESSAGE + 1)
-    except (OSError, http.client.HTTPException) as e:
+        # HTTP/1.1: Chromium refuses 1.0, and it keeps the connection open after the answer.
+        conn._send((f"GET /json/list HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\n"
+                    "Accept-Encoding: identity\r\n\r\n").encode())
+        status, headers = conn._read_head()
+        if status.split()[1:2] != ["200"]:
+            raise CdpError(f"the page list answered {status[:80]!r}")
+        length = headers.get("content-length", "")
+        if "transfer-encoding" in headers or not _LENGTH_RE.fullmatch(length):
+            raise CdpError("Steam's page list has no plain Content-Length")
+        if int(length) > MAX_MESSAGE:
+            raise CdpError("Steam's page list is too large")
+        data = conn._read(int(length))
+    except OSError as e:
         raise CdpError(f"Steam's remote debugging is not reachable ({type(e).__name__})") from e
     finally:
-        conn.close()
-    if len(data) > MAX_MESSAGE:
-        raise CdpError("Steam's page list is too large")
+        conn.sock.close()
     try:
         targets = _loads(data)
     except (ValueError, RecursionError) as e:
@@ -102,33 +160,21 @@ def shared_context_path(targets: list[dict]) -> str:
     raise CdpError("Steam's SharedJSContext page was not found")
 
 
-class WebSocket:
+class WebSocket(_Connection):
     """Just enough of RFC 6455 for one request and its answer."""
 
     def __init__(self, host: str, port: int, path: str, deadline: _Deadline) -> None:
-        self.deadline = deadline
-        self.sent = False  # once the request is out, a failure may follow a change
-        try:
-            self.sock = socket.create_connection((host, port), timeout=deadline.left())
-        except OSError as e:
-            raise CdpError(f"Steam's remote debugging is not reachable ({type(e).__name__})") from e
+        super().__init__(host, port, deadline)
         try:
             key = base64.b64encode(os.urandom(16)).decode()
             # No Origin header: CEF only checks the origin of requests that send one.
-            self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
-                               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                               "Sec-WebSocket-Version: 13\r\n\r\n").encode())
-            head = b""
-            while b"\r\n\r\n" not in head:
-                if len(head) > MAX_HEADERS:
-                    raise CdpError("the WebSocket handshake answer is too large")
-                head += self._recv(4096)
-            head, _, self.buf = head.partition(b"\r\n\r\n")
-            lines = head.decode("latin-1").split("\r\n")
-            status = lines[0].split()
+            self._send((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+                        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+            line, headers = self._read_head()
+            status = line.split()
             if len(status) < 2 or status[1] != "101":
-                raise CdpError(f"WebSocket handshake refused: {lines[0][:80]}")
-            headers = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+                raise CdpError(f"WebSocket handshake refused: {line[:80]}")
             accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
             if (headers.get("upgrade", "").lower() != "websocket"
                     or "upgrade" not in [t.strip().lower() for t in headers.get("connection", "").split(",")]
@@ -141,24 +187,6 @@ class WebSocket:
             self.sock.close()
             raise
 
-    def _recv(self, n: int) -> bytes:
-        self.sock.settimeout(self.deadline.left(self.sent))
-        try:
-            data = self.sock.recv(n)
-        except socket.timeout as e:
-            raise CdpError("Steam did not answer in time", self.sent) from e
-        except OSError as e:
-            raise CdpError(f"the connection to Steam failed ({type(e).__name__})", self.sent) from e
-        if not data:
-            raise CdpError("Steam closed the connection", self.sent)
-        return data
-
-    def _read(self, n: int) -> bytes:
-        while len(self.buf) < n:
-            self.buf += self._recv(65536)
-        data, self.buf = self.buf[:n], self.buf[n:]
-        return data
-
     def _send_frame(self, opcode: int, payload: bytes) -> None:
         header = bytes([0x80 | opcode])
         n = len(payload)
@@ -169,8 +197,7 @@ class WebSocket:
         else:
             header += bytes([0x80 | 127]) + struct.pack("!Q", n)
         mask = os.urandom(4)
-        self.sock.settimeout(self.deadline.left(self.sent))
-        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+        self._send(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
     def send_text(self, text: str) -> None:
         try:
@@ -215,8 +242,8 @@ class WebSocket:
 
     def close(self) -> None:
         try:
-            self.sock.settimeout(0.2)
             self._send_frame(0x8, struct.pack("!H", 1000))
+            self.sock.settimeout(0.2)  # after the send, which sets the deadline's own timeout
             end = time.monotonic() + 0.5
             while time.monotonic() < end and self.sock.recv(4096):
                 pass
@@ -253,8 +280,8 @@ def evaluate(expression: str, host: str = CDP_HOST, port: int = CDP_PORT, timeou
         ws.close()
     if "error" in msg:
         text = str(msg["error"].get("message") if isinstance(msg["error"], dict) else msg["error"])[:200]
-        # The expression only runs in an execution context; losing it mid-run is the one error after a start.
-        raise CdpError(f"DevTools error: {text}", "context was destroyed" in text)
+        # The expression only runs in an execution context; the page going away mid-run is an error after a start.
+        raise CdpError(f"DevTools error: {text}", any(gone in text for gone in _GONE_ERRORS))
     result = msg.get("result")
     if not isinstance(result, dict):
         raise CdpError("Steam's answer has no result", True)

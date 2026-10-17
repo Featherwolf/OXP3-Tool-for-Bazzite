@@ -1,7 +1,7 @@
 """The JavaScript that toggles Steam's global frame limit, run in Steam's SharedJSContext.
 
-Called as ``(SRC)({"action": "toggle", "limitFps": N, "maxFps": M, "budgetMs": B}).then(JSON.stringify)``
-over Steam's remote debugging (cdp.py). It writes only while Steam's default performance profile
+Called as ``(SRC)({"action": "toggle", "limitFps": N, "maxFps": M, "budgetMs": B, "notAfter": T})
+.then(JSON.stringify)`` over Steam's remote debugging (cdp.py). It writes only while Steam's default performance profile
 (gameid 769) is active, with the same setters Quick Access uses, so Quick Access shows the change:
 - legacy Quick Access ("Framerate Limit", msgLimits.disable_refresh_rate_management false):
   SystemPerfStore's per-app fps_limit (fps_limit_external on an external display) through
@@ -9,8 +9,10 @@ over Steam's remote debugging (cdp.py). It writes only while Steam's default per
 - unified Quick Access ("Frame Limit"): the client settings gamescope_app_target_framerate and
   gamescope_disable_framelimit through settingsStore.GetClientSetting(name)[1].
 It never throws, writes only after its first await (so a DevTools timeout cannot cut a write
-short), stays within budgetMs, and returns {v: 1, ok, wrote, changed, confirmed, ...}; with
-ok false and wrote false nothing was changed.
+short), stays within budgetMs, and returns {v: 1, ok, wrote, changed, confirmed, on, ...}; with
+ok false and wrote false nothing was changed. notAfter is a wall-clock time in ms (Date.now()):
+a script that only starts running by then, because Steam's UI was busy and the caller has given
+up, ends with error "too late" and writes nothing, and every wait ends by then.
 
 Checked against the Steam client UI of October 2026 (steamui build 11123049) and its webpack
 modules in a test harness, not on a device.
@@ -21,9 +23,12 @@ async (OPTS) => {
   // Toggle the frame limit of Steam's DEFAULT perf profile (gameid 769) so Quick Access shows it.
   // Never throws or rejects; resolves to a plain object. Nothing is written unless the default profile is active.
   const DEFAULT_PROFILE = "769";
-  const o = Object.assign({ action: "toggle", limitFps: 0, maxFps: 0, budgetMs: 1800 }, OPTS || {});
+  const o = Object.assign({ action: "toggle", limitFps: 0, maxFps: 0, budgetMs: 1800, notAfter: 0 }, OPTS || {});
   const t0 = Date.now();
-  const left = () => Math.max(0, Number(o.budgetMs) - (Date.now() - t0));
+  // notAfter: the caller's wall-clock deadline; a run that starts late must not write after the caller gave up.
+  const notAfter = Number(o.notAfter) > 0 ? Number(o.notAfter) : Infinity;
+  const late = () => Date.now() >= notAfter;
+  const left = () => Math.max(0, Math.min(Number(o.budgetMs) - (Date.now() - t0), notAfter - Date.now()));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const TO = {};
   const within = (p, ms) => Promise.race([Promise.resolve(p), sleep(Math.max(0, Math.min(ms, left()))).then(() => TO)]);
@@ -107,6 +112,7 @@ async (OPTS) => {
       if (out.action === "status") return done({ ok: true });
       if (blocked) return done({ error: "per-game profile active" });
       const on = wantLimit(out.limitedBefore);
+      out.on = on;
       let target;
       if (!on) target = options.includes(0) ? 0 : maxOpt;
       else {
@@ -123,6 +129,7 @@ async (OPTS) => {
       const perf = window.SteamClient && SteamClient.System && SteamClient.System.Perf;
       if (!perf || typeof perf.UpdateSettings !== "function") return done({ error: "SteamClient.System.Perf.UpdateSettings unavailable" });
       if (activeId() !== DEFAULT_PROFILE) return done({ error: "active profile changed; nothing written" });
+      if (late()) return done({ error: "too late" });
       const rq = ps.CreateSettingsUpdateRequest(DEFAULT_PROFILE);
       const pa = rq.settings_delta().per_app(true);
       if (out.external) pa.set_fps_limit_external(target); else pa.set_fps_limit(target);
@@ -165,6 +172,7 @@ async (OPTS) => {
     if (blocked) return done({ error: "per-game profile active" });
     if (!maxFps) return done({ error: "unknown maximum frame rate; pass maxFps" });
     const on = wantLimit(out.limitedBefore);
+    out.on = on;
     let target;
     if (!on) target = maxFps;
     else {
@@ -181,6 +189,8 @@ async (OPTS) => {
     if (!writes.length) return done({ ok: true, confirmed: true, after: b, limitedAfter: out.limitedBefore });
     if (!(window.SteamClient && SteamClient.Settings && typeof SteamClient.Settings.SetSetting === "function")) return done({ error: "SteamClient.Settings.SetSetting unavailable" });
     if (activeId() !== DEFAULT_PROFILE) return done({ error: "active profile changed; nothing written" });
+    if (late()) return done({ error: "too late" });
+    // No checks between the two writes: stopping after the first would leave the limit half set.
     for (const [k, v] of writes) {
       const setter = ss.GetClientSetting(k)[1];
       out.wrote = true;

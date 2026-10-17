@@ -233,9 +233,16 @@ def _xbox_helper_notes(ctx: Context, actions: dict[str, str], session: Optional[
     if not ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH):
         return []
     action = actions.get("xbox", "guide")
+    installed = ctx.sys.read_text(templates.XBOX_KEY_HELPER_PATH) or ""
     if action != "guide" and (ctx.sys.read_text(templates.XBOX_KEY_UNIT_PATH) != templates.XBOX_KEY_UNIT or
-                              ctx.sys.read_text(templates.XBOX_KEY_HELPER_PATH) != templates.xbox_key_helper_script()):
-        return ["The xbox-key helper is from an older oxp3-tool and only sends the Steam button; run "
+                              installed != templates.xbox_key_helper_script()):
+        if templates.KEYS_CONFIG_PATH not in installed:  # from before it read the key settings
+            why = "only sends the Steam button"
+        elif action == templates.FPS_ACTION:
+            why = "sets the frame limit in gamescope only, never in Steam's own setting"
+        else:
+            why = "may not do what --xbox-key chose"
+        return [f"The xbox-key helper is from an older oxp3-tool and {why}; run "
                 "`sudo oxp3-tool apply xbox-key` to update it."]
     if action == "ogui-menu" and session == OGUI:
         return ["The xbox-key helper cannot open the OpenGamepadUI menu (InputPlumber drops that button when a "
@@ -269,7 +276,7 @@ class ButtonsFix(Fix):
         "keyboard-chord, home, fps-limit, screenshot, ogui-menu; `oxp3-tool list` ends\n"
         "with what each does). --xbox-key also sets what the xbox-key helper does.\n"
         "Some actions are not a button: a small helper service\n"
-        f"({templates.STEAM_ACTIONS_UNIT_NAME}) carries them out as your user.\n"
+        f"({templates.STEAM_ACTIONS_UNIT_NAME}) carries them out in your Steam session.\n"
         "- keyboard (native Steam Input) asks Steam directly to open its keyboard\n"
         "  (steam://open/keyboard, as HHD does), because Steam's Steam+X shortcut does\n"
         "  nothing on some setups; keyboard-chord sends Steam+X instead.\n"
@@ -500,7 +507,7 @@ class XboxKeyFix(Fix):
         "(read-only: nothing is written to the controller). On each press the helper\n"
         "does what `oxp3-tool apply buttons --xbox-key` chose, read from\n"
         f"{templates.KEYS_CONFIG_PATH} (the Steam button when buttons is not applied):\n"
-        "a button tap through InputPlumber over D-Bus, or a Steam action as your user\n"
+        "a button tap through InputPlumber over D-Bus, or a Steam action in your session\n"
         "(keyboard, home, fps-limit). The key can only tap: holding it for Steam+button\n"
         "shortcuts does not work (InputPlumber 0.82's hold-capable D-Bus call is\n"
         "broken); use Home for those.\n"

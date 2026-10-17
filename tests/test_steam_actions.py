@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -997,12 +998,45 @@ class SteamRouteTest(unittest.TestCase):
         self.assertIn("ok: frame limit 72 fps in Steam (global, shown in Quick Access)", log)
         expression, kw = sent[0]
         self.assertTrue(expression.startswith("(\nasync (OPTS) => {"))
-        self.assertTrue(expression.endswith(
-            ')({"action": "toggle", "limitFps": 72, "maxFps": 144, "budgetMs": 1800}).then(JSON.stringify)'))
+        head, _, opts = expression.rpartition(")(")
+        self.assertTrue(opts.endswith(").then(JSON.stringify)"))
+        opts = json.loads(opts[:-len(").then(JSON.stringify)")])
+        not_after = opts.pop("notAfter")
+        self.assertEqual(opts, {"action": "toggle", "limitFps": 72, "maxFps": 144, "budgetMs": 1800})
+        # Steam must not start the script after the helper gave up on its answer.
+        self.assertAlmostEqual(not_after / 1000, time.time() + cdp.CDP_TIMEOUT - 1, delta=1)
         self.assertEqual(kw, {"await_promise": True, "eval_timeout_ms": 1500})
-        off = dict(on, target=144, limitedAfter=False, confirmed=False, warnings=["limitFps 72 not offered"])
+        off = dict(on, target=0, limitedAfter=False, warnings=["limitFps 72 not offered; using 36"])
         result, log, _ = self.run_steam(off)
-        self.assertIn("ok: frame limit off in Steam (global); Steam has not confirmed it yet; limitFps 72", log)
+        self.assertIn("ok: frame limit off in Steam (global); limitFps 72 not offered; using 36", log)
+
+    def test_unconfirmed_changes_report_the_request(self):
+        # Until Steam echoes a change, the script reads back the old state (as the Steam UI harness shows).
+        for reply, text in (
+                ({"on": True, "target": 72, "limitedBefore": False, "limitedAfter": False},
+                 "ok: asked Steam for a frame limit of 72 fps (global); Steam has not confirmed it yet"),
+                ({"on": False, "target": 0, "limitedBefore": True, "limitedAfter": True},
+                 "ok: asked Steam to turn its frame limit off (global); Steam has not confirmed it yet"),
+                ({"on": False, "target": 144, "limitedBefore": True, "limitedAfter": True},
+                 "ok: asked Steam to turn its frame limit off (global)"),
+                ({"target": 72, "limitedBefore": False, "limitedAfter": False},  # a script without "on"
+                 "ok: asked Steam for a frame limit of 72 fps (global)")):
+            with self.subTest(reply=reply):
+                result, log, _ = self.run_steam(dict(reply, v=1, ok=True, wrote=True, changed=True, confirmed=False))
+                self.assertTrue(result)
+                self.assertIn(text, log)
+
+    def test_too_late_changes_nothing(self):
+        result, log, _ = self.run_steam({"v": 1, "ok": False, "wrote": False, "error": "too late"})
+        self.assertIs(result, False)  # Steam is in charge and only busy: no hidden gamescope limit
+        self.assertIn("failed: Steam was too busy to change the frame limit; nothing was changed", log)
+
+    def test_text_from_steam_stays_on_one_line(self):
+        reply = {"v": 1, "ok": False, "wrote": True, "error": "x\nok: frame limit 72 fps\x1b[2J"}
+        result, log, _ = self.run_steam(reply)
+        self.assertEqual(log.count("\n"), 1)
+        self.assertNotIn("\x1b", log)
+        self.assertTrue(log.startswith("failed: "))
 
     def test_falls_back_only_when_nothing_was_written(self):
         for reply, error, expected, text in (

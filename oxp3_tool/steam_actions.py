@@ -6,8 +6,8 @@ on some setups, and no button opens the Home screen or toggles the frame
 limit). InputPlumber then sends no key or button at all: its D-Bus target
 emits org.shadowblip.Input.DBusDevice.InputEvent(action, 1.0) on press and
 0.0 on release. This helper watches for that signal (``busctl monitor``, as
-root), checks that InputPlumber sent it, and performs the action as the Steam
-user (steam_session.py).
+root), checks that InputPlumber sent it, and performs the action in the Steam
+user's session (steam_session.py).
 
 The buttons fix installs this file, bundled with steam_session.py, as a
 standalone script and runs it as a systemd service. It only uses the standard
