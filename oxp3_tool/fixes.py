@@ -75,6 +75,7 @@ class Plan:
     # Writing one of these files leaves a restart pending (notes restart_pending)
     # until a post step gated on it has run, or the next boot.
     pending_paths: tuple[str, ...] = ()
+    pending_note: str = ""  # message shown when the restart is still pending after the apply
 
 
 @dataclass
@@ -285,8 +286,8 @@ class ButtonsFix(Fix):
                     "controller for native Steam Input only when Game Mode starts, and the InputPlumber restart "
                     "resets it.") if session == NATIVE_STEAM else ""
             plan.post.append(_restart_inputplumber(only_if_changed=(map_path,), note=note))
-        elif ctx.sys.sha256(map_path) != sha256_bytes(content.encode()):
-            plan.messages.append("InputPlumber was not restarted; the new map loads on the next reboot.")
+        else:
+            plan.pending_note = "InputPlumber was not restarted; the new map loads on the next reboot."
         if not self._stock_map_known(ctx):
             plan.messages.append(
                 f"The stock map differs from the 0.82.0 one this override was written for; compare with "

@@ -294,6 +294,8 @@ class Engine:
                                      order=10))
             post += due
             outcome.messages += plan.messages + [s.note for s in due if s.note]
+            if plan.pending_note and restart_pending(self.ctx, self.state.entry(fix.id)["notes"]):
+                outcome.messages.append(plan.pending_note)
             done.append(fix)
             if gated:
                 restarting.append(fix)
@@ -377,13 +379,20 @@ class Engine:
                 rec = {"path": spec.path}
                 entry["files"].append(rec)
             rec.update({"sha256": wanted, "backup": backup})
-            if current != wanted and spec.path in plan.pending_paths:
+            pending = current != wanted and spec.path in plan.pending_paths
+            was = {k: entry["notes"].get(k) for k in ("restart_pending", "restart_pending_boot")}
+            if pending:
                 # Pending from this write until the restart has run, so a failed or
                 # interrupted run leaves it for the next one.
                 entry["notes"].update(restart_pending=True, restart_pending_boot=self.ctx.boot_id)
             self.state.save()  # write-ahead
             if current != wanted:
-                self.sys.write_atomic(spec.path, spec.content, spec.mode)
+                try:
+                    self.sys.write_atomic(spec.path, spec.content, spec.mode)
+                except OSError:
+                    if pending:
+                        entry["notes"].update(was)  # the old file is still in place
+                    raise
                 for d in new_dirs:
                     self._restorecon(d)
                 self._restorecon(spec.path)

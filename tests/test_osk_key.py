@@ -348,7 +348,9 @@ class OskFixTest(unittest.TestCase):
         self.f.runner.fail.add(f"systemctl enable {self.UNIT}")
         self.assertNotEqual(self.cli("apply", "--yes", "buttons", "--no-restart")[0], 0)  # map already written
         self.f.runner.fail.clear()
-        self.assertEqual(self.cli("apply", "--yes", "buttons", "--no-restart")[0], 0)
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "--no-restart")
+        self.assertEqual(rc, 0)
+        self.assertIn("InputPlumber was not restarted", out)
         rc, out, _ = self.cli("status")
         self.assertIn("InputPlumber has not been restarted", out)
         self.f.runner.calls.clear()
@@ -367,6 +369,21 @@ class OskFixTest(unittest.TestCase):
         self.f.runner.calls.clear()
         rc, out, _ = self.cli("apply", "--yes", "buttons")
         self.assertNotIn("systemctl try-restart inputplumber.service", self.calls())
+
+    def test_failed_map_write_is_not_a_pending_restart(self):
+        from oxp3_tool.fixes import IP_ETC_CAPABILITY_MAPS
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        real_write = System.write_atomic
+
+        def write_atomic(sys_, path, content, mode=0o644):
+            if path.startswith(IP_ETC_CAPABILITY_MAPS):
+                raise OSError(28, "No space left on device")
+            return real_write(sys_, path, content, mode)
+
+        with mock.patch.object(System, "write_atomic", write_atomic):
+            self.assertNotEqual(self.cli("apply", "--yes", "buttons", "--home", "quick-access")[0], 0)
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("InputPlumber has not been restarted", out)
 
     def test_no_restart_helper_update_is_not_a_pending_restart(self):
         self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
