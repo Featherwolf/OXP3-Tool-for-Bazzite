@@ -10,9 +10,12 @@ TCP on 127.0.0.1:8080, only when the Steam user owns that listener, treating
 every answer as untrusted data:
 - steam:// URLs go to the running client the way Valve's
   steam-runtime-steam-remote does: one shell-quoted command line written to
-  ~/.steam/steam.pipe. steam://open/keyboard opens the on-screen keyboard;
-  steam://open/library takes Game Mode to its Home screen (the Steam menu's
-  Home item).
+  ~/.steam/steam.pipe. steam://open/library takes Game Mode to its Home screen
+  (the Steam menu's Home item). steam://open/keyboard opens the on-screen
+  keyboard in Desktop Mode; Game Mode only acts on it while a game is in front.
+- So in Game Mode the keyboard is toggled in Steam's UI over its remote
+  debugging, as Steam's own Steam+X chord does, on any screen; without remote
+  debugging it falls back to steam://open/keyboard.
 - The frame limit is Steam's own global setting, changed in Steam's UI over its
   remote debugging (which Decky Loader turns on; cdp.py, steam_ui_js.py), so
   Quick Access shows it. When that is not possible (debugging off, a game with
@@ -40,7 +43,7 @@ import time
 from typing import Optional, Union
 
 from .cdp import CDP_TIMEOUT, CdpError, evaluate
-from .steam_ui_js import STEAM_FPS_TOGGLE_JS
+from .steam_ui_js import STEAM_FPS_TOGGLE_JS, STEAM_OSK_JS
 
 PYTHON = "/usr/bin/python3"
 GAMESCOPECTL = "/usr/bin/gamescopectl"
@@ -51,6 +54,7 @@ ENVIRON_MAX = 1 << 20
 DEFAULT_FPS_LIMIT = 72  # half of 144 Hz: the panel keeps its mode with VRR off
 PANEL_MAX_FPS = 144  # for Steam's frame-limit script when gamescope's own list is not available
 STEAM_JS_BUDGET_MS = 1800  # the script's own time limit, well inside the DevTools deadline
+STEAM_OSK_BUDGET_MS = 1200
 # A script Steam only starts this long after the press (its UI was busy) writes nothing: by then the
 # helper may have given up on the answer, and a change nobody reports should not land later.
 STEAM_JS_NOT_AFTER = CDP_TIMEOUT - 1.0
@@ -278,6 +282,35 @@ def debug_port_uids(proc: str = "/proc") -> set[int]:
     return uids
 
 
+def run_in_steam(script: str, opts: dict) -> Optional[dict]:
+    """Run one of steam_ui_js's scripts in Steam's UI: its answer, or None when it is not understood.
+
+    CdpError passes through. The script gets notAfter, so it never acts after this helper gave up.
+    """
+    opts = dict(opts, notAfter=int((time.time() + STEAM_JS_NOT_AFTER) * 1000))
+    value = evaluate(f"({script})({json.dumps(opts)}).then(JSON.stringify)", await_promise=True, eval_timeout_ms=1500)
+    try:
+        reply = json.loads(value) if isinstance(value, str) else None
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(reply, dict) or reply.get("v") != 1 or not isinstance(reply.get("ok"), bool) \
+            or not isinstance(reply.get("wrote"), bool):
+        return None
+    return reply
+
+
+def _warnings(reply: dict, known: dict[str, str]) -> str:
+    warnings = reply.get("warnings")
+    if not isinstance(warnings, list) or not warnings:
+        return ""
+    texts = []
+    for w in warnings[:3]:
+        w = str(w)[:80]
+        name, _, arg = w.partition(" ")
+        texts.append(known.get(w) or (known[name].format(arg) if name in known and arg else w))
+    return "; " + "; ".join(texts)
+
+
 def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Union[None, bool, str]:
     """Toggle Steam's global frame limit in its UI.
 
@@ -289,11 +322,9 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Union[None, bool
         log("Steam's remote debugging is off (Decky Loader turns it on); setting the limit in gamescope, "
             "which Quick Access does not show")
         return None
-    opts = {"action": "toggle", "limitFps": int(fps), "maxFps": PANEL_MAX_FPS, "budgetMs": STEAM_JS_BUDGET_MS,
-            "notAfter": int((time.time() + STEAM_JS_NOT_AFTER) * 1000)}
+    opts = {"action": "toggle", "limitFps": int(fps), "maxFps": PANEL_MAX_FPS, "budgetMs": STEAM_JS_BUDGET_MS}
     try:
-        value = evaluate(f"({STEAM_FPS_TOGGLE_JS})({json.dumps(opts)}).then(JSON.stringify)",
-                         await_promise=True, eval_timeout_ms=1500)
+        reply = run_in_steam(STEAM_FPS_TOGGLE_JS, opts)
     except CdpError as e:
         if e.maybe_ran:
             # Steam may have changed the setting: changing gamescope too could undo it.
@@ -302,12 +333,7 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Union[None, bool
             return False
         log(f"Steam's frame limit setting is not reachable ({e}); setting the limit in gamescope")
         return None
-    try:
-        reply = json.loads(value) if isinstance(value, str) else None
-    except (ValueError, RecursionError):
-        reply = None
-    if not isinstance(reply, dict) or reply.get("v") != 1 or not isinstance(reply.get("ok"), bool) \
-            or not isinstance(reply.get("wrote"), bool):
+    if reply is None:
         log("failed: Steam's answer about the frame limit is not understood")
         return False
     error = str(reply.get("error"))[:120]
@@ -342,10 +368,63 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Union[None, bool
         else:
             line = "ok: asked Steam to turn its frame limit off (global)"
         line += "; Steam has not confirmed it yet"
-    warnings = reply.get("warnings")
-    if isinstance(warnings, list) and warnings:
-        line += "; " + "; ".join(str(w)[:80] for w in warnings[:3])
-    log(line)
+    log(line + _warnings(reply, {}))
+    return True
+
+
+# Errors of STEAM_OSK_JS that mean its route is not there (nothing was asked of Steam): use steam.pipe.
+OSK_NO_ROUTE = ("SteamUIStore unavailable", "no gamepad UI main window", "VirtualKeyboardManager unavailable",
+                "not in the gamepad UI")
+OSK_FAILED = {
+    "too late": "Steam was too busy to open its keyboard; nothing was changed, press again",
+    "a game's text input is open": "the game's own text input is open; Steam shows one keyboard at a time",
+    "no keyboard owner": "Steam's keyboard is not ready yet (its UI is still starting); press again",
+}
+OSK_WARNINGS = {
+    "stale": "no keyboard keys were found in Steam's window, so none may have been showing; if so, press again",
+    "no keys drawn": "no keyboard keys found in Steam's window yet",
+    "composition": "Steam did not put its keyboard over the game (composition {})",
+}
+PIPE_NOTE = "asking through steam.pipe, which Game Mode only acts on while a game is in front"
+
+
+def keyboard_in_steam(uid: int, proc: str = "/proc") -> Optional[bool]:
+    """Toggle Steam's on-screen keyboard in Game Mode as Steam+X does; None when nothing was asked (use the pipe)."""
+    if uid not in debug_port_uids(proc):
+        log(f"Steam's remote debugging is off (Decky Loader turns it on); {PIPE_NOTE}")
+        return None
+    try:
+        reply = run_in_steam(STEAM_OSK_JS, {"action": "toggle", "budgetMs": STEAM_OSK_BUDGET_MS})
+    except CdpError as e:
+        if e.maybe_ran:
+            # Steam may have opened or closed it: a pipe request now could undo that.
+            log(f"failed: Steam did not answer about its keyboard ({e}); it may still open or close")
+            return False
+        log(f"Steam's UI is not reachable ({e}); {PIPE_NOTE}")
+        return None
+    if reply is None:
+        log("failed: Steam's answer about its keyboard is not understood")
+        return False
+    error = str(reply.get("error"))[:120]
+    if not reply["ok"]:
+        if reply["wrote"]:
+            log(f"failed: Steam's keyboard call failed ({error})")
+            return False
+        if error in OSK_NO_ROUTE:
+            log(f"Steam's keyboard cannot be reached in its UI ({error}); {PIPE_NOTE}")
+            return None
+        # The pipe goes to the same handler, which refuses these too.
+        log("failed: " + OSK_FAILED.get(error, f"Steam cannot open its keyboard ({error})"))
+        return False
+    opening = reply.get("opening") is True
+    if reply.get("confirmed") is True:
+        if opening:
+            line = "ok: opened Steam's keyboard" + (" over the game" if reply.get("gameRunning") is True else "")
+        else:
+            line = "ok: closed Steam's keyboard"
+    else:
+        line = f"ok: asked Steam to {'open' if opening else 'close'} its keyboard; Steam has not confirmed it yet"
+    log(line + _warnings(reply, OSK_WARNINGS))
     return True
 
 
@@ -433,6 +512,13 @@ class Actions:
 
     def perform(self, action: str) -> bool:
         try:
+            if action == "keyboard":
+                found = game_mode_steam(self.proc)
+                if found is not None:
+                    done = keyboard_in_steam(found[1], self.proc)
+                    if done is not None:
+                        return done
+                return open_url(action, self.proc)
             if action in URLS:
                 return open_url(action, self.proc)
             if action == "fps-limit":

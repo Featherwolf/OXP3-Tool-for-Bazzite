@@ -1,20 +1,32 @@
-"""The JavaScript that toggles Steam's global frame limit, run in Steam's SharedJSContext.
+"""The JavaScript oxp3-tool runs in Steam's SharedJSContext over its remote debugging (cdp.py).
 
-Called as ``(SRC)({"action": "toggle", "limitFps": N, "maxFps": M, "budgetMs": B, "notAfter": T})
-.then(JSON.stringify)`` over Steam's remote debugging (cdp.py). It writes only while Steam's default performance profile
+Each script is called as ``(SRC)(OPTS).then(JSON.stringify)``, never throws, changes nothing before
+its first await (so a DevTools timeout cannot cut a change short), stays within OPTS.budgetMs and
+OPTS.notAfter, and returns {v: 1, ok, wrote, ...}; with ok false and wrote false nothing was changed.
+notAfter is a wall-clock time in ms (Date.now()): a script that only starts running by then,
+because Steam's UI was busy and the caller has given up, ends with error "too late" and changes
+nothing, and every wait ends by then.
+
+STEAM_FPS_TOGGLE_JS toggles Steam's global frame limit. OPTS: {"action": "toggle", "limitFps": N,
+"maxFps": M, "budgetMs": B, "notAfter": T}. It writes only while Steam's default performance profile
 (gameid 769) is active, with the same setters Quick Access uses, so Quick Access shows the change:
 - legacy Quick Access ("Framerate Limit", msgLimits.disable_refresh_rate_management false):
   SystemPerfStore's per-app fps_limit (fps_limit_external on an external display) through
   SteamClient.System.Perf.UpdateSettings;
 - unified Quick Access ("Frame Limit"): the client settings gamescope_app_target_framerate and
   gamescope_disable_framelimit through settingsStore.GetClientSetting(name)[1].
-It never throws, writes only after its first await (so a DevTools timeout cannot cut a write
-short), stays within budgetMs, and returns {v: 1, ok, wrote, changed, confirmed, on, ...}; with
-ok false and wrote false nothing was changed. notAfter is a wall-clock time in ms (Date.now()):
-a script that only starts running by then, because Steam's UI was busy and the caller has given
-up, ends with error "too late" and writes nothing, and every wait ends by then.
+It returns {v: 1, ok, wrote, changed, confirmed, on, target, ...}.
 
-Checked against the Steam client UI of October 2026 (steamui build 11123049) and its webpack
+STEAM_OSK_JS toggles Steam's on-screen keyboard in Game Mode the way Steam's own Steam+X chord
+does: SteamUIStore.OnModalKeyboardMessage with bChordInvoked, the handler Steam registers with
+SteamClient.Input.RegisterForUserKeyboardMessages. steam://open/keyboard reaches the same handler
+without bChordInvoked, and Steam then only acts while a game is in front (route /apprunning).
+Over Steam's own screens the keyboard opens in place; over a running game Steam moves to its
+/keyboard route, which draws the keyboard over the game. OPTS: {"action": "toggle" | "status",
+"budgetMs": B, "notAfter": T}. It returns {v: 1, ok, wrote, confirmed, opening, gameRunning,
+before, after, warnings, ...}.
+
+Both are checked against the Steam client UI of October 2026 (steamui build 11123049) and its webpack
 modules in a test harness, not on a device.
 """
 
@@ -200,6 +212,95 @@ async (OPTS) => {
     while (!good() && left() > 0) await sleep(50);
     const a = readU();
     return done({ ok: true, changed: true, confirmed: good(), after: a, limitedAfter: isLimitedU(a) });
+  } catch (e) {
+    return done({ ok: false, error: "exception: " + String(e && e.message || e) });
+  }
+}
+'''
+
+STEAM_OSK_JS = r'''
+async (OPTS) => {
+  // Toggle Steam's on-screen keyboard as its Steam+X chord does. Never throws or rejects; resolves to a plain object.
+  const DESKTOP_UI = 7;                   // EUIMode Desktop (SteamUIStore.MainInstanceUIMode; -1 until Steam reports one)
+  const KEYBOARD_ROUTE = "/keyboard";     // GamepadUI.Keyboard(): the keyboard over a running game
+  const GAME_OSK_ROUTE = "/gameapiosk";   // GamepadUI.GameAPIOSK(): a game's own Steamworks text input
+  const OVERLAY_KEYBOARD = 4;             // EUIComposition OverlayKeyboard
+  const o = Object.assign({ action: "toggle", budgetMs: 1200, notAfter: 0 }, OPTS || {});
+  const t0 = Date.now();
+  const notAfter = Number(o.notAfter) > 0 ? Number(o.notAfter) : Infinity;
+  const left = () => Math.max(0, Math.min(Number(o.budgetMs) - (Date.now() - t0), notAfter - Date.now()));
+  const safe = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (e) { return d; } };
+  const S = safe(() => window.SteamUIStore, null);
+  const inst = safe(() => S.WindowStore.GamepadUIMainWindowInstance, null);
+  // Chromium may slow the timers of this hidden page; the Big Picture window's own timers keep time while it shows.
+  const sleep = (ms) => new Promise((r) => {
+    setTimeout(r, ms);
+    try { const w = inst && inst.BrowserWindow; if (w && w !== window && typeof w.setTimeout === "function") w.setTimeout(r, ms); } catch (e) { /* this page's timer still fires */ }
+  });
+  const out = { v: 1, ok: false, wrote: false, changed: false, confirmed: false, action: String(o.action), mode: null, warnings: [] };
+  const done = (extra) => { Object.assign(out, extra || {}); out.ms = Date.now() - t0; try { return JSON.parse(JSON.stringify(out)); } catch (e) { return { v: 1, ok: false, wrote: out.wrote, error: "unserialisable result" }; } };
+  try {
+    if (!["toggle", "status"].includes(out.action)) return done({ error: "bad action" });
+    if (!S || !S.WindowStore) return done({ error: "SteamUIStore unavailable" });
+    out.uiMode = safe(() => S.MainInstanceUIMode, null);
+    if (out.uiMode === DESKTOP_UI) return done({ error: "not in the gamepad UI" });
+    if (!inst) return done({ error: "no gamepad UI main window" });
+    const vkm = safe(() => inst.VirtualKeyboardManager, null);
+    if (!vkm || !vkm.IsShowingVirtualKeyboard || typeof vkm.SetVirtualKeyboardHidden !== "function"
+        || typeof vkm.SetVirtualKeyboardVisible !== "function") return done({ error: "VirtualKeyboardManager unavailable" });
+    const shown = () => !!safe(() => vkm.IsShowingVirtualKeyboard.Value, false);
+    const route = () => String(safe(() => inst.LocationPathName, "") || "");
+    const game = () => !!safe(() => S.MainRunningApp != null, false);
+    const comp = () => safe(() => inst.CompositionStateStore.GetCompositionState(), null);
+    // Advisory only: Steam's keyboard keys ([data-key-row] is used only by its keyboard) in the Big Picture window.
+    const rendered = () => safe(() => {
+      const d = inst.BrowserWindow && inst.BrowserWindow.document;
+      return d && typeof d.querySelector === "function" ? !!d.querySelector("[data-key-row]") : null;
+    }, null);
+    const snap = () => ({ shown: shown(), route: route(), composition: comp(), rendered: rendered() });
+    out.before = snap();
+    out.gameRunning = game();
+    out.owners = safe(() => vkm.m_KeyboardOwners.size, null);
+    if (out.action === "status") return done({ ok: true });
+    const want = !out.before.shown;
+    out.opening = want;
+    await sleep(0); // everything below runs outside Runtime.evaluate's synchronous part
+    if (Date.now() >= notAfter) return done({ error: "too late" });
+    if (shown() === want) return done({ ok: true, confirmed: true, after: snap(), warnings: ["changed by someone else"] });
+    // Steam's handler skips a window showing a game's own text input; the manager does nothing without an owner.
+    if (want && route() === GAME_OSK_ROUTE) return done({ error: "a game's text input is open" });
+    if (out.owners === 0) return done({ error: "no keyboard owner" });
+    // Steam bug #12195 kind: Steam counts its keyboard as open but none is drawn. Steam+X would close it too.
+    if (!want && out.before.rendered === false) out.warnings.push("stale");
+    out.wrote = true;
+    if (typeof S.OnModalKeyboardMessage === "function") {
+      out.mode = "chord"; // shows the keyboard, or hides it where it shows, in each of Steam's windows
+      S.OnModalKeyboardMessage({ nAppID: 0, bChordInvoked: true, bEnterDismissesKeyboard: false,
+        nXPosition: 0, nYPosition: 0, nWidth: 0, nHeight: 0 });
+    } else if (!want) {
+      out.mode = "hide";
+      vkm.SetVirtualKeyboardHidden(); // over a game the /keyboard route then returns to /apprunning
+    } else {
+      out.mode = "direct"; // the handler's own steps, should it be renamed
+      try { inst.MenuStore.CloseSideMenus(); } catch (e) { out.warnings.push("CloseSideMenus failed"); }
+      if (typeof vkm.SetDismissOnEnterKey === "function") vkm.SetDismissOnEnterKey(true);
+      if (typeof vkm.SetTextFieldLocation === "function") vkm.SetTextFieldLocation(0, 0, 0, 0);
+      if (game()) { vkm.SetVirtualKeyboardHidden(); inst.NavigateWithoutChangingFocus(KEYBOARD_ROUTE, true, true); }
+      else vkm.SetVirtualKeyboardVisible();
+    }
+    // Over a game: route /keyboard, whose component calls ShowModalKeyboard once React renders it, and the
+    // composition becomes OverlayKeyboard. Over Steam's own screens: the keyboard opens in place.
+    const good = () => shown() === want && (!want || !game() || route() === KEYBOARD_ROUTE);
+    while (!good() && left() > 0) await sleep(50);
+    if (want && good()) {
+      const end = Date.now() + Math.min(300, left());
+      while (Date.now() < end && (rendered() === false || (game() && comp() !== OVERLAY_KEYBOARD))) await sleep(50);
+    }
+    const after = snap();
+    out.changed = after.shown !== out.before.shown;
+    if (want && good() && game() && after.composition !== OVERLAY_KEYBOARD) out.warnings.push("composition " + after.composition);
+    if (want && good() && after.rendered === false) out.warnings.push("no keys drawn");
+    return done({ ok: true, confirmed: good(), after });
   } catch (e) {
     return done({ ok: false, error: "exception: " + String(e && e.message || e) });
   }

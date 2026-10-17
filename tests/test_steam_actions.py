@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from oxp3_tool import cdp, steam_actions, steam_session, templates
+from oxp3_tool import cdp, steam_actions, steam_session, steam_ui_js, templates
 from oxp3_tool.cli import main
 from oxp3_tool.system import CommandResult, System
 
@@ -1130,3 +1130,122 @@ class SteamRouteTest(unittest.TestCase):
         params = steam.requests[0]["params"]
         self.assertTrue(params["awaitPromise"])
         self.assertIn("SystemPerfStore", params["expression"])
+
+
+class KeyboardRouteTest(unittest.TestCase):
+    """The keyboard in Game Mode through Steam's own Steam+X handler, steam.pipe as the fallback."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.proc = Path(tmp.name, "proc")
+        (self.proc / "net").mkdir(parents=True)
+        self.listen(1000)
+
+    def listen(self, uid):
+        (self.proc / "net/tcp").write_text(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            f"   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  {uid}        0 4242 1\n")
+
+    def run_steam(self, reply=None, error=None):
+        sent = []
+
+        def fake_evaluate(expression, **kw):
+            sent.append((expression, kw))
+            if error:
+                raise error
+            return json.dumps(reply)
+        err = io.StringIO()
+        with mock.patch.object(steam_session, "evaluate", fake_evaluate), contextlib.redirect_stderr(err):
+            result = steam_session.keyboard_in_steam(1000, str(self.proc))
+        return result, err.getvalue(), sent
+
+    def reply(self, **kw):
+        return dict({"v": 1, "ok": True, "wrote": True, "changed": True, "confirmed": True, "opening": True,
+                     "gameRunning": False, "warnings": []}, **kw)
+
+    def test_opens_and_closes_like_steam_x(self):
+        result, log, sent = self.run_steam(self.reply())
+        self.assertIs(result, True)
+        self.assertEqual(log, "ok: opened Steam's keyboard\n")
+        expression, kw = sent[0]
+        self.assertTrue(expression.startswith("(" + steam_ui_js.STEAM_OSK_JS + ")("))
+        opts = json.loads(expression[len(steam_ui_js.STEAM_OSK_JS) + 3:-len(").then(JSON.stringify)")])
+        self.assertAlmostEqual(opts.pop("notAfter") / 1000, time.time() + cdp.CDP_TIMEOUT - 1, delta=1)
+        self.assertEqual(opts, {"action": "toggle", "budgetMs": 1200})
+        self.assertEqual(kw, {"await_promise": True, "eval_timeout_ms": 1500})
+        for reply, line in ((self.reply(gameRunning=True), "ok: opened Steam's keyboard over the game"),
+                            (self.reply(opening=False), "ok: closed Steam's keyboard"),
+                            (self.reply(confirmed=False),
+                             "ok: asked Steam to open its keyboard; Steam has not confirmed it yet"),
+                            (self.reply(opening=False, warnings=["stale"]),
+                             "ok: closed Steam's keyboard; no keyboard keys were found in Steam's window, so none "
+                             "may have been showing; if so, press again"),
+                            (self.reply(gameRunning=True, warnings=["composition 3", "no keys drawn", "other"]),
+                             "ok: opened Steam's keyboard over the game; Steam did not put its keyboard over the "
+                             "game (composition 3); no keyboard keys found in Steam's window yet; other")):
+            with self.subTest(line=line):
+                result, log, _ = self.run_steam(reply)
+                self.assertIs(result, True)
+                self.assertEqual(log, line + "\n")
+
+    def test_falls_back_to_the_pipe_only_when_nothing_was_asked(self):
+        for reply, error, expected, text in (
+                ({"v": 1, "ok": False, "wrote": False, "error": "no gamepad UI main window"}, None, None,
+                 "cannot be reached in its UI (no gamepad UI main window); asking through steam.pipe"),
+                ({"v": 1, "ok": False, "wrote": False, "error": "SteamUIStore unavailable"}, None, None,
+                 "asking through steam.pipe"),
+                (None, cdp.CdpError("Steam's remote debugging is not reachable"), None, "asking through steam.pipe"),
+                (None, cdp.CdpError("Steam did not answer in time", maybe_ran=True), False,
+                 "failed: Steam did not answer about its keyboard"),
+                ({"v": 1, "ok": False, "wrote": True, "error": "exception: boom"}, None, False,
+                 "failed: Steam's keyboard call failed (exception: boom)"),
+                ({"v": 1, "ok": False, "wrote": False, "error": "too late"}, None, False,
+                 "failed: Steam was too busy to open its keyboard; nothing was changed, press again"),
+                ({"v": 1, "ok": False, "wrote": False, "error": "a game's text input is open"}, None, False,
+                 "failed: the game's own text input is open"),
+                ({"v": 1, "ok": False, "wrote": False, "error": "no keyboard owner"}, None, False,
+                 "failed: Steam's keyboard is not ready yet"),
+                ({"v": 1, "ok": False, "wrote": False, "error": "something new"}, None, False,
+                 "failed: Steam cannot open its keyboard (something new)"),
+                ({"v": 2}, None, False, "not understood")):
+            with self.subTest(text=text):
+                result, log, _ = self.run_steam(reply, error)
+                self.assertEqual(result, expected)
+                self.assertIn(text, log)
+                self.assertEqual(len([ln for ln in log.splitlines() if ln.startswith(("ok: ", "failed: "))]),
+                                 0 if expected is None else 1)
+
+    def test_only_steams_own_listener(self):
+        self.listen(1001)
+        result, log, sent = self.run_steam(self.reply())
+        self.assertIsNone(result)
+        self.assertEqual(sent, [])
+        self.assertIn("remote debugging is off (Decky Loader turns it on); asking through steam.pipe", log)
+
+    def test_key_uses_steams_ui_in_game_mode_and_the_pipe_otherwise(self):
+        for display, in_steam, pipe_used in (("gamescope-0", True, False), ("gamescope-0", False, False),
+                                             ("gamescope-0", None, True), ("", True, True)):
+            with self.subTest(display=display, in_steam=in_steam), tempfile.TemporaryDirectory() as tmp, \
+                    FakeProc(tmp, display=display) as fake, \
+                    mock.patch.object(steam_session, "keyboard_in_steam", return_value=in_steam) as steam, \
+                    mock.patch.object(steam_session, "open_url", return_value=True) as pipe:
+                result = steam_session.Actions(str(fake.proc)).perform("keyboard")
+                self.assertEqual(pipe.called, pipe_used)
+                self.assertEqual(steam.called, bool(display))
+                self.assertEqual(result, True if pipe_used else in_steam)
+
+    def test_through_a_devtools_server(self):
+        from .test_cdp import FakeSteam, frame
+
+        def reply(request):
+            body = {"id": 1, "result": {"result": {"type": "string", "value": json.dumps(self.reply())}}}
+            return [frame(0x1, json.dumps(body).encode())]
+        steam = FakeSteam(reply)
+        self.addCleanup(steam.close)
+        err = io.StringIO()
+        with mock.patch.object(steam_session, "evaluate", functools.partial(cdp.evaluate, port=steam.port)), \
+                contextlib.redirect_stderr(err):
+            self.assertTrue(steam_session.keyboard_in_steam(1000, str(self.proc)))
+        self.assertEqual(err.getvalue(), "ok: opened Steam's keyboard\n")
+        self.assertIn("OnModalKeyboardMessage", steam.requests[0]["params"]["expression"])
