@@ -157,6 +157,21 @@ def _restart_inputplumber(only_if_changed: tuple[str, ...] = (), note: str = "")
                     only_if_changed=only_if_changed, note=note)
 
 
+# Bazzite's user unit that selects the Steam Deck controller for native Steam
+# Input. It runs once when the user's session starts, so an InputPlumber
+# restart drops back to the default controller until it runs again.
+NATIVE_STEAM_INPUT_UNIT = "bazzite-native-steam-input.service"
+
+
+def _restore_deck_controller(ctx: Context, only_if_changed: tuple[str, ...] = ()) -> list[PostStep]:
+    """Rerun Bazzite's native Steam Input unit for each user who has it, after InputPlumber restarts."""
+    # --no-block: the unit retries by itself while InputPlumber's device comes back.
+    return [PostStep(f"restore-deck-controller-{user}",
+                     ["systemctl", "--user", "-M", f"{user}@", "--no-block", "restart", NATIVE_STEAM_INPUT_UNIT],
+                     f"select the Steam Deck controller again for {user}", order=65, only_if_changed=only_if_changed)
+            for user in ctx.ogui_disabled_for]
+
+
 def _daemon_reload() -> PostStep:
     return PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units", order=10)
 
@@ -254,9 +269,11 @@ class ButtonsFix(Fix):
         "- home takes Game Mode to its Home screen (steam://open/library).\n"
         "- fps-limit turns gamescope's frame limit off when one is on, else sets\n"
         "  --fps-limit (default 72; limits that divide 144 keep the panel at 144 Hz with\n"
-        "  VRR off). Steam is not told: Quick Access keeps showing its own setting, and\n"
-        "  Steam's next change (a game starting, the slider) replaces it. It also\n"
-        "  replaces a refresh rate chosen in Quick Access: off means 144 Hz again.\n"
+        "  VRR off). It caps games, never Steam's own screens: check it in a game that\n"
+        "  runs faster, with the performance overlay on. Steam is not told: Quick\n"
+        "  Access keeps showing its own setting, and Steam replaces the limit when it\n"
+        "  next sends its own (the slider, a per-game setting). It also replaces a\n"
+        "  refresh rate chosen in Quick Access: off means 144 Hz again.\n"
         "Only the Steam button can be held for Steam+button shortcuts, and the\n"
         "xbox-key helper can only tap, so keep guide on Home to keep them.\n"
         "Check each key with `inputplumber device 0 test` (press q to quit; closing the\n"
@@ -340,10 +357,16 @@ class ButtonsFix(Fix):
             )
         if restart:
             # Only when the map changes: a helper-only update leaves InputPlumber alone.
-            note = ("Reboot (or leave Game Mode and start it again) afterwards: Bazzite selects the Steam Deck "
-                    "controller for native Steam Input only when Game Mode starts, and the InputPlumber restart "
-                    "resets it.") if session == NATIVE_STEAM else ""
+            restore = _restore_deck_controller(ctx, (map_path,)) if session == NATIVE_STEAM else []
+            note = ""
+            if session == NATIVE_STEAM:
+                note = ("If the buttons act like an Xbox controller in Game Mode afterwards, reboot: the InputPlumber "
+                        "restart resets the Steam Deck controller Bazzite selects for native Steam Input."
+                        if restore else
+                        "Reboot afterwards: Bazzite selects the Steam Deck controller for native Steam Input when your "
+                        "session starts, and the InputPlumber restart resets it.")
             plan.post.append(_restart_inputplumber(only_if_changed=(map_path,), note=note))
+            plan.post += restore
         else:
             plan.pending_note = "InputPlumber was not restarted; the new map loads on the next reboot."
         if not self._stock_map_known(ctx):
@@ -387,6 +410,8 @@ class ButtonsFix(Fix):
 
     def revert_post(self, ctx: Context) -> list[PostStep]:
         steps = [_restart_inputplumber()]
+        if ctx.game_mode_input == NATIVE_STEAM:
+            steps += _restore_deck_controller(ctx)
         running = [u for u in (self.STEAM_UNIT, *templates.LEGACY_STEAM_ACTIONS_UNITS)
                    if ctx.unit_state(u) in ("active", "activating", "reloading")]
         for unit in running:

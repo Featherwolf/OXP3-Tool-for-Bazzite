@@ -10,9 +10,10 @@ never as root:
   steam://open/library takes Game Mode to its Home screen (the Steam menu's
   Home item).
 - The frame limit is gamescope's own `gamescopectl debug_set_fps_limit`, the
-  value Steam's Quick Access limiter also sets. Steam is not told, so Quick
-  Access keeps showing its own setting and Steam's next change (a game
-  starting, the slider) replaces it.
+  value Steam's Quick Access limiter also sets. It caps games only, never
+  Steam's own screens. Steam is not told, so Quick Access keeps showing its
+  own setting, and Steam replaces the limit when it next sends its own (the
+  slider, a per-game setting).
 
 Each action logs one line starting with "ok: " or "failed: "; oxp3-tool status
 looks at the newest.
@@ -161,7 +162,7 @@ def send_as(uid: int, url: str) -> int:
 def open_url(action: str, proc: str = "/proc") -> bool:
     uids = steam_uids(proc)
     if not uids:
-        log("Steam is not running; nothing to open")
+        log(f"failed: Steam is not running; cannot {WHAT[action]}")
         return False
     codes = []
     for uid in uids:
@@ -219,19 +220,40 @@ def set_fps_limit(uid: int, env: dict[str, str], fps: int) -> Optional[str]:
     return None
 
 
+def describe_steam(proc: str = "/proc") -> str:
+    """The Steam processes found, for a log line: why no Game Mode session was found."""
+    found = steam_processes(proc)
+    if not found:
+        return "no process named steam"
+    parts = []
+    for pid, uid in found[:4]:
+        try:
+            exe = os.readlink(os.path.join(proc, str(pid), "exe"))
+        except OSError:
+            exe = "?"
+        game_mode = _DISPLAY_RE.fullmatch(read_environ(proc, pid).get("GAMESCOPE_WAYLAND_DISPLAY", ""))
+        parts.append(f"pid {pid} uid {uid} {exe}{'' if game_mode else ' (no gamescope display)'}")
+    return "; ".join(parts)
+
+
 class FrameLimit:
     def __init__(self) -> None:
-        self.sent = 0  # used when gamescope's state file cannot be read
+        self.sent = 0  # the limit this helper set last (0: none or off)
 
     def toggle(self, fps: int, proc: str = "/proc") -> bool:
-        """Turn the frame limit off when one is on (also one Steam set), else set ``fps``."""
+        """Set ``fps``, or turn the frame limit off when the limit this helper set is still on.
+
+        gamescope's state file only says whether some limit is on. Steam can keep one that
+        changes nothing (its target at the panel's full rate), so a limit the helper did not set
+        is replaced rather than turned off: the first press always shows a limit.
+        """
         found = game_mode_steam(proc)
         if found is None:
-            log("Steam is not running in Game Mode; no frame limit to change")
+            log(f"failed: Steam is not running in Game Mode ({describe_steam(proc)}); no frame limit to change")
             return False
         pid, uid, env = found
         active = limiter_active(proc, pid, uid, env)
-        target = 0 if (self.sent != 0 if active is None else active) else fps
+        target = 0 if self.sent and active is not False else fps
         error = set_fps_limit(uid, env, target)
         if error:
             log(f"failed: could not change the frame limit: {error}")
@@ -241,7 +263,10 @@ class FrameLimit:
         if now is not None and now != (target != 0):
             log(f"failed: gamescope did not {'set' if target else 'clear'} the frame limit")
             return False
-        log(f"ok: frame limit {target} fps" if target else "ok: frame limit off")
+        if target:
+            log(f"ok: frame limit {target} fps" + (" (replaced a limit Steam set)" if active else ""))
+        else:
+            log("ok: frame limit off")
         return True
 
 

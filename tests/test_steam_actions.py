@@ -175,8 +175,7 @@ class OpenUrlTest(unittest.TestCase):
     def test_results(self):
         ok, log, _ = self.run_open([], [])
         self.assertFalse(ok)
-        self.assertIn("Steam is not running", log)
-        self.assertNotIn("failed", log)
+        self.assertIn("failed: Steam is not running; cannot open the keyboard", log)
         ok, log, send = self.run_open([1000, 1001], [1, 0])
         self.assertTrue(ok)
         self.assertIn("ok: asked Steam to open the keyboard (uid 1001)", log)
@@ -294,7 +293,8 @@ class FrameLimitTest(unittest.TestCase):
 
     def test_toggles_from_gamescope_state(self):
         with FakeProc(self.tmp) as fake:
-            ok, log = self.toggle(fake)
+            limit = steam_session.FrameLimit()
+            ok, log = self.toggle(fake, limit=limit)
             self.assertTrue(ok)
             self.assertIn("ok: frame limit 72 fps", log)
             argv, kw = self.runs[-1]
@@ -302,13 +302,28 @@ class FrameLimitTest(unittest.TestCase):
             self.assertEqual((kw["user"], kw["extra_groups"]), (1000, []))
             self.assertEqual(kw["env"]["XDG_RUNTIME_DIR"], "/run/user/1000")
             self.assertEqual(kw["env"]["GAMESCOPE_WAYLAND_DISPLAY"], "gamescope-0")
-            ok, log = self.toggle(fake)
+            ok, log = self.toggle(fake, limit=limit)
             self.assertIn("ok: frame limit off", log)
             self.assertEqual(self.runs[-1][0][-1], "0")
-            # A limit Steam set (Quick Access) counts as on: the key turns it off.
+            # A limit Steam set (Quick Access, or one at the panel's full rate that changes
+            # nothing) is replaced, so the press always shows a limit; the next press clears it.
             fake.set(1)
-            ok, log = self.toggle(fake, fps=48)
+            ok, log = self.toggle(fake, fps=48, limit=limit)
+            self.assertEqual(self.runs[-1][0][-1], "48")
+            self.assertIn("ok: frame limit 48 fps (replaced a limit Steam set)", log)
+
+    def test_first_press_sets_even_when_steam_has_a_limit(self):
+        with FakeProc(self.tmp, limiter=1) as fake:
+            limit = steam_session.FrameLimit()
+            self.toggle(fake, limit=limit)
+            self.assertEqual(self.runs[-1][0][-1], "72")
+            self.toggle(fake, limit=limit)
             self.assertEqual(self.runs[-1][0][-1], "0")
+            # Steam turned our limit off meanwhile: the press sets it again instead of clearing nothing.
+            self.toggle(fake, limit=limit)
+            fake.set(0)
+            self.toggle(fake, limit=limit)
+            self.assertEqual(self.runs[-1][0][-1], "72")
 
     def test_failures(self):
         with FakeProc(self.tmp) as fake:
@@ -324,8 +339,8 @@ class FrameLimitTest(unittest.TestCase):
         with FakeProc(self.tmp, display="") as fake:
             ok, log = self.toggle(fake)
         self.assertFalse(ok)
-        self.assertIn("not running in Game Mode", log)
-        self.assertNotIn("failed", log)
+        # A failure, so status shows it; it names the Steam processes it saw.
+        self.assertIn("failed: Steam is not running in Game Mode (pid 4321 uid 1000 ? (no gamescope display))", log)
         self.assertEqual(self.runs, [])
 
     def test_unreadable_state_falls_back_to_what_was_sent(self):
@@ -613,11 +628,11 @@ class SteamActionsFixTest(unittest.TestCase):
         calls = self.calls()
         self.assertNotIn("systemctl try-restart inputplumber.service", calls)
         self.assertIn(f"systemctl restart {self.UNIT}", calls)
-        self.assertNotIn("Reboot (or leave Game Mode", out)
+        self.assertNotIn("Reboot afterwards", out)
         # A map change still restarts InputPlumber, with the reboot note.
         rc, out, _ = self.cli("apply", "--yes", "buttons", "--home", "quick-access")
         self.assertIn("systemctl try-restart inputplumber.service", self.calls())
-        self.assertIn("Reboot (or leave Game Mode", out)
+        self.assertIn("Reboot afterwards", out)
 
     def test_no_restart_keeps_dropped_helper_running(self):
         self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
@@ -751,7 +766,7 @@ class SteamActionsFixTest(unittest.TestCase):
         self.assertIn("oxp3-tool-xbox-key.service handles it", cap_map.read_text())
         self.assertEqual(self.keys()["xbox"], "fps-limit")
         self.assertNotIn("systemctl try-restart inputplumber.service", self.calls())
-        self.assertNotIn("Reboot (or leave Game Mode", out)
+        self.assertNotIn("Reboot afterwards", out)
 
     def test_undecoded_xbox_key_does_not_count_as_the_steam_menu(self):
         from .test_xbox_key import IP_LOG
@@ -845,9 +860,27 @@ class SteamActionsFixTest(unittest.TestCase):
         # Only a comment in the map changed, so InputPlumber is left alone.
         self.assertIn(f"update {'/etc/inputplumber/capability_maps.d/onexplayer_type9.yaml'}", self.dry_run_log)
         self.assertNotIn("systemctl try-restart inputplumber.service", calls)
-        self.assertNotIn("Reboot (or leave Game Mode", out)
+        self.assertNotIn("Reboot afterwards", out)
         rc, status, _ = self.cli("status")
         self.assertNotIn("InputPlumber has not been restarted", status)
+
+    def test_inputplumber_restart_restores_the_deck_controller(self):
+        self.f.ogui_overlay(disabled_for="gamer")  # Bazzite's native Steam Input setup for user gamer
+        restore = "systemctl --user -M gamer@ --no-block restart bazzite-native-steam-input.service"
+        rc, out, err = self.cli("apply", "--yes", "buttons")
+        self.assertEqual(rc, 0, err)
+        calls = self.calls()
+        self.assertLess(calls.index("systemctl try-restart inputplumber.service"), calls.index(restore))
+        self.assertIn("If the buttons act like an Xbox controller in Game Mode afterwards, reboot", out)
+        self.assertNotIn("Reboot afterwards", out)
+        # Not when InputPlumber is left alone, and again after the revert's restart.
+        self.f.runner.calls.clear()
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "--fps-limit", "48")[0], 0)
+        self.assertNotIn(restore, self.calls())
+        self.f.runner.calls.clear()
+        self.assertEqual(self.cli("revert", "--yes", "buttons")[0], 0)
+        calls = self.calls()
+        self.assertLess(calls.index("systemctl try-restart inputplumber.service"), calls.index(restore))
 
     def test_revert_stops_the_previous_releases_helper(self):
         self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
@@ -857,6 +890,20 @@ class SteamActionsFixTest(unittest.TestCase):
         self.assertEqual(self.cli("revert", "--yes", "buttons")[0], 0)
         self.assertIn(f"systemctl stop {old_unit}", self.calls())
         self.assertIn("systemctl daemon-reload", self.calls())
+
+    def test_diagnose_records_steam_and_decky(self):
+        from oxp3_tool import diagnose
+        from oxp3_tool.detect import Context
+        pkg = "/var/home/gamer/.local/share/Steam/package"
+        self.f.write(f"{pkg}/beta", "steamdeck_publicbeta\n")
+        self.f.write(f"{pkg}/steam_client_ubuntu12.manifest", '"ubuntu12"\n{\n\t"version"\t\t"1791918634"\n}\n')
+        self.f.write("/var/home/gamer/.local/share/Steam/logs/bootstrap_log.txt", "line 1\nUpdate complete\n")
+        bundle, _ = diagnose.collect(Context(self.f.system()), "status")
+        steam = bundle.files["steam-client.txt"].decode()
+        self.assertIn("beta=steamdeck_publicbeta", steam)
+        self.assertIn("steam_client_ubuntu12.manifest: version 1791918634", steam)
+        self.assertIn("    Update complete", steam)
+        self.assertIn("commands/journal-decky-loader-this-boot.txt", bundle.files)
 
     def test_missing_busctl(self):
         (self.root / "usr/bin/busctl").unlink()

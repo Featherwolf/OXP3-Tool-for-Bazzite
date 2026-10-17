@@ -61,6 +61,9 @@ COMMANDS: list[tuple[str, list[str]]] = [
     ("journal-oxp3-helpers-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
                                             "-u", "oxp3-tool-xbox-key.service", "-u", "oxp3-tool-steam-actions.service",
                                             "-u", "oxp3-tool-osk-key.service", "-n", "500"]),
+    ("decky-loader.txt", ["systemctl", "status", "--no-pager", "--lines=0", "plugin_loader.service"]),
+    ("journal-decky-loader-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
+                                            "-u", "plugin_loader.service", "-n", "300"]),
     ("journal-gamescope-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
                                          "--grep", "gamescope|known display", "-n", "3000"]),
 ]
@@ -166,6 +169,22 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
         data = sys.read_bytes(path)
         if data is not None:
             bundle.add("files" + path, data)
+
+    # Steam's update channel and version: a Steam update often lands at the same restart as an apply.
+    steam = []
+    for root in ("/home", "/var/home"):
+        for pkg in sys.glob(f"{root}/*/.local/share/Steam/package"):
+            beta = sys.read_text(f"{pkg}/beta")
+            steam.append(f"{pkg}: beta={beta.strip() if beta else '(none)'}")
+            for manifest in sys.glob(f"{pkg}/steam_client_*.manifest"):
+                text = sys.read_text(manifest) or ""
+                version = re.search(r'"version"\s+"(\d+)"', text)
+                steam.append(f"  {manifest.rsplit('/', 1)[-1]}: version {version.group(1) if version else '?'}")
+            log = sys.read_text(f"{pkg[:-len('package')]}logs/bootstrap_log.txt")
+            if log:
+                steam += ["  bootstrap_log.txt (end):"] + [f"    {line}" for line in log.splitlines()[-25:]]
+    if steam:
+        bundle.add("steam-client.txt", "\n".join(steam) + "\n")
 
     stats = []
     for p in sys.glob("/sys/power/suspend_stats/*"):
