@@ -736,6 +736,23 @@ class SteamActionsFixTest(unittest.TestCase):
         rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", "guide")
         self.assertNotIn("apply xbox-key", out)
 
+    def test_xbox_key_choice_on_a_helper_unit_leaves_inputplumber_alone(self):
+        from .test_xbox_key import IP_LOG
+        self.f.mcu_hidraw()
+        self.f.runner.ip_journal = IP_LOG
+        self.assertEqual(self.cli("apply", "--yes", "xbox-key")[0], 0)
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        cap_map = self.root / "etc/inputplumber/capability_maps.d/onexplayer_type9.yaml"
+        self.f.runner.calls.clear()
+        rc, out, err = self.cli("apply", "--yes", "buttons", "--xbox-key", "fps-limit")
+        self.assertEqual(rc, 0, err)
+        # InputPlumber cannot read this Xbox key, so the map has no entry for it; keys.json changed.
+        self.assertNotIn("name: Xbox", cap_map.read_text())
+        self.assertIn("oxp3-tool-xbox-key.service handles it", cap_map.read_text())
+        self.assertEqual(self.keys()["xbox"], "fps-limit")
+        self.assertNotIn("systemctl try-restart inputplumber.service", self.calls())
+        self.assertNotIn("Reboot (or leave Game Mode", out)
+
     def test_undecoded_xbox_key_does_not_count_as_the_steam_menu(self):
         from .test_xbox_key import IP_LOG
         self.f.mcu_hidraw()

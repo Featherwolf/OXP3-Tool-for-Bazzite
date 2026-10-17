@@ -91,7 +91,10 @@ _NATIVE = {"home": "Keyboard", "xbox": "Guide"}
 
 
 def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Optional[str],
-                        upstream_sha256: Optional[str], session: Optional[str] = None) -> str:
+                        upstream_sha256: Optional[str], session: Optional[str] = None,
+                        xbox_by_helper: bool = False) -> str:
+    """The override map. With ``xbox_by_helper`` the Xbox key gets no entry: InputPlumber cannot read it
+    there (vendor button 0x25), so the xbox-key helper does its action and an entry would never fire."""
     for key, action in actions.items():
         if key not in BUTTON_KEYS:
             raise ValueError(f"unknown key {key!r}")
@@ -111,6 +114,8 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
     ]
     if any(uses_helper(a, session) for a in actions.values()):
         lines.append(f"# dbus: targets go to {STEAM_ACTIONS_UNIT_NAME}, which carries them out in Steam.")
+    if xbox_by_helper:
+        lines.append(f"# The Xbox key reports as button 0x25 here: {XBOX_KEY_UNIT_NAME} handles it.")
     if upstream_path:
         lines.append(f"# Stock map: {upstream_path}" + (f" (sha256 {upstream_sha256})" if upstream_sha256 else ""))
     lines += [
@@ -130,6 +135,8 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
     # gamepad Guide. Translated events are not translated again, so these do
     # not touch the chords above (or each other).
     for name, key in (("Home", "home"), ("Xbox", "xbox")):
+        if key == "xbox" and xbox_by_helper:
+            continue
         native = _NATIVE[key]
         target = action_target(actions.get(key, DEFAULT_BUTTON_ACTIONS[key]), session)
         if target != ("gamepad", native):

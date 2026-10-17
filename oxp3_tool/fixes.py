@@ -318,7 +318,8 @@ class ButtonsFix(Fix):
         upstream_name = ip.upstream_map.rsplit("/", 1)[-1]
         upstream_sha = ctx.sys.sha256(ip.upstream_map)
         session = ctx.game_mode_input
-        content = templates.capability_map_yaml(ip.map_id, actions, ip.upstream_map, upstream_sha, session)
+        content = templates.capability_map_yaml(ip.map_id, actions, ip.upstream_map, upstream_sha, session,
+                                                xbox_by_helper=ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH))
         map_path = f"{IP_ETC_CAPABILITY_MAPS}/{upstream_name}"
         restart = opts.get("restart", True)
         plan = Plan(
