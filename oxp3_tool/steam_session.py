@@ -14,7 +14,8 @@ every answer as untrusted data:
   (the Steam menu's Home item). steam://open/keyboard opens the on-screen
   keyboard in Desktop Mode; Game Mode only acts on it while a game is in front.
 - So in Game Mode the keyboard is toggled in Steam's UI over its remote
-  debugging, as Steam's own Steam+X chord does, on any screen; without remote
+  debugging, as Steam's own Steam+X chord does, on any screen (over the game
+  while one runs); without remote
   debugging it falls back to steam://open/keyboard.
 - The frame limit is Steam's own global setting, changed in Steam's UI over its
   remote debugging (which Decky Loader turns on; cdp.py, steam_ui_js.py), so
@@ -376,8 +377,9 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Union[None, bool
 OSK_NO_ROUTE = ("SteamUIStore unavailable", "no gamepad UI main window", "VirtualKeyboardManager unavailable",
                 "not in the gamepad UI")
 OSK_FAILED = {
-    "too late": "Steam was too busy to open its keyboard; nothing was changed, press again",
-    "a game's text input is open": "the game's own text input is open; Steam shows one keyboard at a time",
+    "too late": "Steam was too busy to open or close its keyboard; nothing was changed, press again",
+    "a game's text input is open": "the game's own text input is open; Steam's keyboard key does not act on it "
+                                   "(use its own buttons; B cancels)",
     "no keyboard owner": "Steam's keyboard is not ready yet (its UI is still starting); press again",
 }
 OSK_WARNINGS = {
@@ -414,7 +416,7 @@ def keyboard_in_steam(uid: int, proc: str = "/proc") -> Optional[bool]:
             log(f"Steam's keyboard cannot be reached in its UI ({error}); {PIPE_NOTE}")
             return None
         # The pipe goes to the same handler, which refuses these too.
-        log("failed: " + OSK_FAILED.get(error, f"Steam cannot open its keyboard ({error})"))
+        log("failed: " + OSK_FAILED.get(error, f"Steam's keyboard cannot be used ({error})"))
         return False
     opening = reply.get("opening") is True
     if reply.get("confirmed") is True:

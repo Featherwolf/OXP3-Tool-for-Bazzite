@@ -39,8 +39,8 @@ DBUS_ACTIONS = steam_session.DBUS_ACTIONS
 BUTTON_ACTIONS: dict[str, tuple[str, str, str]] = {
     "guide": ("Guide", "Guide", "Steam button (opens the Steam menu; hold it for Steam+button shortcuts)"),
     "quick-access": ("QuickAccess", "QuickAccess", "Quick Access menu (the '...' button)"),
-    OSK_ACTION: ("Keyboard", "LeftTop", "Steam on-screen keyboard, open and close (native Steam Input: through "
-                                         "oxp3-tool's helper)"),
+    OSK_ACTION: ("Keyboard", "LeftTop", "Steam on-screen keyboard (native Steam Input: through oxp3-tool's helper; "
+                                         "a second press closes it in Game Mode with Decky Loader)"),
     "keyboard-chord": ("Keyboard", "LeftTop", "Steam on-screen keyboard through the Steam+X shortcut (no helper)"),
     HOME_ACTION: ("", "", "Steam Home screen (through oxp3-tool's helper)"),
     FPS_ACTION: ("", "", "turn the frame limit on or off (--fps-limit, default 72; Steam's own with Decky Loader; "

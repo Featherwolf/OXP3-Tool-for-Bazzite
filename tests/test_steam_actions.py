@@ -1201,13 +1201,13 @@ class KeyboardRouteTest(unittest.TestCase):
                 ({"v": 1, "ok": False, "wrote": True, "error": "exception: boom"}, None, False,
                  "failed: Steam's keyboard call failed (exception: boom)"),
                 ({"v": 1, "ok": False, "wrote": False, "error": "too late"}, None, False,
-                 "failed: Steam was too busy to open its keyboard; nothing was changed, press again"),
+                 "failed: Steam was too busy to open or close its keyboard; nothing was changed, press again"),
                 ({"v": 1, "ok": False, "wrote": False, "error": "a game's text input is open"}, None, False,
                  "failed: the game's own text input is open"),
                 ({"v": 1, "ok": False, "wrote": False, "error": "no keyboard owner"}, None, False,
                  "failed: Steam's keyboard is not ready yet"),
                 ({"v": 1, "ok": False, "wrote": False, "error": "something new"}, None, False,
-                 "failed: Steam cannot open its keyboard (something new)"),
+                 "failed: Steam's keyboard cannot be used (something new)"),
                 ({"v": 2}, None, False, "not understood")):
             with self.subTest(text=text):
                 result, log, _ = self.run_steam(reply, error)

@@ -279,10 +279,11 @@ class ButtonsFix(Fix):
         f"({templates.STEAM_ACTIONS_UNIT_NAME}) carries them out in your Steam session.\n"
         "- keyboard (native Steam Input) opens and closes Steam's keyboard in Game Mode\n"
         "  the way Steam+X does, in Steam's own interface over its remote debugging\n"
-        "  (Decky Loader turns it on), on any screen and over games; Steam's Steam+X\n"
-        "  shortcut itself does nothing on some setups. In Desktop Mode, or without\n"
-        "  remote debugging, it sends steam://open/keyboard, which Game Mode only acts\n"
-        "  on while a game is in front. keyboard-chord sends Steam+X instead.\n"
+        "  (Decky Loader turns it on), on any screen (over the game while one runs);\n"
+        "  Steam's Steam+X shortcut itself does nothing on some setups. In Desktop\n"
+        "  Mode, or without remote debugging, it sends steam://open/keyboard, which\n"
+        "  Game Mode only acts on while a game is in front. keyboard-chord sends\n"
+        "  Steam+X instead.\n"
         "- home takes Game Mode to its Home screen (steam://open/library).\n"
         "- fps-limit turns a frame limit of --fps-limit (default 72) on, and the next\n"
         "  press turns it off. With Steam's remote debugging on (Decky Loader turns it\n"
@@ -489,7 +490,8 @@ class ButtonsFix(Fix):
                 actions.get("keyboard") in (templates.OSK_ACTION, "keyboard-chord"):
             lines.append("under the OpenGamepadUI overlay the keyboard key's Steam+X shortcut often does nothing "
                          "(OpenGamepadUI issue #549); for a working on-screen keyboard switch to native Steam Input "
-                         "(`ujust configure-opengamepadui disable`, reboot, `sudo oxp3-tool apply buttons`)")
+                         "(`ujust configure-opengamepadui disable`, reboot, `sudo oxp3-tool apply buttons`); without "
+                         "Decky Loader (Steam's remote debugging) the key then works only over a game")
         return lines
 
 

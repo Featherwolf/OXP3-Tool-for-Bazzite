@@ -21,8 +21,9 @@ STEAM_OSK_JS toggles Steam's on-screen keyboard in Game Mode the way Steam's own
 does: SteamUIStore.OnModalKeyboardMessage with bChordInvoked, the handler Steam registers with
 SteamClient.Input.RegisterForUserKeyboardMessages. steam://open/keyboard reaches the same handler
 without bChordInvoked, and Steam then only acts while a game is in front (route /apprunning).
-Over Steam's own screens the keyboard opens in place; over a running game Steam moves to its
-/keyboard route, which draws the keyboard over the game. OPTS: {"action": "toggle" | "status",
+With no game running the keyboard opens in place on any screen; while a game runs, from any
+screen, Steam replaces the route with /keyboard, which draws the keyboard over the game, and
+closing it returns to the game (/apprunning). OPTS: {"action": "toggle" | "status",
 "budgetMs": B, "notAfter": T}. It returns {v: 1, ok, wrote, confirmed, opening, gameRunning,
 before, after, warnings, ...}.
 
@@ -267,8 +268,9 @@ async (OPTS) => {
     await sleep(0); // everything below runs outside Runtime.evaluate's synchronous part
     if (Date.now() >= notAfter) return done({ error: "too late" });
     if (shown() === want) return done({ ok: true, confirmed: true, after: snap(), warnings: ["changed by someone else"] });
-    // Steam's handler skips a window showing a game's own text input; the manager does nothing without an owner.
-    if (want && route() === GAME_OSK_ROUTE) return done({ error: "a game's text input is open" });
+    // Steam's handler skips a window showing a game's own text input, to open or to close; the manager does
+    // nothing without an owner.
+    if (route() === GAME_OSK_ROUTE) return done({ error: "a game's text input is open" });
     if (out.owners === 0) return done({ error: "no keyboard owner" });
     // Steam bug #12195 kind: Steam counts its keyboard as open but none is drawn. Steam+X would close it too.
     if (!want && out.before.rendered === false) out.warnings.push("stale");
@@ -289,7 +291,7 @@ async (OPTS) => {
       else vkm.SetVirtualKeyboardVisible();
     }
     // Over a game: route /keyboard, whose component calls ShowModalKeyboard once React renders it, and the
-    // composition becomes OverlayKeyboard. Over Steam's own screens: the keyboard opens in place.
+    // composition becomes OverlayKeyboard. With no game running: the keyboard opens in place.
     const good = () => shown() === want && (!want || !game() || route() === KEYBOARD_ROUTE);
     while (!good() && left() > 0) await sleep(50);
     if (want && good()) {
