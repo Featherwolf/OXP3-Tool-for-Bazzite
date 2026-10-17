@@ -310,7 +310,7 @@ class FrameLimitTest(unittest.TestCase):
             fake.set(1)
             ok, log = self.toggle(fake, fps=48, limit=limit)
             self.assertEqual(self.runs[-1][0][-1], "48")
-            self.assertIn("ok: frame limit 48 fps (replaced a limit Steam set)", log)
+            self.assertIn("ok: frame limit 48 fps (replaced a limit that was already on)", log)
 
     def test_first_press_sets_even_when_steam_has_a_limit(self):
         with FakeProc(self.tmp, limiter=1) as fake:
@@ -324,6 +324,20 @@ class FrameLimitTest(unittest.TestCase):
             fake.set(0)
             self.toggle(fake, limit=limit)
             self.assertEqual(self.runs[-1][0][-1], "72")
+
+    def test_a_new_game_mode_session_starts_without_our_limit(self):
+        with FakeProc(self.tmp, limiter=0) as fake:
+            limit = steam_session.FrameLimit()
+            self.toggle(fake, limit=limit)
+            self.assertEqual(self.runs[-1][0][-1], "72")
+            # Desktop Mode and back: a new limiter file, and Steam's no-op limit is on.
+            environ = fake.proc / "4321" / "environ"
+            environ.write_bytes(environ.read_bytes().replace(b"AbCd1234", b"New54321"))
+            new = fake.proc / "4321" / "root/tmp/gamescope-limiter.New54321"
+            new.write_bytes(struct.pack("=I", 1))
+            fake.limiter = new
+            self.toggle(fake, limit=limit)
+            self.assertEqual(self.runs[-1][0][-1], "72")  # sets, instead of turning the old one off
 
     def test_failures(self):
         with FakeProc(self.tmp) as fake:
@@ -340,7 +354,8 @@ class FrameLimitTest(unittest.TestCase):
             ok, log = self.toggle(fake)
         self.assertFalse(ok)
         # A failure, so status shows it; it names the Steam processes it saw.
-        self.assertIn("failed: Steam is not running in Game Mode (pid 4321 uid 1000 ? (no gamescope display))", log)
+        self.assertIn("failed: Steam is not running in Game Mode; no frame limit to change "
+                      "(Steam processes: pid 4321 uid 1000 ? (no gamescope display))", log)
         self.assertEqual(self.runs, [])
 
     def test_unreadable_state_falls_back_to_what_was_sent(self):
@@ -864,8 +879,16 @@ class SteamActionsFixTest(unittest.TestCase):
         rc, status, _ = self.cli("status")
         self.assertNotIn("InputPlumber has not been restarted", status)
 
+    def test_unit_not_enabled_is_pointed_out(self):
+        self.f.ogui_overlay(disabled_for="gamer")  # override from before Bazzite enabled its unit
+        rc, out, _ = self.cli("apply", "--yes", "buttons")
+        self.assertNotIn("bazzite-native-steam-input.service\n", "\n".join(self.calls()))
+        self.assertIn("is not enabled for gamer", out)
+        self.assertIn("Reboot afterwards", out)
+
     def test_inputplumber_restart_restores_the_deck_controller(self):
         self.f.ogui_overlay(disabled_for="gamer")  # Bazzite's native Steam Input setup for user gamer
+        self.f.write("/var/home/gamer/.config/systemd/user/default.target.wants/bazzite-native-steam-input.service", "")
         restore = "systemctl --user -M gamer@ --no-block restart bazzite-native-steam-input.service"
         rc, out, err = self.cli("apply", "--yes", "buttons")
         self.assertEqual(rc, 0, err)
@@ -898,8 +921,13 @@ class SteamActionsFixTest(unittest.TestCase):
         self.f.write(f"{pkg}/beta", "steamdeck_publicbeta\n")
         self.f.write(f"{pkg}/steam_client_ubuntu12.manifest", '"ubuntu12"\n{\n\t"version"\t\t"1791918634"\n}\n')
         self.f.write("/var/home/gamer/.local/share/Steam/logs/bootstrap_log.txt", "line 1\nUpdate complete\n")
+        self.f.symlink("/home", "var/home")  # as on Bazzite: listed once
+        self.f.write("/etc/secret", "root only\n")
+        self.f.symlink("/var/home/gamer/.local/share/Steam/package/steam_client_linux.manifest", "/etc/secret")
         bundle, _ = diagnose.collect(Context(self.f.system()), "status")
         steam = bundle.files["steam-client.txt"].decode()
+        self.assertEqual(steam.count("beta=steamdeck_publicbeta"), 1)
+        self.assertNotIn("root only", steam)  # never through a symlink
         self.assertIn("beta=steamdeck_publicbeta", steam)
         self.assertIn("steam_client_ubuntu12.manifest: version 1791918634", steam)
         self.assertIn("    Update complete", steam)

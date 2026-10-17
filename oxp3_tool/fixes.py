@@ -163,13 +163,20 @@ def _restart_inputplumber(only_if_changed: tuple[str, ...] = (), note: str = "")
 NATIVE_STEAM_INPUT_UNIT = "bazzite-native-steam-input.service"
 
 
+def _native_steam_input_users(ctx: Context) -> list[str]:
+    """Users who chose native Steam Input and whose Bazzite unit runs at login (it is enabled)."""
+    wants = f".config/systemd/user/default.target.wants/{NATIVE_STEAM_INPUT_UNIT}"
+    return [u for u in ctx.ogui_disabled_for
+            if any(ctx.sys.exists(f"{root}/{u}/{wants}") for root in ("/home", "/var/home"))]
+
+
 def _restore_deck_controller(ctx: Context, only_if_changed: tuple[str, ...] = ()) -> list[PostStep]:
     """Rerun Bazzite's native Steam Input unit for each user who has it, after InputPlumber restarts."""
     # --no-block: the unit retries by itself while InputPlumber's device comes back.
     return [PostStep(f"restore-deck-controller-{user}",
                      ["systemctl", "--user", "-M", f"{user}@", "--no-block", "restart", NATIVE_STEAM_INPUT_UNIT],
                      f"select the Steam Deck controller again for {user}", order=65, only_if_changed=only_if_changed)
-            for user in ctx.ogui_disabled_for]
+            for user in _native_steam_input_users(ctx)]
 
 
 def _daemon_reload() -> PostStep:
@@ -267,8 +274,8 @@ class ButtonsFix(Fix):
         "  (steam://open/keyboard, as HHD does), because Steam's Steam+X shortcut does\n"
         "  nothing on some setups; keyboard-chord sends Steam+X instead.\n"
         "- home takes Game Mode to its Home screen (steam://open/library).\n"
-        "- fps-limit turns gamescope's frame limit off when one is on, else sets\n"
-        "  --fps-limit (default 72; limits that divide 144 keep the panel at 144 Hz with\n"
+        "- fps-limit sets a frame limit of --fps-limit, and the next press turns it off\n"
+        "  (default 72; limits that divide 144 keep the panel at 144 Hz with\n"
         "  VRR off). It caps games, never Steam's own screens: check it in a game that\n"
         "  runs faster, with the performance overlay on. Steam is not told: Quick\n"
         "  Access keeps showing its own setting, and Steam replaces the limit when it\n"
@@ -278,7 +285,9 @@ class ButtonsFix(Fix):
         "xbox-key helper can only tap, so keep guide on Home to keep them.\n"
         "Check each key with `inputplumber device 0 test` (press q to quit; closing the\n"
         "window instead leaves InputPlumber in test mode until\n"
-        "`sudo systemctl restart inputplumber`). A key that goes to the helper shows\n"
+        "`sudo systemctl restart inputplumber`; with native Steam Input, then run\n"
+        f"`systemctl --user restart {NATIVE_STEAM_INPUT_UNIT}` or reboot to get the Steam\n"
+        "Deck controller back). A key that goes to the helper shows\n"
         f"nothing there; `journalctl -u {templates.STEAM_ACTIONS_UNIT_NAME} -f` logs its presses\n"
         f"(`journalctl -u {templates.XBOX_KEY_UNIT_NAME} -f` for an Xbox key the xbox-key helper reads).\n"
         "Your choice is kept when you apply again\n"
@@ -287,7 +296,8 @@ class ButtonsFix(Fix):
         "recommended while the stock map is the 0.82.0 one it was written for.\n"
         "InputPlumber is restarted when the map changes."
     )
-    takes_effect = "immediately (InputPlumber restarts when the map changes; restart Steam if buttons do nothing)"
+    takes_effect = ("immediately (InputPlumber restarts when the map changes; reboot if the buttons act like an "
+                    "Xbox controller or do nothing)")
     STEAM_UNIT = templates.STEAM_ACTIONS_UNIT_NAME
 
     def check(self, ctx: Context) -> Check:
@@ -367,6 +377,11 @@ class ButtonsFix(Fix):
                         "session starts, and the InputPlumber restart resets it.")
             plan.post.append(_restart_inputplumber(only_if_changed=(map_path,), note=note))
             plan.post += restore
+            for user in sorted(set(ctx.ogui_disabled_for) - set(_native_steam_input_users(ctx))):
+                plan.messages.append(
+                    f"Bazzite's {NATIVE_STEAM_INPUT_UNIT} is not enabled for {user}, so Steam gets an Xbox controller "
+                    f"at login instead of the Steam Deck one; run `ujust configure-opengamepadui disable` again as "
+                    f"{user} to fix it.")
         else:
             plan.pending_note = "InputPlumber was not restarted; the new map loads on the next reboot."
         if not self._stock_map_known(ctx):

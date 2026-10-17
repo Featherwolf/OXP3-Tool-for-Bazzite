@@ -172,15 +172,25 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
 
     # Steam's update channel and version: a Steam update often lands at the same restart as an apply.
     steam = []
-    for root in ("/home", "/var/home"):
+    seen = set()
+
+    def user_file(path: str, limit: int) -> str:
+        # In users' homes: never through a symlink, never unbounded, never a FIFO.
+        data = sys.read_regular(path, limit)
+        return data.decode(errors="replace") if data is not None else ""
+
+    for root in ("/home", "/var/home"):  # /home is a symlink to /var/home on Bazzite
         for pkg in sys.glob(f"{root}/*/.local/share/Steam/package"):
-            beta = sys.read_text(f"{pkg}/beta")
-            steam.append(f"{pkg}: beta={beta.strip() if beta else '(none)'}")
+            user = pkg.split("/")[-5]
+            if user in seen:
+                continue
+            seen.add(user)
+            beta = user_file(f"{pkg}/beta", 4096).strip()
+            steam.append(f"{pkg}: beta={beta or '(none)'}")
             for manifest in sys.glob(f"{pkg}/steam_client_*.manifest"):
-                text = sys.read_text(manifest) or ""
-                version = re.search(r'"version"\s+"(\d+)"', text)
+                version = re.search(r'"version"\s+"(\d+)"', user_file(manifest, 1 << 20))
                 steam.append(f"  {manifest.rsplit('/', 1)[-1]}: version {version.group(1) if version else '?'}")
-            log = sys.read_text(f"{pkg[:-len('package')]}logs/bootstrap_log.txt")
+            log = user_file(f"{pkg[:-len('package')]}logs/bootstrap_log.txt", 8 << 20)
             if log:
                 steam += ["  bootstrap_log.txt (end):"] + [f"    {line}" for line in log.splitlines()[-25:]]
     if steam:

@@ -238,20 +238,26 @@ def describe_steam(proc: str = "/proc") -> str:
 
 class FrameLimit:
     def __init__(self) -> None:
-        self.sent = 0  # the limit this helper set last (0: none or off)
+        self.sent = 0  # the limit this helper set last in this Game Mode session (0: none or off)
+        self.session: Optional[tuple[int, str]] = None
 
     def toggle(self, fps: int, proc: str = "/proc") -> bool:
-        """Set ``fps``, or turn the frame limit off when the limit this helper set is still on.
+        """Set ``fps``, or turn whatever limit is on off when this helper's last press set one.
 
         gamescope's state file only says whether some limit is on. Steam can keep one that
-        changes nothing (its target at the panel's full rate), so a limit the helper did not set
-        is replaced rather than turned off: the first press always shows a limit.
+        changes nothing (its target at the panel's full rate), so a limit that was on before this
+        helper set one is replaced rather than turned off: the first press always shows a limit.
+        If Steam changed the limit since the last press, that press may only turn it off.
         """
         found = game_mode_steam(proc)
         if found is None:
-            log(f"failed: Steam is not running in Game Mode ({describe_steam(proc)}); no frame limit to change")
+            log("failed: Steam is not running in Game Mode; no frame limit to change "
+                f"(Steam processes: {describe_steam(proc)})")
             return False
         pid, uid, env = found
+        session = (pid, env.get("GAMESCOPE_LIMITER_FILE", ""))
+        if session != self.session:
+            self.sent, self.session = 0, session  # a new Game Mode session starts without our limit
         active = limiter_active(proc, pid, uid, env)
         target = 0 if self.sent and active is not False else fps
         error = set_fps_limit(uid, env, target)
@@ -264,7 +270,7 @@ class FrameLimit:
             log(f"failed: gamescope did not {'set' if target else 'clear'} the frame limit")
             return False
         if target:
-            log(f"ok: frame limit {target} fps" + (" (replaced a limit Steam set)" if active else ""))
+            log(f"ok: frame limit {target} fps" + (" (replaced a limit that was already on)" if active else ""))
         else:
             log("ok: frame limit off")
         return True
