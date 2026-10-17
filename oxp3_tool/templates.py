@@ -8,7 +8,7 @@ import re
 from types import ModuleType
 from typing import Optional
 
-from . import PROJECT_URL, cdp, steam_session
+from . import PROJECT_URL, cdp, steam_session, steam_ui_js
 
 # First-line marker of every file this tool writes.
 OWN_MARKER = "Installed by oxp3-tool ("
@@ -42,7 +42,8 @@ BUTTON_ACTIONS: dict[str, tuple[str, str, str]] = {
     OSK_ACTION: ("Keyboard", "LeftTop", "Steam on-screen keyboard (native Steam Input: through oxp3-tool's helper)"),
     "keyboard-chord": ("Keyboard", "LeftTop", "Steam on-screen keyboard through the Steam+X shortcut (no helper)"),
     HOME_ACTION: ("", "", "Steam Home screen (through oxp3-tool's helper)"),
-    FPS_ACTION: ("", "", "turn the frame limit on or off (--fps-limit, default 72; through oxp3-tool's helper)"),
+    FPS_ACTION: ("", "", "turn the frame limit on or off (--fps-limit, default 72; Steam's own with Decky Loader; "
+                         "through oxp3-tool's helper)"),
     "screenshot": ("Screenshot", "Screenshot", "Steam screenshot"),
     "ogui-menu": ("QuickAccess2", "QuickAccess2",
                   "OpenGamepadUI menu (with native Steam Input this takes a screenshot instead)"),
@@ -199,7 +200,7 @@ XBOX_KEY_UNIT_PATH = f"/etc/systemd/system/{XBOX_KEY_UNIT_NAME}"
 def xbox_key_helper_script() -> str:
     from . import xbox_helper
 
-    return _bundle("Remove with `sudo oxp3-tool revert xbox-key`.", cdp, steam_session, xbox_helper)
+    return _bundle("Remove with `sudo oxp3-tool revert xbox-key`.", cdp, steam_ui_js, steam_session, xbox_helper)
 
 
 # ProtectHome=read-only, not yes, for helpers that act in the Steam user's
@@ -241,7 +242,7 @@ def steam_actions_helper_script() -> str:
     from . import steam_actions
 
     return _bundle("Remove with `sudo oxp3-tool revert buttons`, or give the keys other actions with "
-                   "`sudo oxp3-tool apply buttons ...`.", cdp, steam_session, steam_actions)
+                   "`sudo oxp3-tool apply buttons ...`.", cdp, steam_ui_js, steam_session, steam_actions)
 
 
 STEAM_ACTIONS_UNIT = f"""\

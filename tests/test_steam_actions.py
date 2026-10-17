@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from oxp3_tool import steam_actions, steam_session, templates
+from oxp3_tool import cdp, steam_actions, steam_session, templates
 from oxp3_tool.cli import main
 from oxp3_tool.system import CommandResult, System
 
@@ -943,3 +944,118 @@ class SteamActionsFixTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SteamRouteTest(unittest.TestCase):
+    """The frame limit through Steam's own setting (Quick Access shows it), gamescope as the fallback."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.proc = Path(tmp.name, "proc")
+        (self.proc / "net").mkdir(parents=True)
+        self.listen(1000)
+
+    def listen(self, uid, address="0100007F:1F90", state="0A"):
+        (self.proc / "net/tcp").write_text(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+            f"   0: {address} 00000000:0000 {state} 00000000:00000000 00:00000000 00000000  {uid}        0 4242 1\n")
+
+    def run_steam(self, reply=None, error=None):
+        sent = []
+
+        def fake_evaluate(expression, **kw):
+            sent.append((expression, kw))
+            if error:
+                raise error
+            return json.dumps(reply)
+        err = io.StringIO()
+        with mock.patch.object(steam_session, "evaluate", fake_evaluate), contextlib.redirect_stderr(err):
+            result = steam_session.toggle_in_steam(72, 1000, str(self.proc))
+        return result, err.getvalue(), sent
+
+    def test_debug_port_owner(self):
+        self.assertEqual(steam_session.debug_port_uids(str(self.proc)), {1000})
+        self.listen(1000, state="01")  # an established connection, not a listener
+        self.assertEqual(steam_session.debug_port_uids(str(self.proc)), set())
+        self.listen(1000, address="0100007F:1F91")
+        self.assertEqual(steam_session.debug_port_uids(str(self.proc)), set())
+        self.assertEqual(steam_session.debug_port_uids(str(self.proc / "missing")), set())
+
+    def test_only_steams_own_listener(self):
+        self.listen(1001)  # someone else listens on 8080: never talk to it
+        result, log, sent = self.run_steam({"v": 1, "ok": True, "wrote": True})
+        self.assertIsNone(result)
+        self.assertEqual(sent, [])
+        self.assertIn("remote debugging is off", log)
+
+    def test_turns_steams_limit_on_and_off(self):
+        on = {"v": 1, "ok": True, "wrote": True, "changed": True, "confirmed": True, "target": 72,
+              "limitedAfter": True, "warnings": []}
+        result, log, sent = self.run_steam(on)
+        self.assertTrue(result)
+        self.assertIn("ok: frame limit 72 fps in Steam (global, shown in Quick Access)", log)
+        expression, kw = sent[0]
+        self.assertTrue(expression.startswith("(\nasync (OPTS) => {"))
+        self.assertTrue(expression.endswith(
+            ')({"action": "toggle", "limitFps": 72, "maxFps": 144, "budgetMs": 1800}).then(JSON.stringify)'))
+        self.assertEqual(kw, {"await_promise": True, "eval_timeout_ms": 1500})
+        off = dict(on, target=144, limitedAfter=False, confirmed=False, warnings=["limitFps 72 not offered"])
+        result, log, _ = self.run_steam(off)
+        self.assertIn("ok: frame limit off in Steam (global); Steam has not confirmed it yet; limitFps 72", log)
+
+    def test_falls_back_only_when_nothing_was_written(self):
+        for reply, error, expected, text in (
+                ({"v": 1, "ok": False, "wrote": False, "error": "per-game profile active"}, None, None,
+                 "its own performance profile"),
+                ({"v": 1, "ok": False, "wrote": False, "error": "SystemPerfStore unavailable"}, None, None,
+                 "cannot be used (SystemPerfStore unavailable)"),
+                (None, cdp.CdpError("Steam's remote debugging is not reachable"), None, "not reachable"),
+                ({"v": 1, "ok": False, "wrote": True, "error": "SetSetting threw: x"}, None, False,
+                 "failed: Steam's frame limit change failed"),
+                (None, cdp.CdpError("Steam did not answer in time", maybe_ran=True), False,
+                 "failed: Steam did not confirm"),
+                ({"v": 2}, None, False, "not understood"),
+                ("not a dict", None, False, "not understood")):
+            with self.subTest(text=text):
+                result, log, _ = self.run_steam(reply, error)
+                self.assertEqual(result, expected)
+                self.assertIn(text, log)
+
+    def test_toggle_prefers_steam(self):
+        with tempfile.TemporaryDirectory() as tmp, FakeProc(tmp) as fake:
+            limit = steam_session.FrameLimit()
+            with mock.patch.object(steam_session, "toggle_in_steam", return_value=True) as steam, \
+                    mock.patch.object(steam_session, "set_fps_limit") as gamescope:
+                self.assertTrue(limit.toggle(72, str(fake.proc)))
+            steam.assert_called_once_with(72, 1000, str(fake.proc))
+            gamescope.assert_not_called()
+            with mock.patch.object(steam_session, "toggle_in_steam", return_value=False), \
+                    mock.patch.object(steam_session, "set_fps_limit") as gamescope:
+                self.assertFalse(limit.toggle(72, str(fake.proc)))  # Steam may have changed it: no fallback
+            gamescope.assert_not_called()
+            with mock.patch.object(steam_session, "toggle_in_steam", return_value=None), \
+                    mock.patch.object(steam_session, "set_fps_limit", return_value=None) as gamescope, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                limit.toggle(72, str(fake.proc))
+            gamescope.assert_called_once()
+
+    def test_through_a_devtools_server(self):
+        from .test_cdp import FakeSteam, frame
+
+        reply_value = {"v": 1, "ok": True, "wrote": True, "changed": True, "confirmed": True, "target": 72,
+                       "limitedAfter": True, "warnings": []}
+
+        def reply(request):
+            body = {"id": 1, "result": {"result": {"type": "string", "value": json.dumps(reply_value)}}}
+            return [frame(0x1, json.dumps(body).encode())]
+        steam = FakeSteam(reply)
+        self.addCleanup(steam.close)
+        err = io.StringIO()
+        with mock.patch.object(steam_session, "evaluate", functools.partial(cdp.evaluate, port=steam.port)), \
+                contextlib.redirect_stderr(err):
+            self.assertTrue(steam_session.toggle_in_steam(72, 1000, str(self.proc)))
+        self.assertIn("ok: frame limit 72 fps in Steam", err.getvalue())
+        params = steam.requests[0]["params"]
+        self.assertTrue(params["awaitPromise"])
+        self.assertIn("SystemPerfStore", params["expression"])

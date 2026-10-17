@@ -9,11 +9,14 @@ never as root:
   ~/.steam/steam.pipe. steam://open/keyboard opens the on-screen keyboard;
   steam://open/library takes Game Mode to its Home screen (the Steam menu's
   Home item).
-- The frame limit is gamescope's own `gamescopectl debug_set_fps_limit`, the
-  value Steam's Quick Access limiter also sets. It caps games only, never
-  Steam's own screens. Steam is not told, so Quick Access keeps showing its
-  own setting, and Steam replaces the limit when it next sends its own (the
-  slider, a per-game setting).
+- The frame limit is Steam's own global setting, changed in Steam's UI over its
+  remote debugging (which Decky Loader turns on; cdp.py, steam_ui_js.py), so
+  Quick Access shows it. When that is not possible (debugging off, a game with
+  its own performance profile, Steam's UI code changed) and nothing was
+  written, it falls back to gamescope's `gamescopectl debug_set_fps_limit`,
+  the value Steam's limiter also sets: Steam is not told then, so Quick Access
+  keeps showing its own setting and Steam replaces the limit when it next
+  sends its own. Either way it caps games only, never Steam's own screens.
 
 Each action logs one line starting with "ok: " or "failed: "; oxp3-tool status
 looks at the newest.
@@ -31,6 +34,9 @@ import subprocess
 import sys
 from typing import Optional
 
+from .cdp import CdpError, evaluate
+from .steam_ui_js import STEAM_FPS_TOGGLE_JS
+
 PYTHON = "/usr/bin/python3"
 GAMESCOPECTL = "/usr/bin/gamescopectl"
 # Written by the buttons fix: {"xbox": <action>, "session": <Game Mode input>, "fps_limit": <fps>}.
@@ -38,6 +44,10 @@ KEYS_CONFIG = "/etc/oxp3-tool/keys.json"
 KEYS_CONFIG_MAX = 4096
 ENVIRON_MAX = 1 << 20
 DEFAULT_FPS_LIMIT = 72  # half of 144 Hz: the panel keeps its mode with VRR off
+PANEL_MAX_FPS = 144  # for Steam's frame-limit script when gamescope's own list is not available
+STEAM_JS_BUDGET_MS = 1800  # the script's own time limit, well inside the DevTools deadline
+# Steam's remote debugging port in /proc/net/tcp: 127.0.0.1:8080 (or any address), state LISTEN.
+DEBUG_PORT_ADDRESSES = ("0100007F:1F90", "00000000:1F90")
 MIN_FPS_LIMIT = 10
 MAX_FPS_LIMIT = 144
 
@@ -236,6 +246,75 @@ def describe_steam(proc: str = "/proc") -> str:
     return "; ".join(parts)
 
 
+def debug_port_uids(proc: str = "/proc") -> set[int]:
+    """Owners of a socket listening on Steam's remote debugging port."""
+    try:
+        with open(os.path.join(proc, "net", "tcp")) as f:
+            lines = f.read(1 << 22).splitlines()[1:]
+    except OSError:
+        return set()
+    uids = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) > 7 and fields[1] in DEBUG_PORT_ADDRESSES and fields[3] == "0A":
+            try:
+                uids.add(int(fields[7]))
+            except ValueError:
+                pass
+    return uids
+
+
+def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Optional[bool]:
+    """Toggle Steam's global frame limit in its UI; None when nothing was written (use gamescope)."""
+    # Only talk to Steam itself: the port must belong to the Steam user, not to some other process.
+    if uid not in debug_port_uids(proc):
+        log("Steam's remote debugging is off (Decky Loader turns it on); setting the limit in gamescope, "
+            "which Quick Access does not show")
+        return None
+    opts = {"action": "toggle", "limitFps": int(fps), "maxFps": PANEL_MAX_FPS, "budgetMs": STEAM_JS_BUDGET_MS}
+    try:
+        value = evaluate(f"({STEAM_FPS_TOGGLE_JS})({json.dumps(opts)}).then(JSON.stringify)",
+                         await_promise=True, eval_timeout_ms=1500)
+    except CdpError as e:
+        if e.maybe_ran:
+            # Steam may have changed the setting: changing gamescope too could undo it.
+            log(f"failed: Steam did not confirm the frame limit change ({e})")
+            return False
+        log(f"Steam's frame limit setting is not reachable ({e}); setting the limit in gamescope")
+        return None
+    try:
+        reply = json.loads(value) if isinstance(value, str) else None
+    except (ValueError, RecursionError):
+        reply = None
+    if not isinstance(reply, dict) or reply.get("v") != 1 or not isinstance(reply.get("ok"), bool) \
+            or not isinstance(reply.get("wrote"), bool):
+        log("failed: Steam's answer about the frame limit is not understood")
+        return False
+    error = str(reply.get("error"))[:120]
+    if not reply["ok"]:
+        if reply["wrote"]:
+            log(f"failed: Steam's frame limit change failed ({error})")
+            return False
+        if error == "per-game profile active":
+            log("this game has its own performance profile in Steam, which the global frame limit does not "
+                "change; setting the limit in gamescope, which Quick Access does not show")
+        else:
+            log(f"Steam's frame limit setting cannot be used ({error}); setting the limit in gamescope")
+        return None
+    target = reply.get("target")
+    if reply.get("limitedAfter") is True and isinstance(target, int) and not isinstance(target, bool):
+        line = f"ok: frame limit {target} fps in Steam (global, shown in Quick Access)"
+    else:
+        line = "ok: frame limit off in Steam (global)"
+    if not reply.get("confirmed"):
+        line += "; Steam has not confirmed it yet"
+    warnings = reply.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        line += "; " + "; ".join(str(w)[:80] for w in warnings[:3])
+    log(line)
+    return True
+
+
 class FrameLimit:
     def __init__(self) -> None:
         self.sent = 0  # the limit this helper set last in this Game Mode session (0: none or off)
@@ -258,6 +337,10 @@ class FrameLimit:
         session = (pid, env.get("GAMESCOPE_LIMITER_FILE", ""))
         if session != self.session:
             self.sent, self.session = 0, session  # a new Game Mode session starts without our limit
+        in_steam = toggle_in_steam(fps, uid, proc)
+        if in_steam is not None:
+            self.sent = 0  # Steam owns the limit now; a later gamescope press starts afresh
+            return in_steam
         active = limiter_active(proc, pid, uid, env)
         target = 0 if self.sent and active is not False else fps
         error = set_fps_limit(uid, env, target)

@@ -10,3 +10,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The embedded JavaScript stays byte-identical to the version tested against Steam's UI code.
+"oxp3_tool/steam_ui_js.py" = ["E501"]

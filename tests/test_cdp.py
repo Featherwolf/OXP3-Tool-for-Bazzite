@@ -48,6 +48,17 @@ def read_frame(conn):
     return b0 & 0x0F, payload
 
 
+SJC = "0123456789ABCDEF0123456789ABCDEF"
+BPM = "FEDCBA9876543210FEDCBA9876543210"
+
+
+def page(title, page_id, port, **extra):
+    target = {"id": page_id, "type": "page", "title": title, "url": "https://steamloopback.host/index.html",
+              "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/{page_id}"}
+    target.update(extra)
+    return target
+
+
 class FakeSteam:
     """/json plus a WebSocket page that answers Runtime.evaluate as ``reply`` says."""
 
@@ -86,10 +97,10 @@ class FakeSteam:
         lines = head.decode().split("\r\n")
         path = lines[0].split()[1]
         headers = {k.lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:] if ln)}
-        if path == "/json":
+        if path == "/json/list":
             body = json.dumps(self.targets if self.targets is not None else [
-                {"title": "Steam Big Picture Mode", "webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}/devtools/page/BPM"},
-                {"title": self.title, "webSocketDebuggerUrl": f"ws://127.0.0.1:{self.port}/devtools/page/SJC"},
+                page("Steam Big Picture Mode", BPM, self.port),
+                page(self.title, SJC, self.port),
             ]).encode()
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body)
                          + body)
@@ -130,10 +141,14 @@ class CdpTest(unittest.TestCase):
     def test_evaluates_in_the_shared_context(self):
         steam = self.fake(answer({"ok": True, "enabled": True}))
         self.assertEqual(cdp.evaluate("1+1", port=steam.port), {"ok": True, "enabled": True})
-        self.assertEqual(steam.path, "/devtools/page/SJC")
+        self.assertEqual(steam.path, f"/devtools/page/{SJC}")
         self.assertIsNone(steam.origin)
         self.assertEqual(steam.requests, [{"id": 1, "method": "Runtime.evaluate",
-                                           "params": {"expression": "1+1", "returnByValue": True}}])
+                                           "params": {"expression": "1+1", "returnByValue": True, "silent": True}}])
+        cdp.evaluate("x", port=steam.port, await_promise=True, eval_timeout_ms=1500)
+        self.assertEqual(steam.requests[-1]["params"],
+                         {"expression": "x", "returnByValue": True, "silent": True, "awaitPromise": True,
+                          "timeout": 1500})
 
     def test_events_pings_fragments_and_large_answers(self):
         big = "x" * 70000
@@ -144,54 +159,77 @@ class CdpTest(unittest.TestCase):
                     frame(0x9, b"hi"),
                     frame(0x1, text[:10], fin=False), frame(0x0, text[10:200], fin=False),
                     frame(0x0, text[200:], fin=True)]
-        steam = self.fake(reply)
-        self.assertEqual(cdp.evaluate("big", port=steam.port), big)
+        self.assertEqual(cdp.evaluate("big", port=self.fake(reply).port), big)
 
-    def test_masked_server_frames_are_read(self):
-        def reply(request):
+    def test_failures_after_the_request_may_have_run(self):
+        def masked(request):
             return [frame(0x1, json.dumps({"id": 1, "result": {"result": {"value": 7}}}).encode(), mask=True)]
-        self.assertEqual(cdp.evaluate("7", port=self.fake(reply).port), 7)
 
-    def test_failures(self):
-        def threw(request):
-            return [frame(0x1, json.dumps({"id": 1, "result": {"result": {"type": "object"},
-                                                                "exceptionDetails": {"text": "Uncaught"}}}).encode())]
+        def binary(request):
+            return [frame(0x2, b"\x00\x01")]
+
+        def not_utf8(request):
+            return [frame(0x1, b"\xff\xfe")]
+
+        def detached(request):
+            return [frame(0x1, json.dumps({"method": "Inspector.detached", "params": {}}).encode())]
+
+        def destroyed(request):
+            error = {"code": -32000, "message": "Execution context was destroyed."}
+            return [frame(0x1, json.dumps({"id": 1, "error": error}).encode())]
 
         def closes(request):
             return [frame(0x8, b"")]
 
-        def error(request):
-            return [frame(0x1, json.dumps({"id": 1, "error": {"code": -32000, "message": "nope"}}).encode())]
-        for reply, text in ((threw, "the script failed in Steam: Uncaught"), (closes, "closed the connection"),
-                            (error, "DevTools error")):
-            with self.assertRaisesRegex(cdp.CdpError, text):
+        def not_json(request):
+            return [frame(0x1, b"{nope")]
+        for reply in (masked, binary, not_utf8, detached, destroyed, closes, not_json):
+            with self.assertRaises(cdp.CdpError) as caught:
                 cdp.evaluate("x", port=self.fake(reply).port)
-        with self.assertRaisesRegex(cdp.CdpError, "SharedJSContext page was not found"):
-            cdp.evaluate("x", port=self.fake(answer(1), title="Other").port)
-        with self.assertRaisesRegex(cdp.CdpError, "does not match"):
-            cdp.evaluate("x", port=self.fake(answer(1), accept="bad").port)
+            self.assertTrue(caught.exception.maybe_ran, reply.__name__)
 
-    def test_only_steams_own_host_and_port(self):
-        steam = self.fake(answer(1))
-        elsewhere = [{"title": "SharedJSContext", "webSocketDebuggerUrl": "ws://192.0.2.1:8080/devtools/page/X"},
-                     {"title": "SharedJSContext", "webSocketDebuggerUrl": f"wss://127.0.0.1:{steam.port}/x"},
-                     {"title": "SharedJSContext", "webSocketDebuggerUrl": "ws://127.0.0.1:1/x"}]
-        with self.assertRaisesRegex(cdp.CdpError, "not found"):
-            cdp.shared_context_url(elsewhere, port=steam.port)
+    def test_failures_before_anything_ran(self):
+        # The script never started (an exception is a syntax or top-level error of an
+        # expression that never rejects), or Steam refused the request.
+        def threw(request):
+            return [frame(0x1, json.dumps({"id": 1, "result": {"result": {"type": "object"}, "exceptionDetails": {
+                "text": "Uncaught", "exception": {"description": "SyntaxError: x"}}}}).encode())]
+
+        def error(request):
+            return [frame(0x1, json.dumps({"id": 1, "error": {"code": -32603, "message": "Internal error"}}).encode())]
+        for steam, text in ((self.fake(threw), "the script failed in Steam: SyntaxError: x"),
+                            (self.fake(error), "DevTools error: Internal error"),
+                            (self.fake(answer(1), title="Other"), "SharedJSContext page was not found"),
+                            (self.fake(answer(1), accept="bad"), "does not match")):
+            with self.assertRaisesRegex(cdp.CdpError, text) as caught:
+                cdp.evaluate("x", port=steam.port)
+            self.assertFalse(caught.exception.maybe_ran, text)
+
+    def test_only_steams_own_pages(self):
+        good = page("SharedJSContext", SJC, 8080)
+        self.assertEqual(cdp.shared_context_path([good]), f"/devtools/page/{SJC}")
+        # The advertised host is never used: only the page id goes into the path.
+        self.assertEqual(cdp.shared_context_path([dict(good, webSocketDebuggerUrl=None)]), f"/devtools/page/{SJC}")
+        for bad in (dict(good, type="service_worker"), dict(good, url="https://example.com/"),
+                    dict(good, id="../../x"), dict(good, webSocketDebuggerUrl="ws://192.0.2.1/devtools/page/OTHER")):
+            with self.assertRaisesRegex(cdp.CdpError, "not found"):
+                cdp.shared_context_path([bad])
 
     def test_remote_debugging_off(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()  # nothing listens there
-        with self.assertRaisesRegex(cdp.CdpError, "not reachable"):
+        with self.assertRaisesRegex(cdp.CdpError, "not reachable") as caught:
             cdp.evaluate("x", port=port)
+        self.assertFalse(caught.exception.maybe_ran)
 
     def test_silent_steam_times_out(self):
         def silent(request):
             return []
-        with self.assertRaisesRegex(cdp.CdpError, "in time"):
+        with self.assertRaisesRegex(cdp.CdpError, "in time") as caught:
             cdp.evaluate("x", port=self.fake(silent).port, timeout=0.5)
+        self.assertTrue(caught.exception.maybe_ran)  # the request was out: it may have run
 
 
 if __name__ == "__main__":
