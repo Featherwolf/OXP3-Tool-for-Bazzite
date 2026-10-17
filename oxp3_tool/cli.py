@@ -10,7 +10,7 @@ import textwrap
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import PROJECT_URL, __version__, diagnose, templates
+from . import PROJECT_URL, __version__, diagnose, steam_session, templates
 from .detect import NATIVE_STEAM, OGUI, Context
 from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
 from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix
@@ -268,6 +268,7 @@ def cmd_apply(ctx: Context, state: State, args: argparse.Namespace) -> int:
         "keyboard_key": args.keyboard_key,
         "onex_key": args.onex_key,
         "xbox_key": args.xbox_key,
+        "fps_limit": args.fps_limit,
         "min_refresh": args.min_refresh,
         "any_ssd": args.any_ssd,
         "restart": not args.no_restart,
@@ -394,7 +395,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--keyboard-key", choices=actions,
                    help="buttons: action for the keyboard key (default keyboard)")
     a.add_argument("--onex-key", choices=actions, help="buttons: action for the ONEX key (default quick-access)")
-    a.add_argument("--xbox-key", choices=actions, help="buttons: action for the Xbox key (default guide)")
+    a.add_argument("--xbox-key", choices=actions,
+                   help="buttons: action for the Xbox key, also for the xbox-key helper (default guide)")
+    a.add_argument("--fps-limit", type=int, choices=range(steam_session.MIN_FPS_LIMIT, steam_session.MAX_FPS_LIMIT + 1),
+                   metavar=f"{{{steam_session.MIN_FPS_LIMIT}..{steam_session.MAX_FPS_LIMIT}}}",
+                   help=f"buttons: frame limit the fps-limit action sets (default {steam_session.DEFAULT_FPS_LIMIT})")
     a.add_argument("--no-restart", action="store_true", help="buttons: do not restart InputPlumber")
     a.add_argument("--min-refresh", type=int, choices=range(templates.PANEL_MIN_HZ, templates.LEGIONGO2_MIN_HZ + 1),
                    metavar=f"{{{templates.PANEL_MIN_HZ}..{templates.LEGIONGO2_MIN_HZ}}}",

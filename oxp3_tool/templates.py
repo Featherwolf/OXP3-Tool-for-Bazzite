@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import inspect
+import json
+import re
+from types import ModuleType
 from typing import Optional
 
-from . import PROJECT_URL
+from . import PROJECT_URL, steam_session
 
 # First-line marker of every file this tool writes.
 OWN_MARKER = "Installed by oxp3-tool ("
@@ -21,34 +24,42 @@ OWN_MARKER = "Installed by oxp3-tool ("
 #   Deck target, QuickAccess2 opens the OGUI menu, and LeftTop becomes
 #   Guide+North, so the keyboard action is sent as LeftTop there.
 # The Steam Deck target turns Screenshot into Steam+R1 by itself in both.
-# With native Steam Input the keyboard action does not use Steam+X at all
-# (it does nothing on some setups): it becomes the InputPlumber D-Bus action
-# OSK_DBUS_ACTION, which the OSK helper (osk_helper.py) turns into
-# steam://open/keyboard. "keyboard-chord" keeps the Steam+X route.
+# Some actions are not a button at all: the capability map sends them as an
+# InputPlumber D-Bus action (steam_session.DBUS_ACTIONS), which the Steam
+# actions helper (steam_actions.py) carries out as the Steam user. With native
+# Steam Input that includes the keyboard action, because Steam+X does nothing
+# on some setups; "keyboard-chord" keeps the Steam+X route.
 OGUI_SESSION = "ogui"
 OSK_ACTION = "keyboard"
-OSK_DBUS_ACTION = "ui_osk"
+HOME_ACTION = "home"
+FPS_ACTION = "fps-limit"
+DBUS_ACTIONS = steam_session.DBUS_ACTIONS
 
 # User-facing action name -> (button, button under the OGUI overlay, description)
 BUTTON_ACTIONS: dict[str, tuple[str, str, str]] = {
-    "guide": ("Guide", "Guide", "Steam button (opens the Steam menu)"),
+    "guide": ("Guide", "Guide", "Steam button (opens the Steam menu; hold it for Steam+button shortcuts)"),
     "quick-access": ("QuickAccess", "QuickAccess", "Quick Access menu (the '...' button)"),
     OSK_ACTION: ("Keyboard", "LeftTop", "Steam on-screen keyboard (native Steam Input: through oxp3-tool's helper)"),
     "keyboard-chord": ("Keyboard", "LeftTop", "Steam on-screen keyboard through the Steam+X shortcut (no helper)"),
+    HOME_ACTION: ("", "", "Steam Home screen (through oxp3-tool's helper)"),
+    FPS_ACTION: ("", "", "turn the frame limit on or off (--fps-limit, default 72; through oxp3-tool's helper)"),
     "screenshot": ("Screenshot", "Screenshot", "Steam screenshot"),
     "ogui-menu": ("QuickAccess2", "QuickAccess2",
                   "OpenGamepadUI menu (with native Steam Input this takes a screenshot instead)"),
 }
 
 
-def uses_osk_helper(action: str, session: Optional[str]) -> bool:
-    return action == OSK_ACTION and session != OGUI_SESSION
+def uses_helper(action: str, session: Optional[str]) -> bool:
+    """Whether ``action`` goes to the Steam actions helper in this Game Mode session."""
+    if action == OSK_ACTION:
+        return session != OGUI_SESSION
+    return action in (HOME_ACTION, FPS_ACTION)
 
 
 def action_target(action: str, session: Optional[str]) -> tuple[str, str]:
     """("gamepad", button) or ("dbus", action) that ``action`` is sent as."""
-    if uses_osk_helper(action, session):
-        return ("dbus", OSK_DBUS_ACTION)
+    if uses_helper(action, session):
+        return ("dbus", DBUS_ACTIONS[action])
     native, ogui, _ = BUTTON_ACTIONS[action]
     return ("gamepad", ogui if session == OGUI_SESSION else native)
 
@@ -98,8 +109,8 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
         f"# Written for Game Mode with {mode}; apply again after switching.",
         "# " + ", ".join(f"{k}: {actions.get(k, DEFAULT_BUTTON_ACTIONS[k])}" for k in BUTTON_KEYS),
     ]
-    if any(uses_osk_helper(a, session) for a in actions.values()):
-        lines.append(f"# dbus: {OSK_DBUS_ACTION} goes to {OSK_KEY_UNIT_NAME}, which asks Steam to open its keyboard.")
+    if any(uses_helper(a, session) for a in actions.values()):
+        lines.append(f"# dbus: targets go to {STEAM_ACTIONS_UNIT_NAME}, which carries them out in Steam.")
     if upstream_path:
         lines.append(f"# Stock map: {upstream_path}" + (f" (sha256 {upstream_sha256})" if upstream_sha256 else ""))
     lines += [
@@ -152,7 +163,26 @@ evdev:atkbd:dmi:bvn*:bvr*:bd*:svnONE-NETBOOK:pnONEXPLAYER3:*
 VOLUME_SCANCODES = {0xAE, 0xB0}
 
 
-# -- Xbox key helper -------------------------------------------------------------
+# -- helper scripts ------------------------------------------------------------
+
+_RELATIVE_IMPORT_RE = re.compile(r"^from \.\w+ import [^\n(]+$", re.M)
+_FUTURE = "from __future__ import annotations\n"
+
+
+def _bundle(remove_with: str, *modules: ModuleType) -> str:
+    """One standalone script from ``modules`` (dependencies first) behind a shebang and our marker."""
+    parts = []
+    for module in modules:
+        source = inspect.getsource(module).replace(_FUTURE, "", 1)
+        parts.append(_RELATIVE_IMPORT_RE.sub("", source))
+    return (
+        "#!/usr/bin/python3 -I\n"
+        f"# Installed by oxp3-tool ({PROJECT_URL}).\n"
+        f"# {remove_with}\n"
+        + _FUTURE
+        + "\n".join(parts)
+    )
+
 
 XBOX_KEY_HELPER_PATH = "/usr/local/libexec/oxp3-tool/xbox-key-helper"
 XBOX_KEY_UNIT_NAME = "oxp3-tool-xbox-key.service"
@@ -160,78 +190,29 @@ XBOX_KEY_UNIT_PATH = f"/etc/systemd/system/{XBOX_KEY_UNIT_NAME}"
 
 
 def xbox_key_helper_script() -> str:
-    """The standalone helper script: oxp3_tool/xbox_helper.py behind a shebang and our marker."""
     from . import xbox_helper
 
-    return (
-        "#!/usr/bin/python3 -I\n"
-        f"# Installed by oxp3-tool ({PROJECT_URL}).\n"
-        "# Remove with `sudo oxp3-tool revert xbox-key`.\n"
-        + inspect.getsource(xbox_helper)
-    )
+    return _bundle("Remove with `sudo oxp3-tool revert xbox-key`.", steam_session, xbox_helper)
 
 
+# ProtectHome=read-only, not yes, for helpers that act in the Steam user's
+# session: they write to the FIFO ~/.steam/steam.pipe (allowed on a read-only
+# mount) and connect to gamescope's socket in /run/user, and on Bazzite /home
+# is a symlink to /var/home, which ProtectHome=yes also hides.
 XBOX_KEY_UNIT = f"""\
 # Installed by oxp3-tool ({PROJECT_URL}).
 # Remove with `sudo oxp3-tool revert xbox-key`.
 #
-# Reads the ONEXPLAYER 3 controller's vendor interface (read-only) and sends the
-# Steam button to InputPlumber when the Xbox key reports as button 0x25.
+# Reads the ONEXPLAYER 3 controller's vendor interface (read-only) and, when the
+# Xbox key reports as button 0x25, does what `oxp3-tool apply buttons --xbox-key`
+# chose (the Steam button by default).
 [Unit]
-Description=ONEXPLAYER 3 Xbox key as the Steam button (oxp3-tool)
+Description=ONEXPLAYER 3 Xbox key helper (oxp3-tool)
 After=inputplumber.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -I {XBOX_KEY_HELPER_PATH}
-Restart=always
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
-# -- on-screen keyboard helper ------------------------------------------------
-
-OSK_KEY_HELPER_PATH = "/usr/local/libexec/oxp3-tool/osk-key-helper"
-OSK_KEY_UNIT_NAME = "oxp3-tool-osk-key.service"
-OSK_KEY_UNIT_PATH = f"/etc/systemd/system/{OSK_KEY_UNIT_NAME}"
-
-
-def osk_key_helper_script() -> str:
-    """The standalone helper script: oxp3_tool/osk_helper.py behind a shebang and our marker."""
-    from . import osk_helper
-
-    return (
-        "#!/usr/bin/python3 -I\n"
-        f"# Installed by oxp3-tool ({PROJECT_URL}).\n"
-        "# Remove with `sudo oxp3-tool revert buttons`, or choose another keyboard action with\n"
-        "# `sudo oxp3-tool apply buttons --keyboard-key=...`.\n"
-        + inspect.getsource(osk_helper)
-    )
-
-
-# ProtectHome=read-only, not yes: the helper writes to the FIFO
-# ~/.steam/steam.pipe (allowed on a read-only mount), and on Bazzite /home is
-# a symlink to /var/home, which ProtectHome=yes also hides.
-OSK_KEY_UNIT = f"""\
-# Installed by oxp3-tool ({PROJECT_URL}).
-# Remove with `sudo oxp3-tool revert buttons`.
-#
-# Opens Steam's on-screen keyboard when InputPlumber sends the D-Bus action
-# {OSK_DBUS_ACTION} (the ONEXPLAYER 3 keyboard key with native Steam Input).
-[Unit]
-Description=ONEXPLAYER 3 keyboard key opens Steam's on-screen keyboard (oxp3-tool)
-After=dbus.service inputplumber.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 -I {OSK_KEY_HELPER_PATH}
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
@@ -242,6 +223,51 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 """
+
+
+STEAM_ACTIONS_HELPER_PATH = "/usr/local/libexec/oxp3-tool/steam-actions-helper"
+STEAM_ACTIONS_UNIT_NAME = "oxp3-tool-steam-actions.service"
+STEAM_ACTIONS_UNIT_PATH = f"/etc/systemd/system/{STEAM_ACTIONS_UNIT_NAME}"
+
+
+def steam_actions_helper_script() -> str:
+    from . import steam_actions
+
+    return _bundle("Remove with `sudo oxp3-tool revert buttons`, or give the keys other actions with "
+                   "`sudo oxp3-tool apply buttons ...`.", steam_session, steam_actions)
+
+
+STEAM_ACTIONS_UNIT = f"""\
+# Installed by oxp3-tool ({PROJECT_URL}).
+# Remove with `sudo oxp3-tool revert buttons`.
+#
+# Carries out the InputPlumber D-Bus actions the ONEXPLAYER 3 keys are mapped to
+# ({", ".join(sorted(DBUS_ACTIONS.values()))}): Steam's on-screen keyboard, its Home
+# screen, the frame limit.
+[Unit]
+Description=ONEXPLAYER 3 keys: Steam keyboard, Home screen and frame limit (oxp3-tool)
+After=dbus.service inputplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I {STEAM_ACTIONS_HELPER_PATH}
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+KEYS_CONFIG_PATH = steam_session.KEYS_CONFIG
+
+
+def keys_config_json(actions: dict[str, str], session: Optional[str], fps_limit: int) -> str:
+    """Settings the helpers read on each press: the Xbox key's action (for the 0x25 helper) and the frame limit."""
+    return json.dumps({"xbox": actions["xbox"], "session": session, "fps_limit": fps_limit}, sort_keys=True) + "\n"
 
 
 # Table key of oxp3-tool's known display in the gamescope Lua (gamescope logs

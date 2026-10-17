@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import osk_helper, templates, xbox_helper
+from . import steam_actions, steam_session, templates, xbox_helper
 from .detect import IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
 from .system import sha256_bytes
 
@@ -161,29 +161,42 @@ def _daemon_reload() -> PostStep:
     return PostStep("daemon-reload", ["systemctl", "daemon-reload"], "reload systemd units", order=10)
 
 
-def _helper_live_state(ctx: Context, entry: Optional[dict[str, Any]], unit: str, failed: str, warning: str,
-                       wanted: dict[str, bytes], fix_id: str, ok: str = "") -> list[str]:
-    """Status of a helper service: unit state, delivery failures this boot, stale files.
-
-    With ``ok`` (a success line the helper logs) only a failure after the last success is reported.
-    """
+def _helper_live_state(ctx: Context, entry: Optional[dict[str, Any]], unit: str, warning: str,
+                       wanted: dict[str, bytes], fix_id: str) -> list[str]:
+    """Status of a helper service: unit state, whether its last action failed, stale files."""
     state = ctx.unit_state(unit) or "unknown"
     line = f"{unit} is {state}"
     if state != "active":
         line += f"; see `journalctl -u {unit}`"
     lines = [line]
-    # Both markers are plain text, so they are safe in journalctl's regular expression.
     res = ctx.sys.run(["journalctl", "-u", unit, "-b", "0", "--no-pager", "-q", "-o", "cat", "-r",
-                       "--grep", f"{failed}|{ok}" if ok else failed, "-n", "1"], timeout=30)
-    if failed in res.stdout:
-        lines.append(f"warning: {warning} this boot; see `journalctl -u {unit}`")
+                       "--grep", steam_session.OUTCOME_GREP, "-n", "1"], timeout=30)
+    if res.stdout.startswith("failed: "):
+        lines.append(f"warning: {warning} ({res.stdout.strip()[8:][:120]}); see `journalctl -u {unit}`")
     recorded = {r["path"]: r.get("sha256") for r in (entry or {}).get("files", [])}
     if any(recorded.get(p) == ctx.sys.sha256(p) != sha256_bytes(c) for p, c in wanted.items()):
         lines.append(f"installed by an older oxp3-tool; run `sudo oxp3-tool apply {fix_id}` to update it")
     return lines
 
 
+def _hold_warnings(actions: dict[str, str], xbox_by_helper: bool) -> list[str]:
+    """What is lost when no key opens the Steam menu, or none can be held for Steam's shortcuts."""
+    steam = [k for k, a in actions.items() if a == "guide"]
+    if not steam:
+        return ["No key opens the Steam menu now (exiting a game, the power menu and Steam's settings live "
+                "there); give one key `guide`, for example `--xbox-key guide`."]
+    # The keys InputPlumber reads pass holds through; the Xbox key helper can only tap.
+    if all(k == "xbox" and xbox_by_helper for k in steam):
+        return ["Only the Xbox key opens the Steam menu, and it can only tap: Steam's hold shortcuts "
+                "(Steam+R1 screenshot, Steam+L1 magnifier, holding Steam+B to quit a game, Steam+left stick "
+                "brightness) are gone. `--home guide` brings them back."]
+    return []
+
+
 # -- controller ----------------------------------------------------------------
+
+FPS = templates.FPS_ACTION
+
 
 
 class ButtonsFix(Fix):
@@ -203,15 +216,24 @@ class ButtonsFix(Fix):
         "Defaults: ONEX/console -> Quick Access, keyboard key -> Steam on-screen keyboard,\n"
         "home -> Steam menu, Xbox key -> Steam menu (as stock). Choose others with\n"
         "--onex-key, --keyboard-key, --home and --xbox-key (guide, quick-access, keyboard,\n"
-        "keyboard-chord, screenshot, ogui-menu).\n"
-        "With native Steam Input the keyboard action skips Steam's Steam+X shortcut,\n"
-        "which does nothing on some setups: a small helper service\n"
-        f"({templates.OSK_KEY_UNIT_NAME}) asks Steam directly to open its keyboard\n"
-        "(steam://open/keyboard, as HHD does). keyboard-chord sends Steam+X instead.\n"
+        "keyboard-chord, home, fps-limit, screenshot, ogui-menu; `oxp3-tool list` ends\n"
+        "with what each does). --xbox-key also sets what the xbox-key helper does.\n"
+        "Some actions are not a button: a small helper service\n"
+        f"({templates.STEAM_ACTIONS_UNIT_NAME}) carries them out as your user.\n"
+        "- keyboard (native Steam Input) asks Steam directly to open its keyboard\n"
+        "  (steam://open/keyboard, as HHD does), because Steam's Steam+X shortcut does\n"
+        "  nothing on some setups; keyboard-chord sends Steam+X instead.\n"
+        "- home takes Game Mode to its Home screen (steam://open/library).\n"
+        "- fps-limit turns gamescope's frame limit off when one is on, else sets\n"
+        "  --fps-limit (default 72; 72, 48, 36 and 24 keep the 144 Hz panel mode with\n"
+        "  VRR off). Steam is not told: Quick Access keeps showing its own setting, and\n"
+        "  Steam's next change (a game starting, the slider) replaces it.\n"
+        "Only the Steam button can be held for Steam+button shortcuts, and the\n"
+        "xbox-key helper can only tap, so keep guide on Home to keep them.\n"
         "Check each key with `inputplumber device 0 test` (press q to quit; closing the\n"
         "window instead leaves InputPlumber in test mode until\n"
         "`sudo systemctl restart inputplumber`). A key that goes to the helper shows\n"
-        f"nothing there; `journalctl -u {templates.OSK_KEY_UNIT_NAME} -f` logs its presses.\n"
+        f"nothing there; `journalctl -u {templates.STEAM_ACTIONS_UNIT_NAME} -f` logs its presses.\n"
         "Your choice is kept when you apply again\n"
         "(--defaults resets it). Apply again after `ujust configure-opengamepadui` switches\n"
         "Game Mode input. The override replaces the whole stock map, so it is only\n"
@@ -219,7 +241,7 @@ class ButtonsFix(Fix):
         "InputPlumber is restarted when the map changes."
     )
     takes_effect = "immediately (InputPlumber restarts when the map changes; restart Steam if buttons do nothing)"
-    OSK_UNIT = templates.OSK_KEY_UNIT_NAME
+    STEAM_UNIT = templates.STEAM_ACTIONS_UNIT_NAME
 
     def check(self, ctx: Context) -> Check:
         hhd = ctx.hhd
@@ -258,6 +280,9 @@ class ButtonsFix(Fix):
                          ("xbox", "xbox_key")):
             if opts.get(opt):
                 actions[key] = opts[opt]
+        fps = opts.get("fps_limit") or prev.get("fps_limit")
+        if not (isinstance(fps, int) and steam_session.MIN_FPS_LIMIT <= fps <= steam_session.MAX_FPS_LIMIT):
+            fps = steam_session.DEFAULT_FPS_LIMIT
         if not (ip.upstream_map and ip.map_id):
             raise FixError("InputPlumber's stock OXP3 capability map was not found")
         upstream_name = ip.upstream_map.rsplit("/", 1)[-1]
@@ -267,8 +292,10 @@ class ButtonsFix(Fix):
         map_path = f"{IP_ETC_CAPABILITY_MAPS}/{upstream_name}"
         restart = opts.get("restart", True)
         plan = Plan(
-            files=[FileSpec(map_path, content.encode())],
-            options={"actions": actions},
+            files=[FileSpec(map_path, content.encode()),
+                   FileSpec(templates.KEYS_CONFIG_PATH, templates.keys_config_json(actions, session, fps).encode())],
+            options={"actions": actions, **({"fps_limit": fps} if fps != steam_session.DEFAULT_FPS_LIMIT
+                                            or "fps_limit" in prev else {})},
             notes={"upstream_map": ip.upstream_map, "upstream_sha256": upstream_sha, "map_id": ip.map_id,
                    "game_mode_input": session},
             # Without the restart InputPlumber keeps the old map, which may still need a dropped helper.
@@ -293,36 +320,46 @@ class ButtonsFix(Fix):
                 f"The stock map differs from the 0.82.0 one this override was written for; compare with "
                 f"`diff {ip.upstream_map} {IP_ETC_CAPABILITY_MAPS}/{upstream_name}`."
             )
-        if any(templates.uses_osk_helper(a, session) for a in actions.values()):
-            if not ctx.sys.exists(osk_helper.BUSCTL):
-                raise FixError(f"{osk_helper.BUSCTL} is missing, which the on-screen keyboard helper needs; "
-                               "choose keyboard-chord for that key instead")
+        helped = [k for k, a in actions.items() if templates.uses_helper(a, session)]
+        if helped:
+            if not ctx.sys.exists(steam_actions.BUSCTL):
+                raise FixError(f"{steam_actions.BUSCTL} is missing, which the helper for "
+                               f"{', '.join(helped)} needs; choose button actions for those keys "
+                               "(keyboard-chord for the keyboard key)")
             plan.files += [
-                FileSpec(templates.OSK_KEY_HELPER_PATH, templates.osk_key_helper_script().encode(), 0o755),
-                FileSpec(templates.OSK_KEY_UNIT_PATH, templates.OSK_KEY_UNIT.encode()),
+                FileSpec(templates.STEAM_ACTIONS_HELPER_PATH, templates.steam_actions_helper_script().encode(),
+                         0o755),
+                FileSpec(templates.STEAM_ACTIONS_UNIT_PATH, templates.STEAM_ACTIONS_UNIT.encode()),
             ]
-            plan.enable_units.append(self.OSK_UNIT)
+            plan.enable_units.append(self.STEAM_UNIT)
             plan.post += [
                 _daemon_reload(),
-                PostStep("restart-osk-key", ["systemctl", "restart", self.OSK_UNIT],
-                         "start the on-screen keyboard helper", order=70),
+                PostStep("restart-steam-actions", ["systemctl", "restart", self.STEAM_UNIT],
+                         "start the Steam actions helper", order=70),
             ]
+        if FPS in actions.values() and not ctx.sys.exists(steam_session.GAMESCOPECTL):
+            plan.messages.append(f"{steam_session.GAMESCOPECTL} is missing, so the fps-limit action cannot work.")
+        plan.messages += _hold_warnings(actions, ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH))
+        installed = ctx.sys.read_text(templates.XBOX_KEY_UNIT_PATH)
+        if actions["xbox"] in xbox_helper.STEAM_ACTIONS and installed not in (None, templates.XBOX_KEY_UNIT):
+            plan.messages.append("The xbox-key helper is from an older oxp3-tool and cannot do this yet; run "
+                                 "`sudo oxp3-tool apply xbox-key` to update it.")
         return plan
 
     def after_apply(self, ctx: Context) -> list[str]:
-        if not ctx.sys.exists(templates.OSK_KEY_UNIT_PATH):
+        if not ctx.sys.exists(templates.STEAM_ACTIONS_UNIT_PATH):
             return []
-        state = ctx.unit_state(self.OSK_UNIT)
+        state = ctx.unit_state(self.STEAM_UNIT)
         if state != "active":
-            return [f"{self.OSK_UNIT} is {state or 'not running'}; see `journalctl -u {self.OSK_UNIT}`"]
+            return [f"{self.STEAM_UNIT} is {state or 'not running'}; see `journalctl -u {self.STEAM_UNIT}`"]
         return []
 
     def revert_post(self, ctx: Context) -> list[PostStep]:
         steps = [_restart_inputplumber()]
-        if ctx.unit_state(self.OSK_UNIT) in ("active", "activating", "reloading"):
+        if ctx.unit_state(self.STEAM_UNIT) in ("active", "activating", "reloading"):
             steps += [
-                PostStep("stop-osk-key", ["systemctl", "stop", self.OSK_UNIT],
-                         "stop the on-screen keyboard helper", order=5),
+                PostStep("stop-steam-actions", ["systemctl", "stop", self.STEAM_UNIT],
+                         "stop the Steam actions helper", order=5),
                 _daemon_reload(),
             ]
         return steps
@@ -351,13 +388,13 @@ class ButtonsFix(Fix):
                          "Steam Input, or an older oxp3-tool); run `sudo oxp3-tool apply buttons` again")
         if restart_pending(ctx, entry.get("notes", {})):
             lines.append("InputPlumber has not been restarted since; reboot or run `sudo oxp3-tool apply buttons`")
-        if any(r.get("path") == templates.OSK_KEY_UNIT_PATH for r in entry.get("files", [])):
+        if any(r.get("path") == templates.STEAM_ACTIONS_UNIT_PATH for r in entry.get("files", [])):
             lines += _helper_live_state(
-                ctx, entry, self.OSK_UNIT, osk_helper.SEND_FAILED,
-                "the last keyboard request could not be handed to Steam",
-                {templates.OSK_KEY_HELPER_PATH: templates.osk_key_helper_script().encode(),
-                 templates.OSK_KEY_UNIT_PATH: templates.OSK_KEY_UNIT.encode()}, "buttons",
-                ok=osk_helper.SENT_GREP)
+                ctx, entry, self.STEAM_UNIT, "the helper's last action failed",
+                {templates.STEAM_ACTIONS_HELPER_PATH: templates.steam_actions_helper_script().encode(),
+                 templates.STEAM_ACTIONS_UNIT_PATH: templates.STEAM_ACTIONS_UNIT.encode()}, "buttons")
+        if actions:
+            lines += [f"warning: {w}" for w in _hold_warnings(actions, ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH))]
         for user in ctx.steam_screen_reader_users:
             lines.append(f"warning: Steam's screen reader is on for {user}; it replaces the Steam button shortcuts "
                          "(Steam+X keyboard, Steam+R1 screenshot). See README > Common problems to turn it off")
@@ -373,8 +410,8 @@ class XboxKeyFix(Fix):
     id = "xbox-key"
     group = CONTROLLER
     level = OPTIONAL
-    title = "Xbox key as the Steam button"
-    summary = "Helper that makes the Xbox key (vendor button 0x25) tap the Steam button"
+    title = "Xbox key works (as the Steam button, or what --xbox-key chose)"
+    summary = "Helper that gives the Xbox key (vendor button 0x25) a job"
     details = (
         "On some OXP3 units the controller reports the Xbox key (the lit logo key below\n"
         "Home) only on its vendor interface, as button 0x25. InputPlumber 0.82 cannot\n"
@@ -383,14 +420,16 @@ class XboxKeyFix(Fix):
         "controller (OneXConsole on Windows can change it); on others the key arrives as\n"
         "the normal Xbox guide button and works without this fix.\n"
         "This installs a small helper and a systemd service that read that interface\n"
-        "(read-only: nothing is written to the controller) and, on each press, ask\n"
-        "InputPlumber over D-Bus for a Steam button tap (opens the Steam menu). Holding\n"
-        "the key for Steam+button shortcuts does not work this way (InputPlumber 0.82's\n"
-        "hold-capable D-Bus call is broken); use Home for those.\n"
+        "(read-only: nothing is written to the controller). On each press the helper\n"
+        "does what `oxp3-tool apply buttons --xbox-key` chose, read from\n"
+        f"{templates.KEYS_CONFIG_PATH} (the Steam button when buttons is not applied):\n"
+        "a button tap through InputPlumber over D-Bus, or a Steam action as your user\n"
+        "(keyboard, home, fps-limit). The key can only tap: holding it for Steam+button\n"
+        "shortcuts does not work (InputPlumber 0.82's hold-capable D-Bus call is\n"
+        "broken); use Home for those.\n"
         f"Files: {templates.XBOX_KEY_HELPER_PATH} and {templates.XBOX_KEY_UNIT_PATH}.\n"
         "Recommended when InputPlumber's log shows button 25 this boot (press the key\n"
-        "once, then run `sudo oxp3-tool status`). The key always sends the Steam button\n"
-        "here; --xbox-key does not apply to it."
+        "once, then run `sudo oxp3-tool status`)."
     )
     takes_effect = "immediately"
     UNIT = templates.XBOX_KEY_UNIT_NAME
@@ -433,7 +472,7 @@ class XboxKeyFix(Fix):
         if state != "active":
             return [f"{self.UNIT} is {state or 'not running'}; see `journalctl -u {self.UNIT}`"]
         return ["Press the Xbox key in Game Mode; if nothing happens, `sudo oxp3-tool status` shows "
-                "whether the helper could reach InputPlumber."]
+                "whether the helper's last action failed."]
 
     def revert_post(self, ctx: Context) -> list[PostStep]:
         return [
@@ -443,8 +482,7 @@ class XboxKeyFix(Fix):
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
         return _helper_live_state(
-            ctx, entry, self.UNIT, xbox_helper.SEND_FAILED,
-            "the helper could not deliver the Xbox key to InputPlumber",
+            ctx, entry, self.UNIT, "the last Xbox key press failed",
             {templates.XBOX_KEY_HELPER_PATH: templates.xbox_key_helper_script().encode(),
              templates.XBOX_KEY_UNIT_PATH: templates.XBOX_KEY_UNIT.encode()}, self.id)
 

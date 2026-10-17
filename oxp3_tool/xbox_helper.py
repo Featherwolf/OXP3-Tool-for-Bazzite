@@ -1,16 +1,21 @@
-"""Turn the ONEXPLAYER 3 Xbox key into the Steam button for InputPlumber.
+"""Give the ONEXPLAYER 3 Xbox key a job when InputPlumber cannot read it.
 
 On some OXP3 units the controller MCU reports the Xbox key only on its vendor
 HID interface, as button 0x25 (frame ``b2 3f 01 01 1f 80 25 ...``), and
 InputPlumber 0.82 cannot decode that id, so the key does nothing. This helper
 reads the same vendor interface (read-only: it never writes to the controller)
-and, on each press, asks InputPlumber's ONEXPLAYER 3 composite device over
-D-Bus for a Steam button tap (SendButtonChord: press, then release 80 ms
-later). SendEvent, which could hold the button, panics inside InputPlumber
-0.82 (blocking_send on a tokio worker), so holds are not possible this way.
+and, on each press, does what the buttons fix chose for the Xbox key
+(/etc/oxp3-tool/keys.json, read on every press; the Steam button without it):
+- a button tap or chord through InputPlumber's ONEXPLAYER 3 composite device
+  over D-Bus (SendButtonChord: press, then release 80 ms later). SendEvent,
+  which could hold a button, panics inside InputPlumber 0.82
+  (blocking_send on a tokio worker), so holds are not possible this way;
+- or a Steam action as the Steam user (steam_session.py): the on-screen
+  keyboard, the Home screen, the frame limit toggle.
 
-The xbox-key fix installs this file as a standalone script and runs it as a
-systemd service. It only uses the standard library and busctl.
+The xbox-key fix installs this file, bundled with steam_session.py, as a
+standalone script and runs it as a systemd service. It only uses the standard
+library, busctl and gamescopectl.
 """
 
 from __future__ import annotations
@@ -20,29 +25,43 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import time
 from typing import Optional
+
+from .steam_session import KEYS_CONFIG, URLS, Actions, key_config, log
 
 VENDOR = "1A86"
 PRODUCT = "FE00"
 INTERFACE = 2
 BUTTON = 0x25
-EVENT = "Gamepad:Button:Guide"
 DEVICE_NAME = "ONEXPLAYER 3"
 BUS = "org.shadowblip.InputPlumber"
 IFACE = "org.shadowblip.Input.CompositeDevice"
 BUSCTL = "/usr/bin/busctl"
 PACKET_SIZE = 64
 RETRY_SECONDS = 2.0
-# Logged when a press could not be delivered; oxp3-tool status looks for it.
-SEND_FAILED = "could not send the Steam button to InputPlumber"
+MIN_INTERVAL = 0.3  # seconds between two Steam actions (the frame limit toggles)
+SEND_FAILED = "could not send the button to InputPlumber"
+OGUI_SESSION = "ogui"
+# Buttons InputPlumber's Steam Deck target gets for each action. They skip
+# InputPlumber's profile, so the keyboard chord is spelled out as Steam+X; the
+# target itself turns Screenshot into Steam+R1.
+CHORDS = {
+    "guide": ["Guide"],
+    "quick-access": ["QuickAccess"],
+    "screenshot": ["Screenshot"],
+    "keyboard-chord": ["Guide", "North"],
+    "ogui-menu": ["QuickAccess2"],
+}
+STEAM_ACTIONS = set(URLS) | {"fps-limit"}
 
 _COMPOSITE_RE = re.compile(r"^/org/shadowblip/InputPlumber/CompositeDevice\d+$")
 
 
-def log(message: str) -> None:
-    print(message, file=sys.stderr, flush=True)
+def chord_for(action: str, session: object) -> list[str]:
+    if action == "ogui-menu" and session != OGUI_SESSION:
+        return ["Screenshot"]  # what the OGUI menu key does with native Steam Input
+    return CHORDS.get(action, CHORDS["guide"])
 
 
 def find_hidraw(root: str = "/") -> Optional[str]:
@@ -107,23 +126,41 @@ def find_composite() -> Optional[str]:
 
 
 class Sender:
-    def __init__(self) -> None:
+    def __init__(self, actions: Optional[Actions] = None, config_path: str = KEYS_CONFIG) -> None:
         self.path: Optional[str] = None
         self.pressed = False  # the key's state from the frames
+        self.config_path = config_path
+        self.actions = actions or Actions(config_path=config_path)
+        self.last = float("-inf")
 
     def send(self, pressed: bool) -> None:
         was, self.pressed = self.pressed, pressed
         if not pressed or was:
-            return  # the tap already includes the release
+            return  # a tap already includes the release
+        config = key_config(self.config_path)
+        action = config.get("xbox")
+        if not isinstance(action, str):
+            action = "guide"
+        if action in STEAM_ACTIONS:
+            now = time.monotonic()
+            if now - self.last >= MIN_INTERVAL:
+                self.last = now
+                self.actions.perform(action)
+            return
+        self.send_chord(chord_for(action, config.get("session")))
+
+    def send_chord(self, buttons: list[str]) -> None:
+        events = [f"Gamepad:Button:{b}" for b in buttons]
         for _ in range(2):
             if self.path is None:
                 self.path = find_composite()
                 if self.path is None:
                     break
-            if busctl("call", BUS, self.path, IFACE, "SendButtonChord", "as", "1", EVENT) is not None:
+            if busctl("call", BUS, self.path, IFACE, "SendButtonChord", "as", str(len(events)), *events) is not None:
+                log(f"ok: sent {'+'.join(buttons)}")
                 return
             self.path = None  # InputPlumber restarted: look the device up again
-        log(SEND_FAILED)
+        log(f"failed: {SEND_FAILED}")
 
 
 def run() -> int:
@@ -150,7 +187,7 @@ def run() -> int:
                 time.sleep(RETRY_SECONDS)
                 continue
             if announced != node:
-                log(f"reading {node}; the Xbox key (button 0x{BUTTON:02x}) sends {EVENT}")
+                log(f"reading {node} for the Xbox key (button 0x{BUTTON:02x})")
                 announced = node
             try:
                 while True:
@@ -168,4 +205,4 @@ def run() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(run())
+    raise SystemExit(run())

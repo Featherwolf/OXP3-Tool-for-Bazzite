@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from oxp3_tool.fixes import BY_ID
 from .fakeroot import FakeOxp3
 
 ROOT = Path(__file__).resolve().parent.parent
+NO_CONFIG = "/nonexistent/oxp3-tool/keys.json"
 
 # Frames from a real OXP3 (InputPlumber's log): the Xbox key as vendor button 0x25.
 XBOX_PRESS = bytes.fromhex("b23f01011f802502016f00000100000000") + bytes(45) + b"\x3f\xb2"
@@ -62,8 +64,8 @@ class HelperTest(unittest.TestCase):
             return None
 
         replies["tree"].append("/org/shadowblip/InputPlumber/CompositeDevice1\n")
-        with mock.patch.object(xbox_helper, "busctl", fake_busctl):
-            sender = xbox_helper.Sender()
+        with mock.patch.object(xbox_helper, "busctl", fake_busctl), contextlib.redirect_stderr(io.StringIO()):
+            sender = xbox_helper.Sender(config_path=NO_CONFIG)
             sender.send(True)
         sends = [c for c in calls if c[0] == "call"]
         self.assertEqual(len(sends), 2)  # first failed (InputPlumber restarted), looked up again, sent
@@ -83,8 +85,8 @@ class HelperTest(unittest.TestCase):
                 return 's "ONEXPLAYER 3"\n'
             return ""
 
-        with mock.patch.object(xbox_helper, "busctl", fake_busctl):
-            sender = xbox_helper.Sender()
+        with mock.patch.object(xbox_helper, "busctl", fake_busctl), contextlib.redirect_stderr(io.StringIO()):
+            sender = xbox_helper.Sender(config_path=NO_CONFIG)
             for state in (True, True, False, False, True, False):
                 sender.send(state)
         self.assertEqual(len([c for c in calls if c[0] == "call"]), 2)
@@ -93,9 +95,9 @@ class HelperTest(unittest.TestCase):
     def test_failure_is_logged_with_the_marker_status_reads(self):
         stderr = io.StringIO()
         with mock.patch.object(xbox_helper, "busctl", lambda *a: None), contextlib.redirect_stderr(stderr):
-            sender = xbox_helper.Sender()
+            sender = xbox_helper.Sender(config_path=NO_CONFIG)
             sender.send(True)
-        self.assertIn(xbox_helper.SEND_FAILED, stderr.getvalue())
+        self.assertIn(f"failed: {xbox_helper.SEND_FAILED}", stderr.getvalue())
         self.assertTrue(sender.pressed)  # tracked from the frames, so the release is not mistaken for a press
 
     def test_installed_script_is_standalone(self):
@@ -103,6 +105,52 @@ class HelperTest(unittest.TestCase):
         self.assertTrue(script.startswith("#!/usr/bin/python3 -I\n# Installed by oxp3-tool ("))
         self.assertNotIn("oxp3_tool", script.split("\n", 3)[3])
         compile(script, templates.XBOX_KEY_HELPER_PATH, "exec")
+
+    def chords(self, config, presses=1, clock=None):
+        """SendButtonChord calls for ``presses`` presses with the buttons fix's ``config``."""
+        calls = []
+
+        def fake_busctl(*args):
+            calls.append(args)
+            if args[0] == "--list":
+                return "/org/shadowblip/InputPlumber/CompositeDevice0\n"
+            if args[0] == "get-property":
+                return 's "ONEXPLAYER 3"\n'
+            return ""
+
+        actions = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "keys.json")
+            if config is not None:
+                Path(path).write_text(json.dumps(config))
+            with mock.patch.object(xbox_helper, "busctl", fake_busctl), contextlib.redirect_stderr(io.StringIO()):
+                sender = xbox_helper.Sender(actions, config_path=path)
+                for _ in range(presses):
+                    sender.send(True)
+                    sender.send(False)
+        return [c[4:] for c in calls if c[0] == "call"], actions
+
+    def test_actions_from_the_buttons_fix(self):
+        self.assertEqual(self.chords(None)[0], [("SendButtonChord", "as", "1", "Gamepad:Button:Guide")])
+        self.assertEqual(self.chords({"xbox": "screenshot"})[0],
+                         [("SendButtonChord", "as", "1", "Gamepad:Button:Screenshot")])
+        self.assertEqual(self.chords({"xbox": "keyboard-chord"})[0],
+                         [("SendButtonChord", "as", "2", "Gamepad:Button:Guide", "Gamepad:Button:North")])
+        self.assertEqual(self.chords({"xbox": "ogui-menu", "session": "native"})[0],
+                         [("SendButtonChord", "as", "1", "Gamepad:Button:Screenshot")])
+        self.assertEqual(self.chords({"xbox": "ogui-menu", "session": "ogui"})[0],
+                         [("SendButtonChord", "as", "1", "Gamepad:Button:QuickAccess2")])
+        self.assertEqual(self.chords({"xbox": "no-such-action"})[0],
+                         [("SendButtonChord", "as", "1", "Gamepad:Button:Guide")])
+        for action in ("home", "keyboard", "fps-limit"):
+            calls, actions = self.chords({"xbox": action})
+            self.assertEqual(calls, [])
+            actions.perform.assert_called_once_with(action)
+
+    def test_steam_actions_are_debounced(self):
+        with mock.patch.object(xbox_helper.time, "monotonic", return_value=50.0):
+            calls, actions = self.chords({"xbox": "fps-limit"}, presses=3)
+        self.assertEqual(actions.perform.call_count, 1)
 
     def test_script_comes_out_of_the_zipapp(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -183,14 +231,14 @@ class XboxKeyFixTest(unittest.TestCase):
         def runner(argv, timeout=None):
             if argv[0] == "journalctl" and templates.XBOX_KEY_UNIT_NAME in argv:
                 from oxp3_tool.system import CommandResult
-                return CommandResult(0, xbox_helper.SEND_FAILED + "\n")
+                return CommandResult(0, f"failed: {xbox_helper.SEND_FAILED}\n")
             return real_run(argv, timeout)
 
         from oxp3_tool.system import System
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             main(["status"], system=System(self.root, runner))
-        self.assertIn("could not deliver the Xbox key to InputPlumber", out.getvalue())
+        self.assertIn("the last Xbox key press failed (could not send the button to InputPlumber)", out.getvalue())
         # An older tool's helper: same recorded sha as on disk, different from the current template.
         with mock.patch.object(templates, "xbox_key_helper_script", lambda: "#!/usr/bin/python3 -I\n# new\n"):
             rc, out, _ = self.cli("status")

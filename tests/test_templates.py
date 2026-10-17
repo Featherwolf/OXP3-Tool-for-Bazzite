@@ -68,10 +68,24 @@ class CapabilityMapTest(unittest.TestCase):
             ogui = targets(templates.OGUI_SESSION, keyboard=action, home=action)
             self.assertEqual(ogui["Keyboard"], {"gamepad": {"button": "LeftTop"}})
             self.assertEqual(ogui["Home"], {"gamepad": {"button": "LeftTop"}})
-        self.assertIn(templates.OSK_KEY_UNIT_NAME, templates.capability_map_yaml(
+        self.assertIn(templates.STEAM_ACTIONS_UNIT_NAME, templates.capability_map_yaml(
             "oxp9", dict(templates.DEFAULT_BUTTON_ACTIONS), None, None))
-        self.assertNotIn(templates.OSK_KEY_UNIT_NAME, templates.capability_map_yaml(
+        self.assertNotIn(templates.STEAM_ACTIONS_UNIT_NAME, templates.capability_map_yaml(
             "oxp9", dict(templates.DEFAULT_BUTTON_ACTIONS), None, None, templates.OGUI_SESSION))
+
+    def test_steam_actions(self):
+        def targets(session, **actions):
+            merged = dict(templates.DEFAULT_BUTTON_ACTIONS, **actions)
+            doc = yaml.safe_load(templates.capability_map_yaml("oxp9", merged, None, None, session))
+            return {m["name"]: m["target_event"] for m in doc["mapping"]}
+
+        # Home and the frame limit go to the helper in both Game Mode sessions.
+        for session in (None, templates.OGUI_SESSION):
+            maps = targets(session, home="home", xbox="fps-limit", onex="home")
+            self.assertEqual(maps["Home"], {"dbus": "oxp3_home"})
+            self.assertEqual(maps["ONEX"], {"dbus": "oxp3_home"})
+            self.assertEqual(maps["Xbox"], {"dbus": "oxp3_fps_limit"})
+        self.assertEqual(set(templates.DBUS_ACTIONS), {"keyboard", "home", "fps-limit"})
 
     def test_stock_actions_reproduce_upstream(self):
         doc = self.render(**templates.STOCK_BUTTON_ACTIONS)
@@ -87,6 +101,12 @@ class CapabilityMapTest(unittest.TestCase):
     @unittest.skipUnless(IP_SCHEMA and jsonschema, "InputPlumber schema or jsonschema not available")
     def test_matches_inputplumber_schema(self):
         schema = json.loads(Path(IP_SCHEMA).read_text())
+        # The schema lists InputPlumber's built-in D-Bus actions only; InputPlumber itself takes
+        # any other name as a custom action (Action::Custom), which oxp3-tool's helper uses.
+        dbus_names = schema["definitions"]["Event"]["properties"]["dbus"]["enum"]
+        custom = sorted(set(templates.DBUS_ACTIONS.values()) - set(dbus_names))
+        self.assertEqual(custom, ["oxp3_fps_limit", "oxp3_home"])
+        dbus_names += custom
         for home in templates.BUTTON_ACTIONS:
             for key in templates.BUTTON_ACTIONS:
                 jsonschema.validate(self.render(home=home, keyboard=key), schema)
