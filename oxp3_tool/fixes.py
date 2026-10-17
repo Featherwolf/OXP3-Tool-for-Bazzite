@@ -238,10 +238,10 @@ def _xbox_helper_notes(ctx: Context, actions: dict[str, str], session: Optional[
                               installed != templates.xbox_key_helper_script()):
         if templates.KEYS_CONFIG_PATH not in installed:  # from before it read the key settings
             why = "only sends the Steam button"
-        elif action == templates.FPS_ACTION:
+        elif action == templates.FPS_ACTION and "def toggle_in_steam" not in installed:  # before the Steam route
             why = "sets the frame limit in gamescope only, never in Steam's own setting"
         else:
-            why = "may not do what --xbox-key chose"
+            why = "lacks this version's fixes"
         return [f"The xbox-key helper is from an older oxp3-tool and {why}; run "
                 "`sudo oxp3-tool apply xbox-key` to update it."]
     if action == "ogui-menu" and session == OGUI:

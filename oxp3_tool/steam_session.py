@@ -4,8 +4,8 @@ Shared by the Steam actions helper (steam_actions.py) and the Xbox key helper
 (xbox_helper.py); oxp3-tool bundles this file into each installed helper
 script. What writes to the user's files or sockets (~/.steam/steam.pipe,
 gamescope's socket in /run/user) runs as the Steam user, never as root. The
-helper itself only reads gamescope's limiter state (without following links,
-and only a file the Steam user owns) and talks to Steam's remote debugging over
+helper itself only reads gamescope's limiter state (4 bytes of a regular file
+the Steam user owns, not through a link at the file itself) and talks to Steam's remote debugging over
 TCP on 127.0.0.1:8080, only when the Steam user owns that listener, treating
 every answer as untrusted data:
 - steam:// URLs go to the running client the way Valve's
@@ -37,7 +37,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import Optional
+from typing import Optional, Union
 
 from .cdp import CDP_TIMEOUT, CdpError, evaluate
 from .steam_ui_js import STEAM_FPS_TOGGLE_JS
@@ -57,6 +57,7 @@ STEAM_JS_NOT_AFTER = CDP_TIMEOUT - 1.0
 # Steam's remote debugging port in /proc/net/tcp: 127.0.0.1:8080 (or any address), state LISTEN.
 DEBUG_PORT_ADDRESSES = ("0100007F:1F90", "00000000:1F90")
 MIN_FPS_LIMIT = 10
+UNCHANGED = "unchanged"  # toggle_in_steam: failed, and nothing was written anywhere
 MAX_FPS_LIMIT = 144
 
 URLS = {"keyboard": "steam://open/keyboard", "home": "steam://open/library"}
@@ -277,8 +278,12 @@ def debug_port_uids(proc: str = "/proc") -> set[int]:
     return uids
 
 
-def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Optional[bool]:
-    """Toggle Steam's global frame limit in its UI; None when nothing was written (use gamescope)."""
+def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Union[None, bool, str]:
+    """Toggle Steam's global frame limit in its UI.
+
+    None: nothing was written and Steam's setting cannot be used (use gamescope). UNCHANGED: a
+    failure that changed nothing. True or False: Steam's setting changed, or may have.
+    """
     # Only talk to Steam itself: the port must belong to the Steam user, not to some other process.
     if uid not in debug_port_uids(proc):
         log("Steam's remote debugging is off (Decky Loader turns it on); setting the limit in gamescope, "
@@ -292,7 +297,8 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Optional[bool]:
     except CdpError as e:
         if e.maybe_ran:
             # Steam may have changed the setting: changing gamescope too could undo it.
-            log(f"failed: Steam did not confirm the frame limit change ({e})")
+            log(f"failed: Steam did not confirm the frame limit change ({e}); it may still apply, "
+                "check Quick Access before pressing again")
             return False
         log(f"Steam's frame limit setting is not reachable ({e}); setting the limit in gamescope")
         return None
@@ -312,7 +318,7 @@ def toggle_in_steam(fps: int, uid: int, proc: str = "/proc") -> Optional[bool]:
         if error == "too late":
             # Steam is in charge of the limit and only slow: gamescope's limit would hide from Quick Access.
             log("failed: Steam was too busy to change the frame limit; nothing was changed, press again")
-            return False
+            return UNCHANGED
         if error == "per-game profile active":
             log("this game has its own performance profile in Steam, which the global frame limit does not "
                 "change; setting the limit in gamescope, which Quick Access does not show")
@@ -366,6 +372,8 @@ class FrameLimit:
         if session != self.session:
             self.sent, self.session = 0, session  # a new Game Mode session starts without our limit
         in_steam = toggle_in_steam(fps, uid, proc)
+        if in_steam == UNCHANGED:
+            return False  # nothing changed anywhere: a gamescope limit this helper set is still on
         if in_steam is not None:
             self.sent = 0  # Steam owns the limit now; a later gamescope press starts afresh
             return in_steam

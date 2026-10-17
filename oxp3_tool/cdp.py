@@ -226,7 +226,10 @@ class WebSocket(_Connection):
             if opcode == 0x8:
                 raise CdpError("Steam closed the connection", self.sent)
             if opcode == 0x9:
-                self._send_frame(0xA, payload)  # ping: answer and keep reading
+                try:
+                    self._send_frame(0xA, payload)  # ping: answer and keep reading
+                except OSError as e:
+                    raise CdpError(f"the connection to Steam failed ({type(e).__name__})", self.sent) from e
                 continue
             if opcode == 0xA:
                 continue

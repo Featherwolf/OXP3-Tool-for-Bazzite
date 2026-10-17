@@ -759,14 +759,38 @@ class SteamActionsFixTest(unittest.TestCase):
         self.assertNotIn("can only tap", out)
         self.assertNotIn("from an older oxp3-tool", out)
         self.assertEqual(self.keys()["xbox"], "fps-limit")
-        # A helper from before it read keys.json is pointed out, for any action but the Steam button.
+        # An older helper unit is pointed out (the helper itself is current), for any action but the Steam button.
         unit = self.root / templates.XBOX_KEY_UNIT_PATH.lstrip("/")
         unit.write_text(templates.XBOX_KEY_UNIT.replace("ProtectHome=read-only", "ProtectHome=yes"))
-        for action in ("home", "screenshot"):
+        for action in ("home", "screenshot", "fps-limit"):
             rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", action)
-            self.assertIn("run `sudo oxp3-tool apply xbox-key` to update it", out)
+            self.assertIn("The xbox-key helper is from an older oxp3-tool and lacks this version's fixes; run "
+                          "`sudo oxp3-tool apply xbox-key` to update it.", out)
         rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", "guide")
         self.assertNotIn("apply xbox-key", out)
+
+    def test_older_xbox_helper_notes_say_what_it_lacks(self):
+        from .test_xbox_key import IP_LOG
+        self.f.mcu_hidraw()
+        self.f.runner.ip_journal = IP_LOG
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "xbox-key")[0], 0)
+        helper = self.root / templates.XBOX_KEY_HELPER_PATH.lstrip("/")
+        steam_button_only = "print('Steam button')\n"  # before it read keys.json
+        gamescope_only = f"KEYS = {templates.KEYS_CONFIG_PATH!r}\n"  # before the Steam frame-limit route
+        steam_route = gamescope_only + "def toggle_in_steam(): pass\n"
+        for body, action, why in (
+                (steam_button_only, "fps-limit", "only sends the Steam button"),
+                (steam_button_only, "home", "only sends the Steam button"),
+                (gamescope_only, "fps-limit", "sets the frame limit in gamescope only, never in Steam's own setting"),
+                (gamescope_only, "home", "lacks this version's fixes"),
+                (steam_route, "fps-limit", "lacks this version's fixes")):
+            with self.subTest(action=action, body=body):
+                helper.write_text(body)
+                rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", action)
+                self.assertIn(f"The xbox-key helper is from an older oxp3-tool and {why}; run "
+                              "`sudo oxp3-tool apply xbox-key` to update it.", out)
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", "guide")
+        self.assertNotIn("from an older oxp3-tool", out)
 
     def test_xbox_key_choice_on_a_helper_unit_leaves_inputplumber_alone(self):
         from .test_xbox_key import IP_LOG
@@ -1028,8 +1052,21 @@ class SteamRouteTest(unittest.TestCase):
 
     def test_too_late_changes_nothing(self):
         result, log, _ = self.run_steam({"v": 1, "ok": False, "wrote": False, "error": "too late"})
-        self.assertIs(result, False)  # Steam is in charge and only busy: no hidden gamescope limit
+        self.assertEqual(result, steam_session.UNCHANGED)  # Steam is in charge and only busy: no gamescope limit
         self.assertIn("failed: Steam was too busy to change the frame limit; nothing was changed", log)
+
+    def test_unchanged_press_keeps_the_gamescope_limit_it_set(self):
+        # gamescope press (Steam unreachable), a press Steam was too busy for, then gamescope again: off.
+        with tempfile.TemporaryDirectory() as tmp, FakeProc(tmp) as fake:
+            limit = steam_session.FrameLimit()
+            sent = []
+            with mock.patch.object(steam_session, "set_fps_limit", side_effect=lambda uid, env, t: sent.append(t)), \
+                    mock.patch.object(steam_session, "limiter_active", return_value=None), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                for in_steam in (None, steam_session.UNCHANGED, None):
+                    with mock.patch.object(steam_session, "toggle_in_steam", return_value=in_steam):
+                        limit.toggle(72, str(fake.proc))
+            self.assertEqual(sent, [72, 0])
 
     def test_text_from_steam_stays_on_one_line(self):
         reply = {"v": 1, "ok": False, "wrote": True, "error": "x\nok: frame limit 72 fps\x1b[2J"}
