@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .detect import Context
-from .fixes import BY_ID, RESTART_INPUTPLUMBER, Fix, FixError, Plan, PostStep, restart_pending
+from .fixes import BY_ID, RESTART_INPUTPLUMBER, Fix, FixError, Plan, PostStep, normalized_yaml_sha256, restart_pending
 from .state import BACKUP_DIR, STATE_DIR, State, backup_path_for
 from .system import sha256_bytes
 from .templates import OWN_MARKER
@@ -124,6 +124,16 @@ class Engine:
         # Keep SELinux labels right for files and directories this tool creates.
         if self.sys.is_real_root and self.sys.which("restorecon"):
             self.sys.run(["restorecon", path], timeout=30)
+
+    def _differs(self, path: str, content: bytes) -> bool:
+        """Whether writing ``content`` changes what ``path`` means: for YAML, comments and blank lines do not count."""
+        current = self.sys.sha256(path)
+        if current == sha256_bytes(content):
+            return False
+        if current is None or not path.endswith((".yaml", ".yml")):
+            return True
+        text = self.sys.read_text(path)
+        return text is None or normalized_yaml_sha256(text) != normalized_yaml_sha256(content.decode(errors="replace"))
 
     def _is_ours(self, path: str) -> bool:
         head = (self.sys.read_bytes(path) or b"")[:512].decode("utf-8", errors="replace")
@@ -255,12 +265,12 @@ class Engine:
         """The post steps applying ``plan`` runs; call it before any file is written."""
         entry = self.state.get(fix.id)
         pending = bool(entry) and restart_pending(self.ctx, entry.get("notes", {}))
-        wanted = {s.path: sha256_bytes(s.content) for s in plan.files}
+        wanted = {s.path: s.content for s in plan.files}
         recorded = {r["path"] for r in (entry or {}).get("files", [])}
 
         def changes(path: str) -> bool:
             if path in wanted:
-                return self.sys.sha256(path) != wanted[path]
+                return self._differs(path, wanted[path])
             return path in recorded and self.sys.exists(path)  # removed
 
         return [s for s in plan.post
@@ -379,7 +389,7 @@ class Engine:
                 rec = {"path": spec.path}
                 entry["files"].append(rec)
             rec.update({"sha256": wanted, "backup": backup})
-            pending = current != wanted and spec.path in plan.pending_paths
+            pending = spec.path in plan.pending_paths and self._differs(spec.path, spec.content)
             was = {k: entry["notes"].get(k) for k in ("restart_pending", "restart_pending_boot")}
             if pending:
                 # Pending from this write until the restart has run, so a failed or

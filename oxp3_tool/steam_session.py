@@ -87,8 +87,9 @@ def steam_processes(proc: str = "/proc") -> list[tuple[int, int]]:
         return found
     for entry in sorted((e for e in entries if e.isdigit()), key=int):
         try:
-            with open(os.path.join(proc, entry, "comm")) as f:
-                if f.read().strip() != "steam":
+            # Bytes: the kernel cuts names at 15 bytes, also inside a UTF-8 character.
+            with open(os.path.join(proc, entry, "comm"), "rb") as f:
+                if f.read().strip() != b"steam":
                     continue
             uid = os.stat(os.path.join(proc, entry)).st_uid
         except OSError:
@@ -281,9 +282,12 @@ class Actions:
         self.frame_limit = FrameLimit()
 
     def perform(self, action: str) -> bool:
-        if action in URLS:
-            return open_url(action, self.proc)
-        if action == "fps-limit":
-            return self.frame_limit.toggle(fps_limit(key_config(self.config_path)), self.proc)
-        log(f"failed: unknown action {action!r}")
+        try:
+            if action in URLS:
+                return open_url(action, self.proc)
+            if action == "fps-limit":
+                return self.frame_limit.toggle(fps_limit(key_config(self.config_path)), self.proc)
+            log(f"failed: unknown action {action!r}")
+        except Exception as e:  # one bad press must not stop the service
+            log(f"failed: {action}: {type(e).__name__}: {e}")
         return False

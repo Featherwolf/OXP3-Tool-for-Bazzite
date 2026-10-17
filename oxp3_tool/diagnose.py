@@ -48,7 +48,8 @@ COMMANDS: list[tuple[str, list[str]]] = [
     ("lsusb.txt", ["lsusb"]),
     ("units.txt", ["systemctl", "status", "--no-pager", "--lines=20", "inputplumber.service",
                    "inputplumber-suspend.service", "powerstation.service", "steamos-manager.service",
-                   "bazzite-hardware-setup.service", "oxp3-tool-xbox-key.service", "oxp3-tool-steam-actions.service"]),
+                   "bazzite-hardware-setup.service", "oxp3-tool-xbox-key.service", "oxp3-tool-steam-actions.service",
+                   "oxp3-tool-osk-key.service"]),
     ("units-failed.txt", ["systemctl", "--failed", "--no-pager"]),
     ("journal-kernel-this-boot.txt", ["journalctl", "-k", "-b", "0", "--no-pager", "-o", "short-monotonic"]),
     ("journal-kernel-previous-boot.txt", ["journalctl", "-k", "-b", "-1", "--no-pager", "-o", "short-monotonic"]),
@@ -59,7 +60,7 @@ COMMANDS: list[tuple[str, list[str]]] = [
                                             "-u", "inputplumber.service", "-n", "3000"]),
     ("journal-oxp3-helpers-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
                                             "-u", "oxp3-tool-xbox-key.service", "-u", "oxp3-tool-steam-actions.service",
-                                            "-n", "500"]),
+                                            "-u", "oxp3-tool-osk-key.service", "-n", "500"]),
     ("journal-gamescope-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
                                          "--grep", "gamescope|known display", "-n", "3000"]),
 ]

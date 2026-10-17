@@ -147,6 +147,10 @@ class Sender:
                 self.last = now
                 self.actions.perform(action)
             return
+        if action == "ogui-menu" and config.get("session") == OGUI_SESSION:
+            # A chord skips InputPlumber's intercept, and the Steam Deck target has no QuickAccess2.
+            log("failed: the Xbox key helper cannot open the OpenGamepadUI menu; choose another --xbox-key")
+            return
         self.send_chord(chord_for(action, config.get("session")))
 
     def send_chord(self, buttons: list[str]) -> None:

@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import steam_actions, steam_session, templates, xbox_helper
+from . import steam_actions, steam_session, templates
 from .detect import IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
 from .system import sha256_bytes
 
@@ -179,17 +179,45 @@ def _helper_live_state(ctx: Context, entry: Optional[dict[str, Any]], unit: str,
     return lines
 
 
-def _hold_warnings(actions: dict[str, str], xbox_by_helper: bool) -> list[str]:
+XBOX_DECODED = "decoded"  # InputPlumber reads the key: it is a normal button, holds work
+XBOX_TAP = "tap"  # the xbox-key helper handles it: taps only
+XBOX_DEAD = "dead"  # reported as 0x25 and no helper: the key does nothing
+
+
+def _xbox_key_state(ctx: Context) -> str:
+    if ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH):
+        return XBOX_TAP
+    if XBOX_KEY_BUTTON in (ctx.ip_undecoded_buttons or ()):
+        return XBOX_DEAD
+    return XBOX_DECODED
+
+
+def _hold_warnings(actions: dict[str, str], xbox: str) -> list[str]:
     """What is lost when no key opens the Steam menu, or none can be held for Steam's shortcuts."""
-    steam = [k for k, a in actions.items() if a == "guide"]
+    steam = [k for k, a in actions.items() if a == "guide" and not (k == "xbox" and xbox == XBOX_DEAD)]
     if not steam:
         return ["No key opens the Steam menu now (exiting a game, the power menu and Steam's settings live "
-                "there); give one key `guide`, for example `--xbox-key guide`."]
+                "there); `sudo oxp3-tool apply buttons --home guide` brings it back with Steam's hold shortcuts."]
     # The keys InputPlumber reads pass holds through; the Xbox key helper can only tap.
-    if all(k == "xbox" and xbox_by_helper for k in steam):
+    if all(k == "xbox" and xbox == XBOX_TAP for k in steam):
         return ["Only the Xbox key opens the Steam menu, and it can only tap: Steam's hold shortcuts "
                 "(Steam+R1 screenshot, Steam+L1 magnifier, holding Steam+B to quit a game, Steam+left stick "
                 "brightness) are gone. `--home guide` brings them back."]
+    return []
+
+
+def _xbox_helper_notes(ctx: Context, actions: dict[str, str], session: Optional[str]) -> list[str]:
+    """Notes on what the installed xbox-key helper cannot do with the chosen Xbox key action."""
+    if not ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH):
+        return []
+    action = actions.get("xbox", "guide")
+    if action != "guide" and (ctx.sys.read_text(templates.XBOX_KEY_UNIT_PATH) != templates.XBOX_KEY_UNIT or
+                              ctx.sys.read_text(templates.XBOX_KEY_HELPER_PATH) != templates.xbox_key_helper_script()):
+        return ["The xbox-key helper is from an older oxp3-tool and only sends the Steam button; run "
+                "`sudo oxp3-tool apply xbox-key` to update it."]
+    if action == "ogui-menu" and session == OGUI:
+        return ["The xbox-key helper cannot open the OpenGamepadUI menu (InputPlumber drops that button when a "
+                "helper sends it); choose another --xbox-key."]
     return []
 
 
@@ -225,15 +253,17 @@ class ButtonsFix(Fix):
         "  nothing on some setups; keyboard-chord sends Steam+X instead.\n"
         "- home takes Game Mode to its Home screen (steam://open/library).\n"
         "- fps-limit turns gamescope's frame limit off when one is on, else sets\n"
-        "  --fps-limit (default 72; 72, 48, 36 and 24 keep the 144 Hz panel mode with\n"
+        "  --fps-limit (default 72; limits that divide 144 keep the panel at 144 Hz with\n"
         "  VRR off). Steam is not told: Quick Access keeps showing its own setting, and\n"
-        "  Steam's next change (a game starting, the slider) replaces it.\n"
+        "  Steam's next change (a game starting, the slider) replaces it. It also\n"
+        "  replaces a refresh rate chosen in Quick Access: off means 144 Hz again.\n"
         "Only the Steam button can be held for Steam+button shortcuts, and the\n"
         "xbox-key helper can only tap, so keep guide on Home to keep them.\n"
         "Check each key with `inputplumber device 0 test` (press q to quit; closing the\n"
         "window instead leaves InputPlumber in test mode until\n"
         "`sudo systemctl restart inputplumber`). A key that goes to the helper shows\n"
-        f"nothing there; `journalctl -u {templates.STEAM_ACTIONS_UNIT_NAME} -f` logs its presses.\n"
+        f"nothing there; `journalctl -u {templates.STEAM_ACTIONS_UNIT_NAME} -f` logs its presses\n"
+        f"(`journalctl -u {templates.XBOX_KEY_UNIT_NAME} -f` for an Xbox key the xbox-key helper reads).\n"
         "Your choice is kept when you apply again\n"
         "(--defaults resets it). Apply again after `ujust configure-opengamepadui` switches\n"
         "Game Mode input. The override replaces the whole stock map, so it is only\n"
@@ -339,29 +369,29 @@ class ButtonsFix(Fix):
             ]
         if FPS in actions.values() and not ctx.sys.exists(steam_session.GAMESCOPECTL):
             plan.messages.append(f"{steam_session.GAMESCOPECTL} is missing, so the fps-limit action cannot work.")
-        plan.messages += _hold_warnings(actions, ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH))
-        installed = ctx.sys.read_text(templates.XBOX_KEY_UNIT_PATH)
-        if actions["xbox"] in xbox_helper.STEAM_ACTIONS and installed not in (None, templates.XBOX_KEY_UNIT):
-            plan.messages.append("The xbox-key helper is from an older oxp3-tool and cannot do this yet; run "
-                                 "`sudo oxp3-tool apply xbox-key` to update it.")
+        # The warnings depend on what the whole run installs, so after_apply gives them.
+        self._applied = (actions, session)
         return plan
 
     def after_apply(self, ctx: Context) -> list[str]:
-        if not ctx.sys.exists(templates.STEAM_ACTIONS_UNIT_PATH):
-            return []
-        state = ctx.unit_state(self.STEAM_UNIT)
-        if state != "active":
-            return [f"{self.STEAM_UNIT} is {state or 'not running'}; see `journalctl -u {self.STEAM_UNIT}`"]
-        return []
+        lines = []
+        if ctx.sys.exists(templates.STEAM_ACTIONS_UNIT_PATH):
+            state = ctx.unit_state(self.STEAM_UNIT)
+            if state != "active":
+                lines.append(f"{self.STEAM_UNIT} is {state or 'not running'}; see `journalctl -u {self.STEAM_UNIT}`")
+        actions, session = getattr(self, "_applied", (None, None))
+        if actions:
+            lines += _hold_warnings(actions, _xbox_key_state(ctx)) + _xbox_helper_notes(ctx, actions, session)
+        return lines
 
     def revert_post(self, ctx: Context) -> list[PostStep]:
         steps = [_restart_inputplumber()]
-        if ctx.unit_state(self.STEAM_UNIT) in ("active", "activating", "reloading"):
-            steps += [
-                PostStep("stop-steam-actions", ["systemctl", "stop", self.STEAM_UNIT],
-                         "stop the Steam actions helper", order=5),
-                _daemon_reload(),
-            ]
+        running = [u for u in (self.STEAM_UNIT, *templates.LEGACY_STEAM_ACTIONS_UNITS)
+                   if ctx.unit_state(u) in ("active", "activating", "reloading")]
+        for unit in running:
+            steps.append(PostStep(f"stop-{unit}", ["systemctl", "stop", unit], f"stop {unit}", order=5))
+        if running:
+            steps.append(_daemon_reload())
         return steps
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
@@ -393,8 +423,12 @@ class ButtonsFix(Fix):
                 ctx, entry, self.STEAM_UNIT, "the helper's last action failed",
                 {templates.STEAM_ACTIONS_HELPER_PATH: templates.steam_actions_helper_script().encode(),
                  templates.STEAM_ACTIONS_UNIT_PATH: templates.STEAM_ACTIONS_UNIT.encode()}, "buttons")
+        if not any(r.get("path") == templates.KEYS_CONFIG_PATH for r in entry.get("files", [])):
+            lines.append("installed by an older oxp3-tool; run `sudo oxp3-tool apply buttons` to update it")
         if actions:
-            lines += [f"warning: {w}" for w in _hold_warnings(actions, ctx.sys.exists(templates.XBOX_KEY_HELPER_PATH))]
+            merged = {**templates.DEFAULT_BUTTON_ACTIONS, **actions}
+            lines += [f"warning: {w}" for w in _hold_warnings(merged, _xbox_key_state(ctx))]
+            lines += [f"note: {n}" for n in _xbox_helper_notes(ctx, merged, written_for)]
         for user in ctx.steam_screen_reader_users:
             lines.append(f"warning: Steam's screen reader is on for {user}; it replaces the Steam button shortcuts "
                          "(Steam+X keyboard, Steam+R1 screenshot). See README > Common problems to turn it off")

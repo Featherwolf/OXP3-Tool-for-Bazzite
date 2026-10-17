@@ -267,7 +267,14 @@ KEYS_CONFIG_PATH = steam_session.KEYS_CONFIG
 
 def keys_config_json(actions: dict[str, str], session: Optional[str], fps_limit: int) -> str:
     """Settings the helpers read on each press: the Xbox key's action (for the 0x25 helper) and the frame limit."""
-    return json.dumps({"xbox": actions["xbox"], "session": session, "fps_limit": fps_limit}, sort_keys=True) + "\n"
+    return json.dumps({
+        "_comment": f"Installed by oxp3-tool ({PROJECT_URL}). Change it with `sudo oxp3-tool apply buttons`.",
+        "xbox": actions["xbox"], "session": session, "fps_limit": fps_limit,
+    }, indent=2, sort_keys=True) + "\n"
+
+
+# Units earlier releases installed for the same job.
+LEGACY_STEAM_ACTIONS_UNITS = ("oxp3-tool-osk-key.service",)
 
 
 # Table key of oxp3-tool's known display in the gamescope Lua (gamescope logs

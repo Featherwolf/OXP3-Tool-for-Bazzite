@@ -138,8 +138,8 @@ class HelperTest(unittest.TestCase):
                          [("SendButtonChord", "as", "2", "Gamepad:Button:Guide", "Gamepad:Button:North")])
         self.assertEqual(self.chords({"xbox": "ogui-menu", "session": "native"})[0],
                          [("SendButtonChord", "as", "1", "Gamepad:Button:Screenshot")])
-        self.assertEqual(self.chords({"xbox": "ogui-menu", "session": "ogui"})[0],
-                         [("SendButtonChord", "as", "1", "Gamepad:Button:QuickAccess2")])
+        # A chord skips InputPlumber's intercept, so the OGUI menu cannot be opened this way.
+        self.assertEqual(self.chords({"xbox": "ogui-menu", "session": "ogui"})[0], [])
         self.assertEqual(self.chords({"xbox": "no-such-action"})[0],
                          [("SendButtonChord", "as", "1", "Gamepad:Button:Guide")])
         for action in ("home", "keyboard", "fps-limit"):

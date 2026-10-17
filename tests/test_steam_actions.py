@@ -347,6 +347,23 @@ class FrameLimitTest(unittest.TestCase):
                                                                {"GAMESCOPE_LIMITER_FILE": path}))
 
 
+class RobustnessTest(unittest.TestCase):
+    def test_process_names_that_are_not_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for pid, comm in (("10", b"GameApp\xe3\x83\x89\xe3\x83\xa9\xe3\x82\n"), ("11", b"steam\n")):
+                Path(tmp, pid).mkdir()
+                Path(tmp, pid, "comm").write_bytes(comm)
+            me = os.getuid()
+            self.assertEqual(steam_session.steam_uids(tmp), [] if me == 0 else [me])
+
+    def test_an_action_error_is_logged_not_raised(self):
+        err = io.StringIO()
+        with mock.patch.object(steam_session, "open_url", side_effect=RuntimeError("boom")), \
+                contextlib.redirect_stderr(err):
+            self.assertFalse(steam_session.Actions().perform("home"))
+        self.assertIn("failed: home: RuntimeError: boom", err.getvalue())
+
+
 class KeyConfigTest(unittest.TestCase):
     def test_reads_and_validates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -672,7 +689,9 @@ class SteamActionsFixTest(unittest.TestCase):
         self.assertEqual(self.f.runner.unit_active[self.UNIT], "inactive")
 
     def keys(self):
-        return json.loads((self.root / templates.KEYS_CONFIG_PATH.lstrip("/")).read_text())
+        config = json.loads((self.root / templates.KEYS_CONFIG_PATH.lstrip("/")).read_text())
+        self.assertTrue(config.pop("_comment").startswith("Installed by oxp3-tool ("))
+        return config
 
     def test_home_and_fps_limit_choices(self):
         rc, out, err = self.cli("apply", "--yes", "buttons", "--home", "home", "--xbox-key", "fps-limit",
@@ -698,18 +717,61 @@ class SteamActionsFixTest(unittest.TestCase):
         from .test_xbox_key import IP_LOG
         self.f.mcu_hidraw()
         self.f.runner.ip_journal = IP_LOG
-        self.assertEqual(self.cli("apply", "--yes", "xbox-key")[0], 0)
-        rc, out, _ = self.cli("apply", "--yes", "buttons", "--home", "home")
+        # Both fixes in one run: the warning knows about the helper this run installs.
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "xbox-key", "--home", "home")
         self.assertIn("Only the Xbox key opens the Steam menu, and it can only tap", out)
+        self.assertNotIn("from an older oxp3-tool", out)
+        rc, status, _ = self.cli("status")
+        self.assertIn("warning: Only the Xbox key opens the Steam menu", status)
         rc, out, _ = self.cli("apply", "--yes", "buttons", "--home", "guide", "--xbox-key", "fps-limit")
         self.assertNotIn("can only tap", out)
         self.assertNotIn("from an older oxp3-tool", out)
         self.assertEqual(self.keys()["xbox"], "fps-limit")
-        # A helper from before it could do Steam actions (ProtectHome=yes) is pointed out.
+        # A helper from before it read keys.json is pointed out, for any action but the Steam button.
         unit = self.root / templates.XBOX_KEY_UNIT_PATH.lstrip("/")
         unit.write_text(templates.XBOX_KEY_UNIT.replace("ProtectHome=read-only", "ProtectHome=yes"))
-        rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", "home")
-        self.assertIn("run `sudo oxp3-tool apply xbox-key` to update it", out)
+        for action in ("home", "screenshot"):
+            rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", action)
+            self.assertIn("run `sudo oxp3-tool apply xbox-key` to update it", out)
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "--xbox-key", "guide")
+        self.assertNotIn("apply xbox-key", out)
+
+    def test_undecoded_xbox_key_does_not_count_as_the_steam_menu(self):
+        from .test_xbox_key import IP_LOG
+        self.f.mcu_hidraw()
+        self.f.runner.ip_journal = IP_LOG  # InputPlumber cannot read the Xbox key, and no helper does
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "--home", "home")
+        self.assertIn("No key opens the Steam menu now", out)
+
+    def test_ogui_menu_on_the_xbox_helper_under_the_overlay(self):
+        from .test_xbox_key import IP_LOG
+        self.f.mcu_hidraw()
+        self.f.runner.ip_journal = IP_LOG
+        self.f.ogui_overlay()
+        rc, out, _ = self.cli("apply", "--yes", "buttons", "xbox-key", "--xbox-key", "ogui-menu")
+        self.assertIn("cannot open the OpenGamepadUI menu", out)
+
+    def test_previous_release_state_is_flagged(self):
+        from oxp3_tool.state import STATE_FILE
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        path = self.root / STATE_FILE.lstrip("/")
+        state = json.loads(path.read_text())
+        state["fixes"]["buttons"]["files"] = [r for r in state["fixes"]["buttons"]["files"]
+                                              if r["path"] != templates.KEYS_CONFIG_PATH]
+        del state["fixes"]["buttons"]["options"]["actions"]["xbox"]  # the first release had no Xbox entry
+        path.write_text(json.dumps(state))
+        rc, status, _ = self.cli("status")
+        self.assertIn("installed by an older oxp3-tool; run `sudo oxp3-tool apply buttons` to update it", status)
+        self.assertNotIn("No key opens the Steam menu", status)  # a missing entry counts as its default
+
+    def test_keys_config_is_ours_after_a_lost_state(self):
+        from oxp3_tool.state import STATE_FILE
+        self.assertEqual(self.cli("apply", "--yes", "buttons", "--xbox-key", "fps-limit")[0], 0)
+        (self.root / STATE_FILE.lstrip("/")).unlink()
+        rc, out, _ = self.cli("apply", "--yes", "buttons")
+        self.assertNotIn(f"backed up {templates.KEYS_CONFIG_PATH}", out)
+        self.assertEqual(self.cli("revert", "--yes", "buttons")[0], 0)
+        self.assertFalse((self.root / templates.KEYS_CONFIG_PATH.lstrip("/")).exists())
 
     def test_default_options_are_not_rewritten(self):
         self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
@@ -733,6 +795,16 @@ class SteamActionsFixTest(unittest.TestCase):
         path = self.root / STATE_FILE.lstrip("/")
         text = path.read_text().replace(templates.STEAM_ACTIONS_HELPER_PATH, old_helper)
         path.write_text(text.replace(self.UNIT, old_unit))
+        cap_map = self.root / "etc/inputplumber/capability_maps.d/onexplayer_type9.yaml"
+        text = cap_map.read_text().replace(
+            "# dbus: targets go to oxp3-tool-steam-actions.service, which carries them out in Steam.",
+            "# dbus: ui_osk goes to oxp3-tool-osk-key.service, which asks Steam to open its keyboard.")
+        cap_map.write_text(text)
+        state = json.loads(path.read_text())
+        for rec in state["fixes"]["buttons"]["files"]:
+            if rec["path"].endswith("onexplayer_type9.yaml"):
+                rec["sha256"] = self.f.system().sha256(rec["path"])
+        path.write_text(json.dumps(state))
         self.helper.rename(self.root / old_helper.lstrip("/"))
         self.unit.rename(self.root / f"etc/systemd/system/{old_unit}")
         state = json.loads(path.read_text())
@@ -742,6 +814,7 @@ class SteamActionsFixTest(unittest.TestCase):
         (self.root / templates.KEYS_CONFIG_PATH.lstrip("/")).unlink()
         self.f.runner.unit_enabled = {old_unit: "enabled"}
         self.f.runner.unit_active[old_unit] = "active"
+        self.dry_run_log = self.cli("apply", "--dry-run", "buttons")[1]
         self.f.runner.calls.clear()
         rc, out, err = self.cli("apply", "--yes", "buttons")
         self.assertEqual(rc, 0, err)
@@ -752,8 +825,21 @@ class SteamActionsFixTest(unittest.TestCase):
         self.assertFalse((self.root / f"etc/systemd/system/{old_unit}").exists())
         self.assertTrue(self.helper.exists())
         self.assertEqual(self.f.runner.unit_active[old_unit], "inactive")
-        # The map did not change, so InputPlumber is left alone.
+        # Only a comment in the map changed, so InputPlumber is left alone.
+        self.assertIn(f"update {'/etc/inputplumber/capability_maps.d/onexplayer_type9.yaml'}", self.dry_run_log)
         self.assertNotIn("systemctl try-restart inputplumber.service", calls)
+        self.assertNotIn("Reboot (or leave Game Mode", out)
+        rc, status, _ = self.cli("status")
+        self.assertNotIn("InputPlumber has not been restarted", status)
+
+    def test_revert_stops_the_previous_releases_helper(self):
+        self.assertEqual(self.cli("apply", "--yes", "buttons")[0], 0)
+        old_unit = templates.LEGACY_STEAM_ACTIONS_UNITS[0]
+        self.f.runner.unit_active[old_unit] = "active"
+        self.f.runner.calls.clear()
+        self.assertEqual(self.cli("revert", "--yes", "buttons")[0], 0)
+        self.assertIn(f"systemctl stop {old_unit}", self.calls())
+        self.assertIn("systemctl daemon-reload", self.calls())
 
     def test_missing_busctl(self):
         (self.root / "usr/bin/busctl").unlink()
