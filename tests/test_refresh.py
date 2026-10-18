@@ -279,6 +279,17 @@ class RefreshStateTest(unittest.TestCase):
         Engine(ctx, State(self.f.system()), out=lambda _: None).plan([BY_ID["xe-dsb-off"]], {})
         self.assertFalse([c for c in self.f.runner.calls if c[0] == "journalctl"])
 
+    def test_ignored_vbt_drive_levels_are_explained(self):
+        self.f.display_debugfs()
+        self.assertNotIn("VBT vswing", self.status())
+        self.f.runner.journal["0"] = ("xe 0000:00:02.0: [drm] Port A asks to use VBT vswing/preemph tables\n"
+                                      "WARNING: drivers/gpu/drm/i915/display/intel_bios.c:2813 at ...\n")
+        ctx = Context(self.f.system())
+        self.assertEqual(ctx.refresh_state.vbt_vswing_port, "A")
+        out = " ".join(self.status().split())
+        self.assertIn("'Port A asks to use VBT vswing/preemph tables'", out)
+        self.assertIn("queued for Linux 7.4; no kernel argument or oxp3-tool fix works around it", out)
+
     def test_dsb_hint_after_apply_says_reboot(self):
         self.f.display_debugfs()
         self.f.runner.journal["0"] = "[CRTC:151:pipe A] DSB 0 poll error\n"

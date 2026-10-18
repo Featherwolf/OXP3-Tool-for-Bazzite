@@ -56,6 +56,9 @@ _DMC_LOG_RE = re.compile(r"Finished loading DMC firmware \S+ \(v(\d+)\.(\d+)\)")
 _DMC_LOG_DEV_RE = re.compile(r"(\S+): \[drm\] $")
 _DSB_ERROR_RE = re.compile(r"DSB \d+ poll error")
 _PSR_ERROR_RE = re.compile(r"Selective fetch area calculation failed|Timed out waiting PSR idle state|PSR aux error")
+# Kernels before the "Vswing / Pre-emphasis Override" series (drm-next, for Linux 7.4) warn and use Intel's generic
+# eDP drive levels when the firmware's VBT asks for its own.
+_VBT_VSWING_RE = re.compile(r"Port ([A-I]) asks to use VBT vswing/preemph tables")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -170,6 +173,12 @@ def count_dsb_errors(kernel_log: str) -> int:
 
 def count_psr_errors(kernel_log: str) -> int:
     return len(_PSR_ERROR_RE.findall(kernel_log))
+
+
+def vbt_vswing_port(kernel_log: str) -> Optional[str]:
+    """The port whose firmware drive levels this kernel ignored ("A" is the OXP3's eDP), if it logged one."""
+    m = _VBT_VSWING_RE.search(kernel_log)
+    return m.group(1) if m else None
 
 
 def _kwin_int(value: object) -> Optional[int]:
@@ -297,6 +306,7 @@ class RefreshState:
     dc_balance_on: bool = False  # xe.enable_dc_balance=Y (readable as root only)
     dsb_errors: int = 0
     psr_errors: int = 0
+    vbt_vswing_port: Optional[str] = None  # the kernel ignored the firmware's eDP drive levels for this port
     kwin: list[KwinOutput] = field(default_factory=list)
     kwin_is_mine: bool = False  # kwin holds only the invoking user's settings
     game_mode: bool = True
@@ -434,6 +444,14 @@ class RefreshState:
             else:
                 out.append(f"The kernel logged {self.dsb_errors} 'DSB poll error' messages this boot; the optional "
                            "xe-dsb-off fix stops them and the cursor trails or flicker that can come with them.")
+        if self.vbt_vswing_port:
+            out.append(f"The kernel logged 'Port {self.vbt_vswing_port} asks to use VBT vswing/preemph tables': the "
+                       "firmware asks for its own signal levels on the link to the screen, and kernels before Linux "
+                       "7.4 ignore them and use Intel's generic ones. On OXP3 units this goes with random white dots "
+                       "or short lines that flicker, most visibly on dark scenes, and never show in screenshots "
+                       "(kernel-anatase issue #7). The fix ('Vswing / Pre-emphasis Override') is queued for Linux "
+                       "7.4; no kernel argument or oxp3-tool fix works around it, and xe-panel-replay-off does not "
+                       "stop the dots.")
         replay_on = bool(self.psr_mode and self.psr_mode.startswith("Panel Replay") and "enabled" in self.psr_mode)
         if replay_on and self.psr_errors and not self.panel_replay_blocked:
             if PANEL_REPLAY_OFF_KARG in self.awaiting_reboot:

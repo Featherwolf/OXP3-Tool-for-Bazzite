@@ -32,6 +32,7 @@ from .display import (
     parse_kwin_outputs,
     parse_psr_mode,
     safe_name,
+    vbt_vswing_port,
 )
 from .system import System
 
@@ -626,6 +627,7 @@ class Context:
         log = self.kernel_log(0)
         st.dsb_errors = count_dsb_errors(log)
         st.psr_errors = count_psr_errors(log)
+        st.vbt_vswing_port = vbt_vswing_port(log)
         st.awaiting_reboot = frozenset(k for k in (DSB_OFF_KARG, PANEL_REPLAY_OFF_KARG)
                                        if self.karg_pending(k) and not self.karg_active(k))
         st.panel_replay_blocked = any(self.karg_active(k) or self.karg_pending(k)
