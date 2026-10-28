@@ -282,10 +282,10 @@ class CliTest(Base):
         self.fake(gm7=False)
         rc, out, _ = self.cli("status")
         self.assertIn("[optional    ] nvme-resume", out)
-        self.fake(os_id="cachyos")
+        self.fake(os_id="fedora")
         rc, out, _ = self.cli("status")
-        self.assertIn("NOT Bazzite", out)
-        self.assertIn("only changes anything on a ONEXPLAYER 3 running Bazzite", out)
+        self.assertIn("NOT Bazzite or CachyOS", out)
+        self.assertIn("only changes anything on a ONEXPLAYER 3 running Bazzite or CachyOS", out)
 
     def test_corrupt_state_keeps_read_only_commands_working(self):
         self.fake()

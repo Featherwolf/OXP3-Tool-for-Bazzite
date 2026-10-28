@@ -2,10 +2,12 @@
 
 Changes are recorded before they are made (write-ahead), so an interrupted
 run never leaves a change the manifest does not know about. Kernel argument
-changes only land in a staged deployment, and a system update installed
-before the reboot is built from the booted arguments and drops them, so the
-manifest tracks additions and removals until /proc/cmdline confirms them
-(see ``reconcile``).
+changes only take effect at the next boot (on Bazzite they land in a staged
+deployment, which a system update installed before the reboot replaces), so
+the manifest tracks additions and removals until /proc/cmdline confirms them
+(see ``reconcile``). How the arguments are changed is the job of
+``kargs.KargBackend``: rpm-ostree on Bazzite, the boot loader's drop-in and
+generator on CachyOS.
 """
 
 from __future__ import annotations
@@ -15,22 +17,17 @@ from typing import Callable, Optional
 
 from .detect import Context
 from .fixes import BY_ID, RESTART_INPUTPLUMBER, Fix, FixError, Plan, PostStep, normalized_yaml_sha256, restart_pending
+from .kargs import HARDWARE_SETUP_UNIT, KARGS_UPDATE_WARNING  # noqa: F401 (re-exported)
 from .state import BACKUP_DIR, STATE_DIR, State, backup_path_for
 from .system import sha256_bytes
 from .templates import OWN_MARKER
 
 Printer = Callable[[str], None]
 
-HARDWARE_SETUP_UNIT = "bazzite-hardware-setup.service"
 UNIT_DIR = "/etc/systemd/system"
 # Directories only this tool writes to. Every fix that writes into one records
 # it, so whichever is reverted last removes it.
 TOOL_DIRS = ("/usr/local/libexec/oxp3-tool",)
-
-KARGS_UPDATE_WARNING = (
-    "Reboot before installing a system update: an update installed first is built from the "
-    "current kernel arguments and drops this change."
-)
 
 
 class EngineError(Exception):
@@ -72,9 +69,11 @@ def reconcile(ctx: Context, state: State) -> bool:
     """Settle kernel-argument bookkeeping against the system; returns True if state changed.
 
     - an addition whose outcome was unknown (interrupted run) is owned if the
-      argument is in the next boot's arguments, and dropped otherwise (not
-      while an rpm-ostree transaction is still running);
-    - a removal is finished once the argument is neither pending nor active;
+      argument is in the next boot's arguments or this tool's boot-loader
+      drop-in, and dropped otherwise (not while an rpm-ostree transaction is
+      still running);
+    - a removal is finished once the argument is neither pending, nor active,
+      nor in the drop-in;
     - an entry that records nothing and never completed is forgotten.
     """
     pending = ctx.pending_kargs
@@ -82,16 +81,17 @@ def reconcile(ctx: Context, state: State) -> bool:
         return False
     # A transaction still running may yet add the argument: settle it later.
     busy = ctx.rpm_ostree_busy
+    owned = ctx.owned_kargs
     changed = False
     for fix_id in list(state.fixes):
         entry = state.fixes[fix_id]
         for karg in [] if busy else list(entry.get("kargs_pending_add", [])):
             entry["kargs_pending_add"].remove(karg)
-            if karg in pending and karg not in entry.setdefault("kargs", []):
+            if (karg in pending or karg in owned) and karg not in entry.setdefault("kargs", []):
                 entry["kargs"].append(karg)
             changed = True
         for karg in list(entry.get("kargs_removal_pending", [])):
-            if karg not in pending and not ctx.karg_active(karg):
+            if karg not in pending and not ctx.karg_active(karg) and karg not in owned:
                 entry["kargs_removal_pending"].remove(karg)
                 changed = True
         if entry_is_empty(entry) and (not entry.get("applied_at") or entry.get("reverted")):
@@ -140,19 +140,25 @@ class Engine:
         return OWN_MARKER in "\n".join(head.splitlines()[:3])
 
     def _check_kargs_preconditions(self) -> list[str]:
-        ctx = self.ctx
-        if not ctx.has_rpm_ostree:
-            raise EngineError("rpm-ostree is not available, so kernel arguments cannot be changed")
-        if ctx.rpm_ostree_busy:
-            raise EngineError("an rpm-ostree transaction is running (an update?); try again when it is done")
-        if ctx.unit_state(HARDWARE_SETUP_UNIT) == "activating":
-            raise EngineError(f"{HARDWARE_SETUP_UNIT} is still running; try again in a minute")
-        if ctx.pending_kargs is None:
-            raise EngineError("could not read the current kernel arguments with `rpm-ostree kargs`")
-        notes = []
-        if ctx.has_staged_deployment:
-            notes.append("A staged update is waiting for a reboot; the kernel arguments are changed in it.")
-        return notes
+        backend = self.ctx.karg_backend
+        refusal = backend.refusal()
+        if refusal:
+            raise EngineError(refusal)
+        busy = backend.busy()
+        if busy:
+            raise EngineError(busy)
+        if self.ctx.pending_kargs is None:
+            raise EngineError(backend.unreadable)
+        return backend.notes()
+
+    def _kept_kargs(self) -> list[str]:
+        """Every kernel argument this tool owns now or is adding (what a boot-loader drop-in holds)."""
+        out: list[str] = []
+        for entry in self.state.fixes.values():
+            for karg in entry.get("kargs", []) + entry.get("kargs_pending_add", []):
+                if karg not in out:
+                    out.append(karg)
+        return out
 
     def _run_post(self, steps: list[PostStep], outcome: Outcome) -> None:
         seen = set()
@@ -179,7 +185,7 @@ class Engine:
         if not self.ctx.device_ok:
             raise EngineError("this is not a ONEXPLAYER 3 (use --force only for development)")
         if not self.ctx.os_ok:
-            raise EngineError("this is not Bazzite (use --force only for development)")
+            raise EngineError("this is not Bazzite or CachyOS (use --force only for development)")
         ids = {f.id for f in fixes}
         plans = []
         errors = []
@@ -225,7 +231,7 @@ class Engine:
         for karg in plan.kargs:
             removal = karg in (entry or {}).get("kargs_removal_pending", [])
             if not self.ctx.karg_pending(karg):
-                lines.append(f"add kernel argument {karg} (rpm-ostree kargs, reboot needed)")
+                lines.append(f"add kernel argument {karg} ({self.ctx.karg_backend.how}, reboot needed)")
             elif removal:
                 lines.append(f"keep kernel argument {karg} (cancels the pending removal)")
         for unit in plan.enable_units:
@@ -465,6 +471,7 @@ class Engine:
 
     def _apply_kargs(self, plans: list[tuple[Fix, Plan]], outcome: Outcome) -> None:
         pending = self.ctx.pending_kargs or []
+        owned = self.ctx.owned_kargs
         missing: list[str] = []
         for fix, plan in plans:
             entry = self.state.entry(fix.id)
@@ -476,6 +483,11 @@ class Engine:
                     if karg not in entry["kargs"]:
                         entry["kargs"].append(karg)
                 if karg in pending:
+                    if karg in owned:
+                        # In this tool's drop-in (state lost or another fix's): ours.
+                        if karg not in entry["kargs"]:
+                            entry["kargs"].append(karg)
+                        continue
                     if karg not in entry["kargs"]:
                         pre = entry["notes"].setdefault("kargs_already_set", [])
                         if karg not in pre:
@@ -490,17 +502,17 @@ class Engine:
         self.state.save()  # write-ahead
 
         if missing:
-            argv = ["rpm-ostree", "kargs"] + [f"--append-if-missing={k}" for k in missing]
-            self.out(f"  running: {' '.join(argv)}")
-            res = self.sys.run(argv, timeout=600)
+            backend = self.ctx.karg_backend
+            res = backend.change(missing, [], self._kept_kargs(), self.out)
             if not res.ok:
                 outcome.ok = False
-                outcome.errors.append(f"rpm-ostree kargs failed ({res.returncode}): {res.stderr.strip()[:500]}")
+                outcome.errors.append(res.error)
             self.ctx.invalidate_kargs()
             reconcile(self.ctx, self.state)
-            if res.ok:
+            if res.changed:
                 outcome.reboot_needed = True
-                outcome.messages.append(KARGS_UPDATE_WARNING)
+                if backend.update_warning:
+                    outcome.messages.append(backend.update_warning)
 
         for fix, plan in plans:
             entry = self.state.get(fix.id)
@@ -534,7 +546,7 @@ class Engine:
 
     def _needs_kargs_change(self, entry: dict) -> bool:
         return bool(entry.get("kargs") or entry.get("kargs_pending_add")) or any(
-            self.ctx.karg_pending(k) for k in entry.get("kargs_removal_pending", [])
+            self.ctx.karg_pending(k) or k in self.ctx.owned_kargs for k in entry.get("kargs_removal_pending", [])
         )
 
     def _disable_unit(self, unit: str, now: bool = False) -> None:
@@ -626,17 +638,18 @@ class Engine:
             entry["kargs_pending_add"] = []
         self.state.save()  # write-ahead
 
-        present = sorted({k for f in fix_ids for k in self.state.fixes[f]["kargs_removal_pending"] if k in pending})
+        owned = self.ctx.owned_kargs
+        present = sorted({k for f in fix_ids for k in self.state.fixes[f]["kargs_removal_pending"]
+                          if k in pending or k in owned})
         if present:
-            argv = ["rpm-ostree", "kargs"] + [f"--delete-if-present={k}" for k in present]
-            self.out(f"  running: {' '.join(argv)}")
-            res = self.sys.run(argv, timeout=600)
+            backend = self.ctx.karg_backend
+            res = backend.change([], present, self._kept_kargs(), self.out)
             self.ctx.invalidate_kargs()
             if not res.ok:
                 outcome.ok = False
-                outcome.errors.append(f"rpm-ostree kargs failed ({res.returncode}): {res.stderr.strip()[:500]}")
-                # Whatever is still in the next boot's arguments is still ours to remove.
-                still = self.ctx.pending_kargs or []
+                outcome.errors.append(res.error)
+                # Whatever is still in the next boot's arguments (or the drop-in) is still ours to remove.
+                still = (self.ctx.pending_kargs or []) + self.ctx.owned_kargs
                 for fix_id in fix_ids:
                     entry = self.state.fixes[fix_id]
                     for karg in list(entry["kargs_removal_pending"]):
@@ -645,8 +658,9 @@ class Engine:
                             entry["kargs"].append(karg)
                     if entry["kargs"]:
                         entry.pop("reverted", None)
-            else:
+            elif res.changed:
                 outcome.reboot_needed = True
-                outcome.messages.append(KARGS_UPDATE_WARNING)
+                if backend.update_warning:
+                    outcome.messages.append(backend.update_warning)
         reconcile(self.ctx, self.state)
         self.state.save()

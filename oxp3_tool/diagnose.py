@@ -9,7 +9,8 @@ import re
 import tarfile
 from typing import Optional
 
-from .detect import IMU_I2C_DEVICE, Context, parse_edid
+from .detect import CACHYOS, IMU_I2C_DEVICE, Context, parse_edid
+from .kargs import LimineBackend
 from .state import STATE_FILE
 
 # Kernel log patterns worth calling out, with what they usually mean.
@@ -72,6 +73,25 @@ COMMANDS: list[tuple[str, list[str]]] = [
                                          "--grep", "gamescope|known display", "-n", "3000"]),
 ]
 
+# CachyOS replaces the rpm-ostree and rpm commands; the rest of COMMANDS is shared.
+CACHYOS_COMMANDS: list[tuple[str, list[str]]] = [
+    ("packages.txt", ["pacman", "-Q", "linux-cachyos", "linux-cachyos-deckify", "linux-cachyos-lts", "inputplumber",
+                      "gamescope", "gamescope-session-cachyos", "cachyos-handheld", "steam", "steamos-manager",
+                      "steamos-powerbuttond", "hhd", "systemd", "linux-firmware", "mkinitcpio", "dracut", "limine",
+                      "limine-mkinitcpio-hook", "systemd-boot-manager", "grub"]),
+    ("bootctl-status.txt", ["bootctl", "status", "--no-pager"]),
+    ("units-cachyos.txt", ["systemctl", "status", "--no-pager", "--lines=10", "plasmalogin.service",
+                           "steamos-powerbuttond.service", "hhd@*.service"]),
+]
+CACHYOS_TEXT_GLOBS = [
+    "/etc/default/limine", "/etc/limine-entry-tool.conf", "/etc/limine-entry-tool.d/*.conf",
+    "/etc/sdboot-manage.conf", "/etc/sdboot-manage.conf.d/*.conf", "/usr/lib/sdboot-manage.conf.d/*.conf",
+    "/etc/kernel/cmdline", "/etc/default/grub", "/etc/default/grub.d/*.cfg", "/boot/refind_linux.conf",
+    "/etc/mkinitcpio.conf", "/etc/mkinitcpio.conf.d/*.conf", "/etc/inputplumber/devices.d/*.yaml",
+    "/etc/inputplumber/capability_maps.d/*.yaml", "/etc/modprobe.d/*.conf",
+    "/boot/limine.conf", "/efi/limine.conf", "/boot/efi/limine.conf", "/boot/loader/entries/*.conf",
+]
+
 TEXT_FILES = [
     "/proc/cmdline",
     "/etc/os-release",
@@ -109,6 +129,7 @@ class Redactor:
 
     def __init__(self) -> None:
         self.macs: dict[str, str] = {}
+        self.literals: dict[str, str] = {}  # e.g. the machine id (in Limine's boot entry paths)
 
     def _mac(self, m: re.Match) -> str:
         key = m.group(0).lower()
@@ -119,6 +140,8 @@ class Redactor:
         return self.macs[key]
 
     def __call__(self, text: str) -> str:
+        for value, tag in self.literals.items():
+            text = text.replace(value, tag)
         text = _SERIAL_RE.sub(r"\1<redacted>", text)
         text = _UNIQ_RE.sub(r"\1<redacted>", text)
         return _MAC_RE.sub(self._mac, text)
@@ -157,6 +180,9 @@ def scan_patterns(text: str) -> list[tuple[str, int, str]]:
 def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     sys = ctx.sys
     bundle = Bundle()
+    machine_id = (sys.read_attr("/etc/machine-id") or "").strip()
+    if re.fullmatch(r"[0-9a-f]{32}", machine_id):
+        bundle.redact.literals[machine_id] = "<machine-id>"
     bundle.add("status.txt", status_text)
     state = sys.read_bytes(STATE_FILE)
     if state is not None:
@@ -183,7 +209,7 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
         data = sys.read_regular(path, limit)
         return data.decode(errors="replace") if data is not None else ""
 
-    for root in ("/home", "/var/home"):  # /home is a symlink to /var/home on Bazzite
+    for root in ("/home", "/var/home"):  # /home is a symlink to /var/home on Bazzite (plain on CachyOS)
         for pkg in sys.glob(f"{root}/*/.local/share/Steam/package"):
             user = pkg.split("/")[-5]
             if user in seen:
@@ -206,7 +232,20 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     if stats:
         bundle.add("suspend_stats.txt", "\n".join(stats) + "\n")
 
-    for name, argv in COMMANDS:
+    commands = COMMANDS
+    if ctx.os_family == CACHYOS:
+        commands = [c for c in COMMANDS if c[1][0] not in ("rpm-ostree", "rpm")] + CACHYOS_COMMANDS
+        for pattern in CACHYOS_TEXT_GLOBS:
+            for path in sys.glob(pattern):
+                data = sys.read_bytes(path)
+                if data is not None:
+                    bundle.add("files" + path, data)
+        backend = ctx.karg_backend
+        if isinstance(backend, LimineBackend):
+            for kernel in backend.kernels():
+                commands.append((f"limine-cmdline-{kernel}.txt", ["limine-entry-tool", "--get-cmdline", kernel]))
+        bundle.add("boot.txt", f"kernel arguments: {backend.name}; {backend.describe() or backend.refusal()}\n")
+    for name, argv in commands:
         res = sys.run(argv, timeout=120)
         bundle.add(f"commands/{name}", f"$ {' '.join(argv)}\n(exit {res.returncode})\n{res.stdout}{res.stderr}")
 

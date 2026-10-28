@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 from pathlib import Path
 from typing import Optional, Sequence
@@ -401,3 +402,309 @@ class FakeOxp3:
     def update_before_reboot(self) -> None:
         """Simulate `bootc upgrade` staging an update built from the booted kernel arguments."""
         self.runner.kargs = (self.root / "proc/cmdline").read_text().split()
+
+
+# -- CachyOS ---------------------------------------------------------------------
+
+MACHINE_ID = "0123456789abcdef0123456789abcdef"
+CACHY_KERNELS = {"linux-cachyos-deckify": "7.2.11-1-cachyos-deckify", "linux-cachyos-lts": "6.18.55-2-cachyos-lts"}
+CALAMARES_LIMINE = ('ESP_PATH="/boot"\n'
+                    'KERNEL_CMDLINE[default]+="quiet nowatchdog splash rw rootflags=subvol=/@ root=UUID=abcd"\n')
+CLI_INSTALLER_LIMINE = 'ESP_PATH="/boot"\nKERNEL_CMDLINE[default]="quiet rw root=UUID=abcd"\n'
+SDBOOT_MANAGE_CONF = 'LINUX_OPTIONS="nowatchdog quiet splash"\nREMOVE_EXISTING="no"\nOVERWRITE_EXISTING="yes"\n'
+DEFAULT_GRUB = ("GRUB_DEFAULT='0'\nGRUB_TIMEOUT='5'\nGRUB_CMDLINE_LINUX_DEFAULT='nowatchdog nvme_load=YES "
+                "zswap.enabled=0 splash loglevel=3'\nGRUB_CMDLINE_LINUX=\"\"\n")
+
+
+def _quoted(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+class FakeCachyRunner(FakeRunner):
+    """The CachyOS tools: pacman, limine-entry-tool/limine-mkinitcpio, sdboot-manage, grub-mkconfig.
+
+    The boot-entry generators follow their real counterparts (limine-entry-tool's ConfigReader,
+    sdboot-manage, grub-mkconfig's grub.d loop), written independently of oxp3_tool.kargs.
+    """
+
+    def __init__(self, root: Path, kernels: dict[str, str]):
+        super().__init__(["initrd=\\initramfs.img", "quiet", "rw", "root=UUID=abcd"])
+        self.root = root
+        self.kernels = dict(kernels)
+        self.packages = {"inputplumber": "0.83.1-1.1"}
+        self.limine_exit = 0
+        self.limine_skip: set[str] = set()
+        self.gen_fail = 0  # how many sdboot-manage/grub-mkconfig runs fail next
+        self.regenerations = 0
+
+    def read(self, path: str) -> Optional[str]:
+        p = self.root / path.lstrip("/")
+        return p.read_text() if p.is_file() else None
+
+    def write(self, path: str, text: str) -> None:
+        p = self.root / path.lstrip("/")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def files(self, pattern: str) -> list[str]:
+        return sorted("/" + str(p.relative_to(self.root)) for p in self.root.glob(pattern.lstrip("/")))
+
+    def __call__(self, argv: Sequence[str], timeout: Optional[int] = None) -> CommandResult:
+        argv = list(argv)
+        cmd = argv[0]
+        if cmd not in ("pacman", "limine-entry-tool", "limine-mkinitcpio", "bash", "sh", "sdboot-manage",
+                       "grub-mkconfig", "bootctl"):
+            return super().__call__(argv, timeout)
+        self.calls.append(argv)
+        if self._failing(argv):
+            return CommandResult(1, "", f"simulated failure of {shlex.join(argv)}")
+        if cmd == "pacman" and argv[1] == "-Q":
+            found = [f"{n} {self.packages[n]}" for n in argv[2:] if n in self.packages]
+            return CommandResult(0 if len(found) == len(argv) - 2 else 1, "".join(f + "\n" for f in found))
+        if cmd == "pacman" and argv[1] == "-Qqo":
+            owners = []
+            for path in argv[2:]:
+                for name, version in self.kernels.items():
+                    if path == f"/usr/lib/modules/{version}/modules.builtin":
+                        owners.append(name)
+            return CommandResult(0, "".join(o + "\n" for o in owners))
+        if cmd == "limine-entry-tool" and argv[1:2] == ["--get-cmdline"]:
+            return CommandResult(0, "some log line\n" + self.limine_cmdline(argv[2]) + "\n")
+        if cmd == "limine-mkinitcpio":
+            return self.limine_regen()
+        if cmd == "bash" and "/etc/sdboot-manage.conf" in argv[-1]:
+            values = self.shell_vars(["/etc/sdboot-manage.conf", *self.files("/usr/lib/sdboot-manage.conf.d/*.conf"),
+                                      *self.files("/etc/sdboot-manage.conf.d/*.conf")])
+            return CommandResult(0, f"{values.get('LINUX_OPTIONS', '')}\n{values.get('NO_AUTOGEN', '')}\n")
+        if cmd == "sdboot-manage" and argv[1:] == ["gen"]:
+            return self.sdboot_gen()
+        if cmd == "bootctl" and "--print-esp-path" in argv:
+            return CommandResult(0, "/boot\n")
+        if cmd == "sh" and "/etc/default/grub" in argv[-1]:
+            values = self.shell_vars(["/etc/default/grub", *self.files("/etc/default/grub.d/*.cfg")])
+            return CommandResult(0, f"{values.get('GRUB_CMDLINE_LINUX', '')} "
+                                    f"{values.get('GRUB_CMDLINE_LINUX_DEFAULT', '')}\n")
+        if cmd == "grub-mkconfig":
+            return self.grub_gen(argv[argv.index("-o") + 1])
+        return CommandResult(0)
+
+    # -- limine-entry-tool ---------------------------------------------------
+
+    def limine_map(self) -> dict[str, str]:
+        files = self.files("/usr/share/limine-entry-tool.d/*.conf") + ["/etc/limine-entry-tool.conf"] + \
+            self.files("/etc/limine-entry-tool.d/*.conf") + ["/etc/default/limine"]
+        cmdlines: dict[str, str] = {}
+        for path in files:
+            for line in (self.read(path) or "").splitlines():
+                line = line.strip()
+                if not line.startswith("KERNEL_CMDLINE"):
+                    continue
+                append = "+=" in line
+                key, value = line.split("+=" if append else "=", 1)
+                name = key[len("KERNEL_CMDLINE"):].strip("[] ") or "default"
+                value = _quoted(value)
+                if append and name in cmdlines:
+                    cmdlines[name] = value + " " + cmdlines[name]  # limine-entry-tool prepends
+                else:
+                    cmdlines[name] = value
+        return cmdlines
+
+    def limine_cmdline(self, kernel: str) -> str:
+        cmdlines = self.limine_map()
+        if not cmdlines.get("default", "").strip():
+            cmdlines["default"] = (self.read("/etc/kernel/cmdline") or "").strip() or \
+                (self.read("/proc/cmdline") or "").strip()
+        value = cmdlines.get(kernel, "")
+        if not value.strip() and "fallback" in kernel:
+            value = cmdlines.get("fallback", "")
+        return value if value.strip() else cmdlines["default"]
+
+    def limine_regen(self) -> CommandResult:
+        self.regenerations += 1
+        if self.limine_exit in (1, 2):
+            return CommandResult(self.limine_exit, "", "simulated limine-mkinitcpio failure")
+        lines = ["timeout: 5", "default_entry: 2", "", f"comment: machine-id={MACHINE_ID}", "/+CachyOS",
+                 f"    comment: machine-id={MACHINE_ID}"]
+        old = self.read("/boot/limine.conf") or ""
+        for kernel, version in self.kernels.items():
+            for name in (kernel, f"{kernel}-fallback"):
+                if kernel in self.limine_skip:
+                    # Keep whatever the old file had for this kernel (process_kernel failed, exit 0).
+                    m = re.search(rf"  //{re.escape(name)}\n(?:    .*\n)+", old)
+                    if m:
+                        lines += m.group(0).rstrip("\n").split("\n")
+                    continue
+                initramfs = "initramfs-fallback" if name.endswith("-fallback") else "initramfs"
+                lines += [f"  //{name}", f"    comment: Kernel version: {version}", f"    comment: kernel-id={kernel}",
+                          "    protocol: linux",
+                          f"    module_path: boot():/{MACHINE_ID}/{kernel}/{initramfs}#00",
+                          f"    path: boot():/{MACHINE_ID}/{kernel}/vmlinuz#00",
+                          f"    cmdline: {self.limine_cmdline(name)}"]
+        lines += ["  //Snapshots", "    ///1 2026-10-27", f"      path: boot():/{MACHINE_ID}/limine_history/vmlinuz#00",
+                  "      cmdline: quiet rw root=UUID=abcd snapshot=1"]
+        self.write("/boot/limine.conf", "\n".join(lines) + "\n")
+        return CommandResult(self.limine_exit, "==> Building image\n", "")
+
+    # -- sdboot-manage / grub-mkconfig ----------------------------------------------
+
+    def shell_vars(self, files: list[str]) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for path in files:
+            for line in (self.read(path) or "").splitlines():
+                m = re.match(r"^\s*([A-Z_]+)(\+?)=(.*)$", line)
+                if not m:
+                    continue
+                name, plus, value = m.group(1), m.group(2), _quoted(m.group(3))
+                value = value.replace("${" + name + "}", values.get(name, "")).replace("$" + name, values.get(name, ""))
+                values[name] = values.get(name, "") + value if plus else value
+        return values
+
+    def sdboot_gen(self) -> CommandResult:
+        self.regenerations += 1
+        if self.gen_fail:
+            self.gen_fail -= 1
+            return CommandResult(1, "", "Error: There are no boot loader entries after entry generation")
+        values = self.shell_vars(["/etc/sdboot-manage.conf", *self.files("/usr/lib/sdboot-manage.conf.d/*.conf"),
+                                  *self.files("/etc/sdboot-manage.conf.d/*.conf")])
+        for kernel in self.kernels:
+            self.write(f"/boot/loader/entries/{kernel}.conf",
+                       f"title {kernel}\noptions root=UUID=abcd rw {values.get('LINUX_OPTIONS', '')}\n"
+                       f"linux /vmlinuz-{kernel}\ninitrd /initramfs-{kernel}.img\n")
+            fallback = values.get("LINUX_FALLBACK_OPTIONS", "")
+            self.write(f"/boot/loader/entries/{kernel}-fallback.conf",
+                       f"title {kernel} (Fallback)\noptions root=UUID=abcd rw {fallback}\n"
+                       f"linux /vmlinuz-{kernel}\ninitrd /initramfs-{kernel}-fallback.img\n")
+        return CommandResult(0)
+
+    def grub_gen(self, output: str) -> CommandResult:
+        self.regenerations += 1
+        if self.gen_fail:
+            self.gen_fail -= 1
+            return CommandResult(1, "", "grub-mkconfig: syntax error")
+        values = self.shell_vars(["/etc/default/grub", *self.files("/etc/default/grub.d/*.cfg")])
+        args = f"{values.get('GRUB_CMDLINE_LINUX', '')} {values.get('GRUB_CMDLINE_LINUX_DEFAULT', '')}".strip()
+        lines = ["### BEGIN /etc/grub.d/00_header ###", "set timeout=5", "### END /etc/grub.d/00_header ###",
+                 "### BEGIN /etc/grub.d/10_linux ###"]
+        for kernel in self.kernels:
+            lines += [f"menuentry 'CachyOS ({kernel})' {{", f"\tlinux\t/vmlinuz-{kernel} root=UUID=abcd rw  {args}",
+                      f"\tinitrd\t/initramfs-{kernel}.img", "}",
+                      f"menuentry 'CachyOS ({kernel}, recovery)' {{",
+                      f"\tlinux\t/vmlinuz-{kernel} root=UUID=abcd rw single", "}"]
+        lines.append("### END /etc/grub.d/10_linux ###")
+        self.write(output, "\n".join(lines) + "\n")
+        return CommandResult(0)
+
+
+class FakeCachyOS(FakeOxp3):
+    """A ONEXPLAYER 3 running CachyOS (Handheld Edition by default), with one boot loader set up."""
+
+    def __init__(self, root: Path, bootloader: str = "limine", kernels: Optional[dict[str, str]] = None,
+                 limine_default: str = CALAMARES_LIMINE, loader_info: Optional[str] = "default",
+                 handheld: bool = True, inputplumber: bool = True, steamos_manager: bool = False,
+                 secure_boot: bool = False, gm7: bool = True):
+        self.root = Path(root)
+        self.runner = FakeCachyRunner(self.root, kernels or CACHY_KERNELS)
+        self.bootloader = bootloader
+        self.build(inputplumber=inputplumber, gm7=gm7)
+        self.cachyos(bootloader, limine_default, loader_info, handheld, inputplumber, steamos_manager, secure_boot)
+
+    def cachyos(self, bootloader, limine_default, loader_info, handheld, inputplumber, steamos_manager,
+                secure_boot) -> None:
+        for path in ("/usr/share/ublue-os/image-info.json", "/usr/bin/rpm-ostree", "/usr/bin/rpm",
+                     "/usr/bin/gamescope-session-plus"):
+            (self.root / path.lstrip("/")).unlink(missing_ok=True)
+        self.write("/etc/os-release", 'NAME="CachyOS Linux"\nPRETTY_NAME="CachyOS"\nID=cachyos\nID_LIKE=arch\n')
+        self.write("/etc/pacman.conf", "[options]\nArchitecture = auto\n\n[cachyos-v3]\nInclude = x\n")
+        self.write("/etc/machine-id", MACHINE_ID + "\n")
+        self.write("/proc/sys/kernel/osrelease", next(iter(self.runner.kernels.values())) + "\n")
+        self.write("/proc/self/mounts", "/dev/nvme0n1p2 / btrfs rw 0 0\n/dev/nvme0n1p1 /boot vfat rw 0 0\n")
+        for tool in ("pacman", "bootctl", "bash", "sh"):
+            self.write(f"/usr/bin/{tool}", "")
+        for version in self.runner.kernels.values():
+            self.write(f"/usr/lib/modules/{version}/modules.builtin", "")
+        if not inputplumber:
+            self.runner.packages.pop("inputplumber", None)
+        if handheld:
+            self.mkdir("/usr/share/cachyos-handheld")
+            self.write("/usr/lib/steamos/gamescope-session", "#!/bin/bash\n")
+            self.write("/usr/lib/systemd/user/gamescope-session.service", "[Service]\n")
+            self.write("/usr/share/wayland-sessions/gamescope-session.desktop", "[Desktop Entry]\n")
+        if steamos_manager:
+            self.runner.unit_active["steamos-manager.service"] = "active"
+        if secure_boot:
+            self.write("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+                       b"\x06\x00\x00\x00\x01")
+        names = {"limine": "Limine 12.9.4", "systemd-boot": "systemd-boot 258.1-1", "grub": "GRUB 2.16",
+                 "refind": "rEFInd 0.14.2"}
+        info = names.get(bootloader) if loader_info == "default" else loader_info
+        if info:
+            self.write("/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f",
+                       b"\x06\x00\x00\x00" + (info + "\0").encode("utf-16-le"))
+        if bootloader == "limine":
+            for tool in ("limine", "limine-entry-tool", "limine-mkinitcpio"):
+                self.write(f"/usr/bin/{tool}", "")
+            self.write("/etc/default/limine", limine_default)
+            self.write("/etc/limine-entry-tool.conf", "### defaults\n#KERNEL_CMDLINE[default]=\n")
+            self.mkdir("/etc/limine-entry-tool.d")
+        elif bootloader == "systemd-boot":
+            self.write("/usr/bin/sdboot-manage",
+                       "for file in /usr/lib/sdboot-manage.conf.d/*.conf /etc/sdboot-manage.conf.d/*.conf; do\n")
+            self.write("/etc/sdboot-manage.conf", SDBOOT_MANAGE_CONF)
+            self.mkdir("/etc/sdboot-manage.conf.d")
+            self.mkdir("/boot/loader/entries")
+        elif bootloader == "grub":
+            self.write("/usr/bin/grub-mkconfig", "for dropin in ${sysconfdir}/default/grub.d/*.cfg ; do\n")
+            self.write("/etc/default/grub", DEFAULT_GRUB)
+        elif bootloader == "refind":
+            self.write("/boot/refind_linux.conf",
+                       '"Boot with standard options"  "quiet rw root=UUID=abcd"\n')
+        self.regenerate()
+        self.boot()
+
+    def regenerate(self) -> None:
+        """What a kernel update's pacman hook does: rebuild the boot entries from the configuration."""
+        if self.bootloader == "limine":
+            self.runner.limine_regen()
+        elif self.bootloader == "systemd-boot":
+            self.runner.sdboot_gen()
+        elif self.bootloader == "grub":
+            self.runner.grub_gen("/boot/grub/grub.cfg")
+        self.runner.regenerations = 0
+
+    def entries(self) -> dict[str, list[str]]:
+        """Boot entry name -> its kernel arguments, as the fake generators wrote them."""
+        out: dict[str, list[str]] = {}
+        if self.bootloader == "limine":
+            name = None
+            for line in (self.runner.read("/boot/limine.conf") or "").splitlines():
+                if line.startswith("  //"):
+                    name = line.strip()[2:]
+                elif name and line.strip().startswith("cmdline:"):
+                    out[name] = line.split(":", 1)[1].split()
+        elif self.bootloader == "systemd-boot":
+            for path in self.runner.files("/boot/loader/entries/*.conf"):
+                for line in (self.runner.read(path) or "").splitlines():
+                    if line.startswith("options "):
+                        out[path.rsplit("/", 1)[1][:-5]] = line.split()[1:]
+        elif self.bootloader == "grub":
+            for line in (self.runner.read("/boot/grub/grub.cfg") or "").splitlines():
+                parts = line.split()
+                if parts[:1] == ["linux"]:
+                    out[parts[1] + (" (recovery)" if "single" in parts else "")] = parts[2:]
+        return out
+
+    def boot(self) -> None:
+        """Reboot into the first kernel's entry."""
+        entries = self.entries()
+        first = next(iter(self.runner.kernels))
+        args = entries.get(first) or entries.get(f"/vmlinuz-{first}") or self.runner.kargs
+        self.write("/proc/cmdline", " ".join(args) + "\n")
+
+    def pacman_lock(self, on: bool = True) -> None:
+        if on:
+            self.write("/var/lib/pacman/db.lck", "")
+        else:
+            (self.root / "var/lib/pacman/db.lck").unlink(missing_ok=True)

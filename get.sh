@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/get.sh | sudo bash
 #
 # Run it again to update. It installs /usr/local/bin/oxp3-tool (writable on
-# Bazzite, survives OS updates) and an "OXP3 Tool" entry in the Desktop Mode
+# Bazzite, survives OS updates on Bazzite and CachyOS) and an "OXP3 Tool" entry in the Desktop Mode
 # app menu. Options: --file PATH installs a local build instead of
 # downloading; --no-menu skips the app menu entry. OXP3_TOOL_REF picks a
 # branch or tag (default: the repository's default branch); OXP3_TOOL_URL
@@ -33,7 +33,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 if ! command -v python3 >/dev/null 2>&1; then
-    echo "python3 is required." >&2
+    echo "python3 is required (on CachyOS: sudo pacman -S python)." >&2
     exit 1
 fi
 

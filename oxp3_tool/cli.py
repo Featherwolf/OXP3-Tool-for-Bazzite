@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from . import PROJECT_URL, __version__, diagnose, steam_session, templates
-from .detect import NATIVE_STEAM, OGUI, Context
+from .detect import CACHYOS, NATIVE_STEAM, OGUI, Context
 from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
 from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix
 from .state import State, StateError
@@ -36,9 +36,10 @@ def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
     if entry and entry.get("reverted"):
         lines = []
         for karg in entry.get("kargs_removal_pending", []):
-            if ctx.karg_pending(karg):
-                lines.append(f"{karg} came back with a system update installed before the reboot; "
-                             f"run `sudo oxp3-tool revert {fix.id}` again")
+            if ctx.karg_pending(karg) or karg in ctx.owned_kargs:
+                why = ("came back with a system update installed before the reboot"
+                       if ctx.karg_backend.name == "rpm-ostree" else "is still in the next boot's configuration")
+                lines.append(f"{karg} {why}; run `sudo oxp3-tool revert {fix.id}` again")
             else:
                 lines.append(f"{karg} is removed from the next boot (reboot to finish)")
         return "reverting", lines
@@ -96,8 +97,14 @@ def status_text(ctx: Context, state: State) -> str:
 
     os_name = ctx.os_release.get("PRETTY_NAME") or ctx.os_release.get("NAME") or "unknown OS"
     image = f", image {ctx.image_name}" if ctx.image_name else ""
-    not_bazzite = "" if ctx.is_bazzite else (" - NOT Bazzite (--force)" if ctx.force else " - NOT Bazzite")
-    lines.append(f"OS:       {os_name}{image}, kernel {ctx.kernel_release or '?'}{not_bazzite}")
+    if ctx.cachyos_handheld:
+        image = ", Handheld Edition"
+    unsupported = "" if ctx.platform else (
+        " - NOT Bazzite or CachyOS (--force)" if ctx.force else " - NOT Bazzite or CachyOS")
+    lines.append(f"OS:       {os_name}{image}, kernel {ctx.kernel_release or '?'}{unsupported}")
+    boot = ctx.karg_backend.describe() if ctx.os_family == CACHYOS else ""
+    if boot:
+        lines.append(boot + (", Secure Boot on" if ctx.secure_boot else ""))
 
     ip = ctx.inputplumber
     if ip.installed:
@@ -157,6 +164,11 @@ def status_text(ctx: Context, state: State) -> str:
     game = {OGUI: "Steam behind the OpenGamepadUI overlay (Bazzite default; "
                   "`ujust configure-opengamepadui disable` switches to native Steam Input)",
             NATIVE_STEAM: "native Steam Input"}.get(ctx.game_mode_input or "")
+    if game and ctx.os_family == CACHYOS:
+        game += (" (CachyOS gamescope-session; steamos-manager selects the Steam Deck controller)"
+                 if ctx.steamos_manager else
+                 " (CachyOS gamescope-session; without steamos-manager Steam gets InputPlumber's Xbox Elite "
+                 "controller)")
     if game:
         lines.append(f"Game Mode: {game}")
 
@@ -183,7 +195,7 @@ def status_text(ctx: Context, state: State) -> str:
             lines.append(_wrap(item, "  - ", "    "))
     lines.append("")
     if not (ctx.device_ok and ctx.os_ok):
-        lines.append("This tool only changes anything on a ONEXPLAYER 3 running Bazzite.")
+        lines.append("This tool only changes anything on a ONEXPLAYER 3 running Bazzite or CachyOS.")
     else:
         lines.append("`sudo oxp3-tool apply` applies the recommended fixes; `oxp3-tool list` explains each one.")
     return "\n".join(lines)
@@ -374,12 +386,12 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="oxp3-tool",
-        description="Controller and wake-from-sleep fixes for the OneXPlayer 3 on Bazzite.",
+        description="Controller and wake-from-sleep fixes for the OneXPlayer 3 on Bazzite and CachyOS.",
         epilog=f"Fix ids: {', '.join(f.id for f in ALL_FIXES)}. Project: {PROJECT_URL}",
     )
     p.add_argument("--version", action="version", version=f"oxp3-tool {__version__}")
     p.add_argument("--force", action="store_true",
-                   help="skip the ONEXPLAYER 3 / Bazzite checks (development only)")
+                   help="skip the ONEXPLAYER 3 / operating system checks (development only)")
     p.add_argument("--root", default="/", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="command")
 

@@ -307,6 +307,9 @@ class RefreshState:
     dsb_errors: int = 0
     psr_errors: int = 0
     vbt_vswing_port: Optional[str] = None  # the kernel ignored the firmware's eDP drive levels for this port
+    kernel_version: Optional[tuple[int, int]] = None  # (major, minor) of the running kernel
+    remove_karg_hint: str = "`sudo rpm-ostree kargs --delete=xe.enable_dc_balance`"
+    kernel_update_hint: str = "until Bazzite ships kernel 7.2.10 or later"
     kwin: list[KwinOutput] = field(default_factory=list)
     kwin_is_mine: bool = False  # kwin holds only the invoking user's settings
     game_mode: bool = True
@@ -327,6 +330,8 @@ class RefreshState:
         """True when variable refresh would be held down by DC balance; None when unknown."""
         if self.dc_balance_param is None:
             return None
+        if self.kernel_version is not None and self.kernel_version < (7, 0):
+            return False  # VRR DC balance arrived in 7.0
         if self.dc_balance_param and not self.dc_balance_on:
             return False
         if self.dmc_loaded is False:
@@ -366,6 +371,8 @@ class RefreshState:
             kernel = "xe.enable_dc_balance=1 turns the variable-refresh bug back on"
         elif self.dc_balance_param:
             kernel = "the kernel has the variable-refresh fix (xe.enable_dc_balance)"
+        elif self.kernel_version is not None and self.kernel_version < (7, 0):
+            kernel = "the kernel predates VRR DC balance (7.0), so the variable-refresh bug does not apply"
         else:
             kernel = "the kernel predates the variable-refresh fix (7.2.10)"
         lines.append(f"display firmware (DMC) {dmc}; {kernel}")
@@ -398,8 +405,7 @@ class RefreshState:
         if risk:
             if self.dc_balance_on:
                 cause = ("xe.enable_dc_balance=1 turns VRR DC balance back on, so variable refresh holds the screen "
-                         f"far below {full} Hz. Remove it (`sudo rpm-ostree kargs --delete=xe.enable_dc_balance`)"
-                         " or keep variable refresh off.")
+                         f"far below {full} Hz. Remove it ({self.remove_karg_hint}) or keep variable refresh off.")
             else:
                 cause = (f"On this kernel with this display firmware, variable refresh holds the screen far below "
                          f"{full} Hz (Intel bug, fixed in kernel 7.2.10).")
@@ -419,9 +425,8 @@ class RefreshState:
                 if self.dc_balance_on:
                     out.append("In Game Mode, leave variable refresh (VRR) off while xe.enable_dc_balance=1 is set.")
                 else:
-                    out.append(f"In Game Mode, leave variable refresh (VRR) off until Bazzite ships kernel 7.2.10 or "
-                               f"later: on this kernel with this display firmware it holds the screen far below "
-                               f"{full} Hz.")
+                    out.append(f"In Game Mode, leave variable refresh (VRR) off {self.kernel_update_hint}: on this "
+                               f"kernel with this display firmware it holds the screen far below {full} Hz.")
         elif risk is None and self.dc_balance_param is False and self.dmc_loaded is not False:
             how = " (run with sudo)" if self.needs_root else ""
             out.append(f"Could not read the display firmware version{how}. If it is v2.33 or later, variable "

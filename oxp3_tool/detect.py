@@ -1,8 +1,8 @@
 """Read-only detection of the device, the OS image and the software stack.
 
 Everything is feature-detected at runtime. Nothing is gated on kernel, BIOS or
-package version strings: Bazzite moves its kernel pin almost daily, and the
-OXP3 has shipped with several BIOS versions and GPU PCI IDs.
+package version strings: Bazzite and CachyOS move their kernels almost daily,
+and the OXP3 has shipped with several BIOS versions and GPU PCI IDs.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .display import (
     DC_BALANCE_PARAM,
@@ -35,6 +35,9 @@ from .display import (
     vbt_vswing_port,
 )
 from .system import System
+
+if TYPE_CHECKING:
+    from .kargs import KargBackend
 
 OXP3_SYS_VENDOR = "ONE-NETBOOK"
 OXP3_PRODUCT_NAME = "ONEXPLAYER 3"
@@ -143,6 +146,16 @@ INTEL_SOURCE_OUI = b"\x00\xaa\x01"
 # overlay; `ujust configure-opengamepadui disable` creates the per-user file
 # below, which switches back to native Steam Input.
 OGUI_SESSION = "/usr/share/gamescope-session-plus/sessions.d/ogui-steam"
+BAZZITE_GAME_MODE = ("/usr/bin/gamescope-session-plus", "/usr/share/gamescope-session-plus/gamescope-session-plus")
+# CachyOS's Handheld Edition runs Valve's SteamOS session (gamescope-session-cachyos), with
+# native Steam Input: OpenGamepadUI is not packaged there.
+CACHYOS_GAME_MODE = "/usr/lib/steamos/gamescope-session"
+CACHYOS_GAME_MODE_UNITS = ("/usr/lib/systemd/user/gamescope-session.service",
+                           "/usr/share/wayland-sessions/gamescope-session.desktop")
+CACHYOS_HANDHELD = "/usr/share/cachyos-handheld"
+BAZZITE = "bazzite"
+CACHYOS = "cachyos"
+OS_NAMES = {BAZZITE: "Bazzite", CACHYOS: "CachyOS"}
 OGUI_USER_OVERRIDE = ".config/gamescope-session-plus/sessions.d/ogui-steam"
 OGUI = "ogui"
 NATIVE_STEAM = "steam"
@@ -284,12 +297,72 @@ class Context:
         return out
 
     @cached_property
+    def platform(self) -> Optional[str]:
+        """BAZZITE or CACHYOS, the systems this tool supports; None for anything else."""
+        os_id = self.os_release.get("ID")
+        if os_id == BAZZITE:
+            return BAZZITE
+        if os_id == CACHYOS:
+            return CACHYOS
+        if os_id == "arch" and re.search(r"^\[cachyos", self.sys.read_text("/etc/pacman.conf") or "", re.M):
+            return CACHYOS  # CachyOS's repositories on a system whose os-release still says Arch
+        return None
+
+    @cached_property
     def is_bazzite(self) -> bool:
-        return self.os_release.get("ID") == "bazzite"
+        return self.platform == BAZZITE
+
+    @cached_property
+    def is_cachyos(self) -> bool:
+        return self.platform == CACHYOS
 
     @property
     def os_ok(self) -> bool:
-        return self.is_bazzite or self.force
+        return self.platform is not None or self.force
+
+    @cached_property
+    def os_family(self) -> str:
+        """The supported system whose tools this machine has: the platform, or a guess under --force."""
+        if self.platform:
+            return self.platform
+        return CACHYOS if self.sys.exists("/usr/bin/pacman") and not self.has_rpm_ostree else BAZZITE
+
+    @cached_property
+    def steamos_manager(self) -> bool:
+        """steamos-manager runs (CachyOS): it switches InputPlumber's controllers to the Steam Deck one."""
+        return self.unit_state("steamos-manager.service") == "active"
+
+    @cached_property
+    def cachyos_handheld(self) -> bool:
+        return self.is_cachyos and self.sys.is_dir(CACHYOS_HANDHELD)
+
+    def package_version(self, name: str) -> Optional[str]:
+        """Installed version of a package (without release or epoch), from rpm or pacman."""
+        if self.os_family == CACHYOS:
+            res = self.sys.run(["pacman", "-Q", name], timeout=30)
+            parts = res.stdout.split()
+            if not res.ok or len(parts) < 2:
+                return None
+            version = parts[-1].split(":", 1)[-1]
+            return version.rsplit("-", 1)[0] if "-" in version else version
+        res = self.sys.run(["rpm", "-q", "--qf", "%{VERSION}", name], timeout=30)
+        return res.stdout.strip() if res.ok and res.stdout.strip() else None
+
+    @cached_property
+    def secure_boot(self) -> bool:
+        from .kargs import SECURE_BOOT
+
+        data = self.sys.read_bytes(SECURE_BOOT)
+        return bool(data) and len(data) >= 5 and data[-1] == 1
+
+    def vfat_mount(self, candidates: tuple[str, ...]) -> Optional[str]:
+        """The first of ``candidates`` that is a vfat mount (an EFI system partition)."""
+        mounts = {}
+        for line in (self.sys.read_text("/proc/self/mounts") or "").splitlines():
+            fields = line.split()
+            if len(fields) >= 3:
+                mounts[fields[1].replace("\\040", " ")] = fields[2]
+        return next((c for c in candidates if mounts.get(c) == "vfat"), None)
 
     @cached_property
     def image_info(self) -> dict:
@@ -326,14 +399,23 @@ class Context:
         return self.sys.which("rpm-ostree") is not None
 
     @cached_property
+    def karg_backend(self) -> KargBackend:
+        """How kernel arguments are read and changed here: rpm-ostree, or CachyOS's boot loader."""
+        from .kargs import RpmOstreeBackend, detect_cachyos_backend
+
+        if self.os_family == CACHYOS:
+            return detect_cachyos_backend(self)
+        return RpmOstreeBackend(self)
+
+    @cached_property
     def pending_kargs(self) -> Optional[list[str]]:
-        """Kernel arguments of the next boot (the staged deployment if any)."""
-        if not self.has_rpm_ostree:
-            return None
-        res = self.sys.run(["rpm-ostree", "kargs"], timeout=120)
-        if not res.ok:
-            return None
-        return parse_kargs(res.stdout)
+        """Kernel arguments of the next boot (the staged deployment, or the regenerated boot entries)."""
+        return self.karg_backend.next_boot()
+
+    @cached_property
+    def owned_kargs(self) -> list[str]:
+        """Arguments in this tool's own boot-loader drop-in (CachyOS)."""
+        return self.karg_backend.owned()
 
     @cached_property
     def rpm_ostree_status(self) -> Optional[dict]:
@@ -361,8 +443,10 @@ class Context:
 
     def invalidate_kargs(self) -> None:
         """Forget cached kernel-argument facts after changing them."""
-        for name in ("pending_kargs", "rpm_ostree_status"):
+        for name in ("pending_kargs", "rpm_ostree_status", "owned_kargs"):
             self.__dict__.pop(name, None)
+        if "karg_backend" in self.__dict__:
+            self.karg_backend.invalidate()
 
     def karg_pending(self, karg: str) -> bool:
         pending = self.pending_kargs
@@ -398,9 +482,7 @@ class Context:
         if not installed:
             return info
 
-        res = self.sys.run(["rpm", "-q", "--qf", "%{VERSION}", "inputplumber"], timeout=30)
-        if res.ok and res.stdout.strip():
-            info.version = res.stdout.strip()
+        info.version = self.package_version("inputplumber")
         info.active = self.unit_state("inputplumber.service")
 
         # InputPlumber takes the FIRST existing XDG data dir as its base path.
@@ -471,10 +553,9 @@ class Context:
     @cached_property
     def has_game_mode(self) -> bool:
         """A gamescope-session (Game Mode) exists; desktop images only run gamescope nested."""
-        return any(self.sys.exists(p) for p in (
-            "/usr/bin/gamescope-session-plus",
-            "/usr/share/gamescope-session-plus/gamescope-session-plus",
-        ))
+        if self.os_family == CACHYOS:
+            return self.sys.exists(CACHYOS_GAME_MODE) or all(self.sys.exists(p) for p in CACHYOS_GAME_MODE_UNITS)
+        return any(self.sys.exists(p) for p in BAZZITE_GAME_MODE)
 
     @cached_property
     def internal_panel(self) -> Optional[tuple[str, Optional[EdidInfo]]]:
@@ -580,6 +661,11 @@ class Context:
         """Read-only refresh-rate picture: display mode, PSR, display firmware, KWin settings."""
         st = RefreshState()
         st.needs_root = self.sys.is_real_root and os.geteuid() != 0
+        m = re.match(r"(\d+)\.(\d+)", self.kernel_release or "")
+        st.kernel_version = (int(m.group(1)), int(m.group(2))) if m else None
+        if self.os_family == CACHYOS:
+            st.remove_karg_hint = self.karg_backend.remove_hint("xe.enable_dc_balance=1")
+            st.kernel_update_hint = "until you update to kernel 7.2.10 or later (`sudo pacman -Syu`, then reboot)"
         st.game_mode = self.has_game_mode
         panel = self.internal_panel
         st.connector = re.sub(r"^card\d+-", "", panel[0]) if panel else None
@@ -697,6 +783,8 @@ class Context:
         when it uses native Steam Input, None without a Game Mode session."""
         if not self.has_game_mode:
             return None
+        if self.os_family == CACHYOS:
+            return NATIVE_STEAM
         text = self.sys.read_text(OGUI_SESSION) or ""
         if "--overlay-mode" not in text:
             return NATIVE_STEAM

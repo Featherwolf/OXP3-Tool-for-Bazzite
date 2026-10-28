@@ -1,9 +1,11 @@
 """The fixes the tool can apply.
 
-A fix never touches the read-only /usr. It only writes files under /etc (and
-/usr/local, which is /var/usrlocal on Bazzite), appends kernel arguments with
-rpm-ostree, or enables a systemd unit, and every one of those changes is
-recorded so ``revert`` can undo exactly what was done.
+A fix never changes files a package installed. It only writes files under /etc
+(and /usr/local, which is /var/usrlocal on Bazzite), changes kernel arguments
+through the system's own tool (rpm-ostree on Bazzite; a drop-in file and the
+boot loader's generator on CachyOS, see kargs.py), or enables a systemd unit,
+and every one of those changes is recorded so ``revert`` can undo exactly what
+was done.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from . import steam_actions, steam_session, templates
-from .detect import IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
+from .detect import CACHYOS, IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
 from .system import sha256_bytes
 
 CONTROLLER = "controller"
@@ -130,14 +132,16 @@ def _karg_live_state(ctx: Context, karg: str, fix_id: str) -> list[str]:
     active = ctx.karg_active(karg)
     pending = ctx.karg_pending(karg)
     again = f"run `sudo oxp3-tool apply {fix_id}` again"
+    why = ctx.karg_backend.missing_text()
     if active and (pending or ctx.pending_kargs is None):
         return [f"{karg} is active"]
     if active:
-        return [f"{karg} is active now but missing from the next boot (a system update installed "
-                f"before rebooting can drop it); {again}"]
+        return [f"{karg} is active now but missing from the next boot ({why}); {again}"]
     if pending:
         return [f"{karg} is set for the next boot (reboot to activate)"]
-    return [f"{karg} is not set (a system update installed before rebooting can drop it); {again}"]
+    if ctx.pending_kargs is None and ctx.karg_backend.name != "rpm-ostree":
+        return [f"{karg} is not active yet; run `sudo oxp3-tool status` to read the boot entries"]
+    return [f"{karg} is not set ({why}); {again}"]
 
 
 def restart_pending(ctx: Context, notes: dict[str, Any]) -> bool:
@@ -267,7 +271,8 @@ class ButtonsFix(Fix):
         "sends the keyboard key to QuickAccess2 and the home key to gamepad Keyboard.\n"
         "In Bazzite's default Game Mode, which runs Steam behind the OpenGamepadUI\n"
         "overlay, that makes the keyboard key open the OpenGamepadUI menu and the home key\n"
-        "do nothing; with native Steam Input they take a screenshot and open the keyboard.\n"
+        "do nothing; with native Steam Input (CachyOS always, Bazzite after\n"
+        "`ujust configure-opengamepadui disable`) they take a screenshot and open the keyboard.\n"
         "This installs a replacement map with the same id in\n"
         f"{IP_ETC_CAPABILITY_MAPS}, written for the Game Mode input in use.\n"
         "Defaults: ONEX/console -> Quick Access, keyboard key -> Steam on-screen keyboard,\n"
@@ -298,15 +303,16 @@ class ButtonsFix(Fix):
         "xbox-key helper can only tap, so keep guide on Home to keep them.\n"
         "Check each key with `inputplumber device 0 test` (press q to quit; closing the\n"
         "window instead leaves InputPlumber in test mode until\n"
-        "`sudo systemctl restart inputplumber`; with native Steam Input, then run\n"
-        f"`systemctl --user restart {NATIVE_STEAM_INPUT_UNIT}` or reboot to get the Steam\n"
-        "Deck controller back). A key that goes to the helper shows\n"
+        "`sudo systemctl restart inputplumber`; with native Steam Input, then reboot, or on\n"
+        f"Bazzite run `systemctl --user restart {NATIVE_STEAM_INPUT_UNIT}`, to get the\n"
+        "Steam Deck controller back). A key that goes to the helper shows\n"
         f"nothing there; `journalctl -u {templates.STEAM_ACTIONS_UNIT_NAME} -f` logs its presses\n"
         f"(`journalctl -u {templates.XBOX_KEY_UNIT_NAME} -f` for an Xbox key the xbox-key helper reads).\n"
         "Your choice is kept when you apply again\n"
-        "(--defaults resets it). Apply again after `ujust configure-opengamepadui` switches\n"
-        "Game Mode input. The override replaces the whole stock map, so it is only\n"
-        "recommended while the stock map is the 0.82.0 one it was written for.\n"
+        "(--defaults resets it). On Bazzite, apply again after\n"
+        "`ujust configure-opengamepadui` switches Game Mode input. The override replaces\n"
+        "the whole stock map, so it is only recommended while the stock map is the one it\n"
+        "was written for (InputPlumber 0.82.0 to 0.83.1).\n"
         "InputPlumber is restarted when the map changes."
     )
     takes_effect = ("immediately (InputPlumber restarts when the map changes; reboot if the buttons act like an "
@@ -320,6 +326,9 @@ class ButtonsFix(Fix):
                          "); it handles the buttons instead of InputPlumber")
         ip = ctx.inputplumber
         if not ip.installed:
+            if ctx.os_family == CACHYOS:
+                return Check(False, "InputPlumber is not installed (CachyOS's hardware detection does not set it up "
+                                    "for the ONEXPLAYER 3 yet): `sudo pacman -S inputplumber`, then reboot")
             return Check(False, "InputPlumber is not installed (Bazzite desktop images do not ship it; "
                                 "use a bazzite-deck image)")
         if not ip.oxp3_config:
@@ -378,11 +387,20 @@ class ButtonsFix(Fix):
                 "Game Mode runs Steam behind the OpenGamepadUI overlay, so the map is written for it. If you "
                 "switch with `ujust configure-opengamepadui`, run `sudo oxp3-tool apply buttons` again."
             )
+        cachyos = ctx.os_family == CACHYOS
+        if session == NATIVE_STEAM and cachyos and not ctx.steamos_manager:
+            plan.messages.append(
+                "steamos-manager is not running, so Steam gets InputPlumber's Xbox Elite controller instead of the "
+                "Steam Deck one, and Steam-only buttons such as Quick Access may do nothing. On CachyOS "
+                "steamos-manager selects the Steam Deck controller: `sudo pacman -S steamos-manager`, then reboot.")
         if restart:
             # Only when the map changes: a helper-only update leaves InputPlumber alone.
-            restore = _restore_deck_controller(ctx, (map_path,)) if session == NATIVE_STEAM else []
+            restore = _restore_deck_controller(ctx, (map_path,)) if session == NATIVE_STEAM and not cachyos else []
             note = ""
-            if session == NATIVE_STEAM:
+            if session == NATIVE_STEAM and cachyos and ctx.steamos_manager:
+                note = ("If the buttons act like an Xbox controller in Game Mode afterwards, reboot: steamos-manager "
+                        "selects the Steam Deck controller again when InputPlumber's controller comes back.")
+            elif session == NATIVE_STEAM and not cachyos:
                 note = ("If the buttons act like an Xbox controller in Game Mode afterwards, reboot: the InputPlumber "
                         "restart resets the Steam Deck controller Bazzite selects for native Steam Input."
                         if restore else
@@ -390,7 +408,7 @@ class ButtonsFix(Fix):
                         "session starts, and the InputPlumber restart resets it.")
             plan.post.append(_restart_inputplumber(only_if_changed=(map_path,), note=note))
             plan.post += restore
-            for user in sorted(set(ctx.ogui_disabled_for) - set(_native_steam_input_users(ctx))):
+            for user in [] if cachyos else sorted(set(ctx.ogui_disabled_for) - set(_native_steam_input_users(ctx))):
                 plan.messages.append(
                     f"Bazzite's {NATIVE_STEAM_INPUT_UNIT} is not enabled for {user}, so Steam gets an Xbox controller "
                     f"at login instead of the Steam Deck one; run `ujust configure-opengamepadui disable` again as "
@@ -438,7 +456,7 @@ class ButtonsFix(Fix):
 
     def revert_post(self, ctx: Context) -> list[PostStep]:
         steps = [_restart_inputplumber()]
-        if ctx.game_mode_input == NATIVE_STEAM:
+        if ctx.game_mode_input == NATIVE_STEAM and ctx.os_family != CACHYOS:
             steps += _restore_deck_controller(ctx)
         running = [u for u in (self.STEAM_UNIT, *templates.LEGACY_STEAM_ACTIONS_UNITS)
                    if ctx.unit_state(u) in ("active", "activating", "reloading")]
@@ -604,8 +622,16 @@ class VolumeKeysFix(Fix):
         return Check(True, "", recommended=True)
 
     def _trigger_steps(self, ctx: Context) -> list[PostStep]:
-        steps = [
-            PostStep("hwdb-update", ["systemd-hwdb", "update"], "rebuild the udev hwdb", order=10),
+        if ctx.os_family == CACHYOS:
+            # Arch builds /usr/lib/udev/hwdb.bin (pacman's hook runs `systemd-hwdb --usr update`); a plain
+            # update would create /etc/udev/hwdb.bin, which hides that file and goes stale with updates.
+            steps = [PostStep("hwdb-update", ["systemd-hwdb", "--usr", "update"], "rebuild the udev hwdb", order=10)]
+            if ctx.sys.exists("/etc/udev/hwdb.bin"):
+                steps.append(PostStep("hwdb-update-etc", ["systemd-hwdb", "update"],
+                                      "rebuild the udev hwdb in /etc too (it exists here)", order=11))
+        else:
+            steps = [PostStep("hwdb-update", ["systemd-hwdb", "update"], "rebuild the udev hwdb", order=10)]
+        steps += [
             # Force udevd to load the new hwdb.bin now; its own reload check is
             # throttled and may still be using the old database.
             PostStep("udev-reload", ["udevadm", "control", "--reload"], "make udev load the new hwdb", order=20),
@@ -662,7 +688,8 @@ class GyroFix(Fix):
     summary = "Blacklist bmi160_i2c so the BMI260 IMU shows up for InputPlumber"
     details = (
         "The OXP3's BMI260 IMU uses ACPI ID 10EC5280, which both bmi160_i2c and (on\n"
-        "Bazzite's kernel) bmi270_i2c claim. bmi160 cannot drive the chip. If the gyro is\n"
+        "kernels with the OGC patch, such as Bazzite's; not CachyOS's yet) bmi270_i2c\n"
+        "claim. bmi160 cannot drive the chip. If the gyro is\n"
         "missing (no IIO device named 'bmi260'), this keeps bmi160_i2c from loading so\n"
         "bmi270 can bind. Only offered when the running kernel's bmi270_i2c knows 10EC5280.\n"
         "Untested on hardware. Needs a reboot."
@@ -702,9 +729,9 @@ class InputPlumberSuspendFix(Fix):
     summary = "Enable InputPlumber's own suspend/resume hook (shipped but disabled)"
     details = (
         "InputPlumber ships inputplumber-suspend.service, which pauses its virtual\n"
-        "controllers before sleep and restores them after resume. Bazzite does not enable\n"
-        "it. Try this if the controller misbehaves after waking from sleep. Untested on\n"
-        "the OXP3."
+        "controllers before sleep and restores them after resume. Neither Bazzite nor\n"
+        "CachyOS enables it. Try this if the controller misbehaves after waking from\n"
+        "sleep. Untested on the OXP3."
     )
     takes_effect = "from the next suspend"
     UNIT = "inputplumber-suspend.service"
@@ -730,8 +757,9 @@ class _KargFix(Fix):
     karg = ""
 
     def check(self, ctx: Context) -> Check:
-        if not ctx.has_rpm_ostree:
-            return Check(False, "rpm-ostree is not available")
+        refusal = ctx.karg_backend.short_refusal(self.karg)
+        if refusal:
+            return Check(False, refusal)
         return self._check(ctx)
 
     def _check(self, ctx: Context) -> Check:
@@ -823,8 +851,10 @@ class OledProfileFix(Fix):
         "that keeps the panel in its native gamma 2.2 mode (the Steam Deck OLED approach):\n"
         "HDR still works through gamescope's tone mapping. It also lists the panel's\n"
         "48-144 Hz refresh rates; --min-refresh=30 extends that down to 30 Hz (untested,\n"
-        "kept when you apply again). Only Game Mode (bazzite-deck images) uses it; it does\n"
-        "not change HDR in Desktop Mode, where KDE always sends PQ (keep HDR off there)."
+        "kept when you apply again). Only Game Mode (bazzite-deck images, CachyOS Handheld\n"
+        "Edition) uses it; it does not change HDR in Desktop Mode, where KDE always sends\n"
+        "PQ (keep HDR off there). gamescope 3.17 ships a Legion Go 2 profile that matches\n"
+        "this panel with PQ; this one takes priority over it."
     )
     takes_effect = "next time Game Mode starts"
     LUA = "/etc/gamescope/scripts/90-oxp3-tool-oled.lua"
@@ -839,8 +869,9 @@ class OledProfileFix(Fix):
             found = f"{edid.vendor} 0x{edid.product:04x}" if edid else "unknown"
             return Check(False, f"the internal panel is {found}, not the SDC 0x4301 OLED this profile is for")
         if not ctx.has_game_mode:
-            return Check(True, "no gamescope Game Mode session on this image (desktop images run gamescope "
-                               "nested, which ignores display profiles)", recommended=False)
+            where = ("CachyOS's Handheld Edition provides one" if ctx.os_family == CACHYOS else
+                     "desktop images run gamescope nested, which ignores display profiles")
+            return Check(True, f"no gamescope Game Mode session on this system ({where})", recommended=False)
         return Check(True, "", recommended=True)
 
     def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
@@ -928,13 +959,21 @@ class XeHdrBacklightFix(_KargFix):
         "Untested on the OXP3: HDR brightness moves to the panel's AUX channel, and SDR\n"
         "brightness too if the panel reports 'SDR brightness over AUX' (otherwise it stays\n"
         "on the SoC's PWM output, and a slider that works today may stop working). Before\n"
-        "trying it, run `ujust configure-grub show` so the boot menu can start the previous\n"
-        "version if the screen stays dark (you need a keyboard there), or keep SSH ready.\n"
+        "trying it, make sure you can boot without it: on Bazzite run\n"
+        "`ujust configure-grub show` so the boot menu can start the previous version (you\n"
+        "need a keyboard there); on CachyOS use the boot loader's menu to edit the entry\n"
+        "for one boot. Or keep SSH ready.\n"
         "Test in Desktop Mode (System Settings > Display > HDR). Game Mode keeps HDR\n"
         "tone-mapped while oled-profile is applied. Needs a reboot."
     )
     takes_effect = "after reboot"
     karg = "xe.enable_dpcd_backlight=3"
+
+    def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
+        plan = super().plan(ctx, opts, prev)
+        if ctx.os_family == CACHYOS and ctx.karg_backend.recovery_hint():
+            plan.messages.append(f"If the screen stays dark after the reboot: {ctx.karg_backend.recovery_hint()}.")
+        return plan
 
     def _check(self, ctx: Context) -> Check:
         other = [k for k in ctx.active_kargs + (ctx.pending_kargs or [])
