@@ -36,7 +36,7 @@ def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
     if entry and entry.get("reverted"):
         lines = []
         for karg in entry.get("kargs_removal_pending", []):
-            if ctx.karg_pending(karg) or karg in ctx.owned_kargs:
+            if ctx.karg_left(karg):
                 why = ("came back with a system update installed before the reboot"
                        if ctx.karg_backend.name == "rpm-ostree" else "is still in the next boot's configuration")
                 lines.append(f"{karg} {why}; run `sudo oxp3-tool revert {fix.id}` again")
@@ -105,6 +105,10 @@ def status_text(ctx: Context, state: State) -> str:
     boot = ctx.karg_backend.describe() if ctx.os_family == CACHYOS else ""
     if boot:
         lines.append(boot + (", Secure Boot on" if ctx.secure_boot else ""))
+    finish = ctx.karg_backend.unfinished()
+    if finish:
+        lines.append(f"          warning: a boot-entry rebuild did not finish (or is still running): do not reboot "
+                     f"before `sudo {finish}` has ended without errors")
 
     ip = ctx.inputplumber
     if ip.installed:
@@ -165,10 +169,15 @@ def status_text(ctx: Context, state: State) -> str:
                   "`ujust configure-opengamepadui disable` switches to native Steam Input)",
             NATIVE_STEAM: "native Steam Input"}.get(ctx.game_mode_input or "")
     if game and ctx.os_family == CACHYOS:
-        game += (" (CachyOS gamescope-session; steamos-manager selects the Steam Deck controller)"
-                 if ctx.steamos_manager else
-                 " (CachyOS gamescope-session; without steamos-manager Steam gets InputPlumber's Xbox Elite "
-                 "controller)")
+        if ctx.hhd.running:
+            pad = "Handheld Daemon's controller"
+        elif not ip.installed:
+            pad = "the kernel's plain Xbox 360 pad (install InputPlumber)"
+        elif ctx.steamos_manager:
+            pad = "the Steam Deck controller, which steamos-manager selects"
+        else:
+            pad = "InputPlumber's Xbox Elite controller (no steamos-manager)"
+        game += f" (CachyOS gamescope-session; Steam gets {pad})"
     if game:
         lines.append(f"Game Mode: {game}")
 
@@ -332,7 +341,7 @@ def cmd_revert(ctx: Context, state: State, args: argparse.Namespace) -> int:
         for unit in entry.get("units_enabled", []):
             _out(f"    disable {unit}")
         for karg in entry.get("kargs", []) + [
-            k for k in entry.get("kargs_removal_pending", []) if ctx.karg_pending(k)
+            k for k in entry.get("kargs_removal_pending", []) if ctx.karg_left(k)
         ]:
             _out(f"    remove kernel argument {karg} (reboot needed)")
     if args.dry_run:

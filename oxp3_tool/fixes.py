@@ -391,8 +391,9 @@ class ButtonsFix(Fix):
         if session == NATIVE_STEAM and cachyos and not ctx.steamos_manager:
             plan.messages.append(
                 "steamos-manager is not running, so Steam gets InputPlumber's Xbox Elite controller instead of the "
-                "Steam Deck one, and Steam-only buttons such as Quick Access may do nothing. On CachyOS "
-                "steamos-manager selects the Steam Deck controller: `sudo pacman -S steamos-manager`, then reboot.")
+                "Steam Deck one (Xbox button layout; Quick Access still works through Steam's Xbox+A shortcut). On "
+                "CachyOS steamos-manager selects the Steam Deck controller: `sudo pacman -S steamos-manager`, then "
+                "reboot.")
         if restart:
             # Only when the map changes: a helper-only update leaves InputPlumber alone.
             restore = _restore_deck_controller(ctx, (map_path,)) if session == NATIVE_STEAM and not cachyos else []
@@ -621,14 +622,20 @@ class VolumeKeysFix(Fix):
                                "with this fix (hhd#342)", recommended=False)
         return Check(True, "", recommended=True)
 
-    def _trigger_steps(self, ctx: Context) -> list[PostStep]:
+    def _trigger_steps(self, ctx: Context, revert: bool = False) -> list[PostStep]:
         if ctx.os_family == CACHYOS:
-            # Arch builds /usr/lib/udev/hwdb.bin (pacman's hook runs `systemd-hwdb --usr update`); a plain
-            # update would create /etc/udev/hwdb.bin, which hides that file and goes stale with updates.
+            # Arch builds /usr/lib/udev/hwdb.bin (pacman's hook runs `systemd-hwdb --usr update`). While a file
+            # is in /etc/udev/hwdb.d, systemd also builds /etc/udev/hwdb.bin at the first boot after an update,
+            # and udev reads that copy first: keep it current, and delete it once nothing in /etc needs it.
             steps = [PostStep("hwdb-update", ["systemd-hwdb", "--usr", "update"], "rebuild the udev hwdb", order=10)]
             if ctx.sys.exists("/etc/udev/hwdb.bin"):
-                steps.append(PostStep("hwdb-update-etc", ["systemd-hwdb", "update"],
-                                      "rebuild the udev hwdb in /etc too (it exists here)", order=11))
+                if revert and not ctx.sys.glob("/etc/udev/hwdb.d/*.hwdb"):
+                    steps.append(PostStep("hwdb-drop-etc", ["rm", "-f", "/etc/udev/hwdb.bin"],
+                                          "remove the /etc copy of the udev hwdb (nothing in /etc needs it now)",
+                                          order=9))
+                else:
+                    steps.append(PostStep("hwdb-update-etc", ["systemd-hwdb", "update"],
+                                          "rebuild the udev hwdb in /etc too (it exists here)", order=11))
         else:
             steps = [PostStep("hwdb-update", ["systemd-hwdb", "update"], "rebuild the udev hwdb", order=10)]
         steps += [
@@ -660,7 +667,7 @@ class VolumeKeysFix(Fix):
         return []
 
     def revert_post(self, ctx: Context) -> list[PostStep]:
-        return self._trigger_steps(ctx)
+        return self._trigger_steps(ctx, revert=True)
 
     def revert_messages(self) -> list[str]:
         return ["The kernel keeps forcing volume-key releases until the next reboot."]
@@ -961,8 +968,9 @@ class XeHdrBacklightFix(_KargFix):
         "on the SoC's PWM output, and a slider that works today may stop working). Before\n"
         "trying it, make sure you can boot without it: on Bazzite run\n"
         "`ujust configure-grub show` so the boot menu can start the previous version (you\n"
-        "need a keyboard there); on CachyOS use the boot loader's menu to edit the entry\n"
-        "for one boot. Or keep SSH ready.\n"
+        "need a keyboard there); on CachyOS edit the entry in the boot loader's menu for\n"
+        "one boot (you need a USB keyboard there; with Secure Boot or an enrolled Limine\n"
+        "config there is no editor, so keep a CachyOS USB stick ready). Or keep SSH ready.\n"
         "Test in Desktop Mode (System Settings > Display > HDR). Game Mode keeps HDR\n"
         "tone-mapped while oled-profile is applied. Needs a reboot."
     )
@@ -971,8 +979,9 @@ class XeHdrBacklightFix(_KargFix):
 
     def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
         plan = super().plan(ctx, opts, prev)
-        if ctx.os_family == CACHYOS and ctx.karg_backend.recovery_hint():
-            plan.messages.append(f"If the screen stays dark after the reboot: {ctx.karg_backend.recovery_hint()}.")
+        hint = ctx.karg_backend.recovery_hint() if ctx.os_family == CACHYOS else ""
+        if hint:
+            plan.messages.append(f"Before rebooting, make sure you can boot without it: {hint}.")
         return plan
 
     def _check(self, ctx: Context) -> Check:

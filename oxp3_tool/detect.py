@@ -413,6 +413,12 @@ class Context:
         return self.karg_backend.next_boot()
 
     @cached_property
+    def pending_kargs_any(self) -> Optional[list[str]]:
+        """Kernel arguments any entry of the next boot has (CachyOS: one kernel's entry may lag behind)."""
+        found = self.karg_backend.next_boot_any()
+        return self.pending_kargs if found is None else found
+
+    @cached_property
     def owned_kargs(self) -> list[str]:
         """Arguments in this tool's own boot-loader drop-in (CachyOS)."""
         return self.karg_backend.owned()
@@ -443,7 +449,7 @@ class Context:
 
     def invalidate_kargs(self) -> None:
         """Forget cached kernel-argument facts after changing them."""
-        for name in ("pending_kargs", "rpm_ostree_status", "owned_kargs"):
+        for name in ("pending_kargs", "pending_kargs_any", "rpm_ostree_status", "owned_kargs"):
             self.__dict__.pop(name, None)
         if "karg_backend" in self.__dict__:
             self.karg_backend.invalidate()
@@ -454,6 +460,10 @@ class Context:
 
     def karg_active(self, karg: str) -> bool:
         return karg in self.active_kargs
+
+    def karg_left(self, karg: str) -> bool:
+        """Whether a removal still has something to remove: any next-boot entry, or this tool's drop-in."""
+        return karg in (self.pending_kargs_any or []) or karg in self.owned_kargs
 
     # -- systemd ---------------------------------------------------------
 

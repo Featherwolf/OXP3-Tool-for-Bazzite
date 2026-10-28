@@ -91,7 +91,7 @@ def reconcile(ctx: Context, state: State) -> bool:
                 entry["kargs"].append(karg)
             changed = True
         for karg in list(entry.get("kargs_removal_pending", [])):
-            if karg not in pending and not ctx.karg_active(karg) and karg not in owned:
+            if not ctx.karg_left(karg) and not ctx.karg_active(karg):
                 entry["kargs_removal_pending"].remove(karg)
                 changed = True
         if entry_is_empty(entry) and (not entry.get("applied_at") or entry.get("reverted")):
@@ -150,6 +150,12 @@ class Engine:
         if self.ctx.pending_kargs is None:
             raise EngineError(backend.unreadable)
         return backend.notes()
+
+    def _dropin_lost(self, entry: Optional[dict], karg: str) -> bool:
+        """An argument this tool set that the next boot has, but its boot-loader drop-in no longer does."""
+        if not entry or not getattr(self.ctx.karg_backend, "dropin", "") or karg in self.ctx.owned_kargs:
+            return False
+        return karg in entry.get("kargs", []) + entry.get("kargs_removal_pending", [])
 
     def _kept_kargs(self) -> list[str]:
         """Every kernel argument this tool owns now or is adding (what a boot-loader drop-in holds)."""
@@ -228,12 +234,18 @@ class Engine:
         for path in recorded:
             if path not in {s.path for s in plan.files}:
                 lines.append(f"remove {path}")
+        backend = self.ctx.karg_backend
         for karg in plan.kargs:
             removal = karg in (entry or {}).get("kargs_removal_pending", [])
             if not self.ctx.karg_pending(karg):
-                lines.append(f"add kernel argument {karg} ({self.ctx.karg_backend.how}, reboot needed)")
+                lines.append(f"add kernel argument {karg} ({backend.how}, reboot needed)")
+            elif self._dropin_lost(entry, karg):
+                lines.append(f"put kernel argument {karg} back into {backend.dropin} ({backend.how}); "
+                             "the next rebuild would drop it")
             elif removal:
                 lines.append(f"keep kernel argument {karg} (cancels the pending removal)")
+        if plan.kargs and backend.unfinished():
+            lines.append("rebuild the boot entries again (the last rebuild did not finish)")
         for unit in plan.enable_units:
             if self.ctx.unit_enabled(unit) != "enabled":
                 lines.append(f"enable {unit}")
@@ -476,13 +488,14 @@ class Engine:
         for fix, plan in plans:
             entry = self.state.entry(fix.id)
             for karg in plan.kargs:
+                lost = self._dropin_lost(entry, karg)
                 if karg in entry["kargs_removal_pending"]:
                     # Still ours: active in the booted deployment even if the
                     # next boot no longer has it.
                     entry["kargs_removal_pending"].remove(karg)
                     if karg not in entry["kargs"]:
                         entry["kargs"].append(karg)
-                if karg in pending:
+                if karg in pending and not lost:
                     if karg in owned:
                         # In this tool's drop-in (state lost or another fix's): ours.
                         if karg not in entry["kargs"]:
@@ -497,19 +510,20 @@ class Engine:
                     missing.append(karg)
                 if karg not in entry["kargs_pending_add"]:
                     entry["kargs_pending_add"].append(karg)
-            if all(k in pending for k in plan.kargs):
+            if not any(k in missing for k in plan.kargs):
                 self.state.stamp(fix.id)  # nothing to add; record it before reconcile runs
         self.state.save()  # write-ahead
 
-        if missing:
-            backend = self.ctx.karg_backend
+        backend = self.ctx.karg_backend
+        if missing or backend.unfinished():
             res = backend.change(missing, [], self._kept_kargs(), self.out)
             if not res.ok:
                 outcome.ok = False
                 outcome.errors.append(res.error)
             self.ctx.invalidate_kargs()
             reconcile(self.ctx, self.state)
-            if res.changed:
+            # On a failure the error says what to do; a rebuild that did not finish must not be rebooted into.
+            if res.ok and res.changed:
                 outcome.reboot_needed = True
                 if backend.update_warning:
                     outcome.messages.append(backend.update_warning)
@@ -546,7 +560,7 @@ class Engine:
 
     def _needs_kargs_change(self, entry: dict) -> bool:
         return bool(entry.get("kargs") or entry.get("kargs_pending_add")) or any(
-            self.ctx.karg_pending(k) or k in self.ctx.owned_kargs for k in entry.get("kargs_removal_pending", [])
+            self.ctx.karg_left(k) for k in entry.get("kargs_removal_pending", [])
         )
 
     def _disable_unit(self, unit: str, now: bool = False) -> None:
@@ -618,16 +632,20 @@ class Engine:
         return outcome
 
     def _revert_kargs(self, fix_ids: list[str], outcome: Outcome) -> None:
-        try:
-            self._check_kargs_preconditions()
-        except EngineError as e:
-            outcome.ok = False
-            outcome.errors.append(str(e))
-            for fix_id in fix_ids:
-                self.state.fixes[fix_id].pop("reverted", None)
-            self.state.save()
-            return
-        pending = self.ctx.pending_kargs or []
+        moving = [f for f in fix_ids if self._needs_kargs_change(self.state.fixes[f])]
+        if moving:
+            try:
+                self._check_kargs_preconditions()
+            except EngineError as e:
+                outcome.ok = False
+                outcome.errors.append(str(e))
+                for fix_id in moving:
+                    entry = self.state.fixes[fix_id]
+                    # A fix that was already being reverted stays so.
+                    if entry.get("kargs") or entry.get("kargs_pending_add"):
+                        entry.pop("reverted", None)
+                self.state.save()
+                return
         for fix_id in fix_ids:
             entry = self.state.fixes[fix_id]
             # kargs_pending_add only ever holds arguments that were missing before.
@@ -638,9 +656,8 @@ class Engine:
             entry["kargs_pending_add"] = []
         self.state.save()  # write-ahead
 
-        owned = self.ctx.owned_kargs
         present = sorted({k for f in fix_ids for k in self.state.fixes[f]["kargs_removal_pending"]
-                          if k in pending or k in owned})
+                          if self.ctx.karg_left(k)})
         if present:
             backend = self.ctx.karg_backend
             res = backend.change([], present, self._kept_kargs(), self.out)

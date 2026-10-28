@@ -81,8 +81,15 @@ CACHYOS_COMMANDS: list[tuple[str, list[str]]] = [
                       "limine-mkinitcpio-hook", "systemd-boot-manager", "grub"]),
     ("bootctl-status.txt", ["bootctl", "status", "--no-pager"]),
     ("units-cachyos.txt", ["systemctl", "status", "--no-pager", "--lines=10", "plasmalogin.service",
-                           "steamos-powerbuttond.service", "hhd@*.service"]),
+                           "hhd@*.service"]),
+    # Game Mode's units are user units; plain field matches find them from root (--user-unit adds _UID=0).
+    ("journal-game-mode-units-this-boot.txt", ["journalctl", "-b", "0", "--no-pager", "-o", "short-monotonic",
+                                               "_SYSTEMD_USER_UNIT=steamos-powerbuttond.service", "+",
+                                               "USER_UNIT=steamos-powerbuttond.service", "+",
+                                               "USER_UNIT=gamescope-session.service", "-n", "300"]),
 ]
+# Per Steam user: the user manager's view of the Game Mode units (CachyOS).
+CACHYOS_USER_UNITS = ["steamos-powerbuttond.service", "gamescope-session.service", "steam-launcher.service"]
 CACHYOS_TEXT_GLOBS = [
     "/etc/default/limine", "/etc/limine-entry-tool.conf", "/etc/limine-entry-tool.d/*.conf",
     "/etc/sdboot-manage.conf", "/etc/sdboot-manage.conf.d/*.conf", "/usr/lib/sdboot-manage.conf.d/*.conf",
@@ -240,6 +247,10 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
                 data = sys.read_bytes(path)
                 if data is not None:
                     bundle.add("files" + path, data)
+        for user in sorted(seen):
+            if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
+                commands.append((f"units-user-{user}.txt", ["systemctl", "--user", "-M", f"{user}@", "status",
+                                                            "--no-pager", "--lines=10", *CACHYOS_USER_UNITS]))
         backend = ctx.karg_backend
         if isinstance(backend, LimineBackend):
             for kernel in backend.kernels():

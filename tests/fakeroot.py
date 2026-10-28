@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -439,6 +440,8 @@ class FakeCachyRunner(FakeRunner):
         self.limine_skip: set[str] = set()
         self.gen_fail = 0  # how many sdboot-manage/grub-mkconfig runs fail next
         self.regenerations = 0
+        # Command -> how many of its runs pass before one gets Ctrl+C (before it writes anything).
+        self.interrupt: dict[str, int] = {}
 
     def read(self, path: str) -> Optional[str]:
         p = self.root / path.lstrip("/")
@@ -459,6 +462,11 @@ class FakeCachyRunner(FakeRunner):
                        "grub-mkconfig", "bootctl"):
             return super().__call__(argv, timeout)
         self.calls.append(argv)
+        if cmd in self.interrupt:
+            self.interrupt[cmd] -= 1
+            if self.interrupt[cmd] < 0:
+                del self.interrupt[cmd]
+                raise KeyboardInterrupt
         if self._failing(argv):
             return CommandResult(1, "", f"simulated failure of {shlex.join(argv)}")
         if cmd == "pacman" and argv[1] == "-Q":
@@ -702,6 +710,7 @@ class FakeCachyOS(FakeOxp3):
         first = next(iter(self.runner.kernels))
         args = entries.get(first) or entries.get(f"/vmlinuz-{first}") or self.runner.kargs
         self.write("/proc/cmdline", " ".join(args) + "\n")
+        shutil.rmtree(self.root / "run", ignore_errors=True)  # a tmpfs
 
     def pacman_lock(self, on: bool = True) -> None:
         if on:
