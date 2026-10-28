@@ -138,7 +138,7 @@ def _karg_live_state(ctx: Context, karg: str, fix_id: str) -> list[str]:
     if active:
         return [f"{karg} is active now but missing from the next boot ({why}); {again}"]
     if pending:
-        return [f"{karg} is set for the next boot (reboot to activate)"]
+        return [f"{karg} is set for the next boot {ctx.reboot_advice('activate')}"]
     if ctx.pending_kargs is None and ctx.karg_backend.name != "rpm-ostree":
         return [f"{karg} is not active yet; run `sudo oxp3-tool status` to read the boot entries"]
     return [f"{karg} is not set ({why}); {again}"]
@@ -388,7 +388,8 @@ class ButtonsFix(Fix):
                 "switch with `ujust configure-opengamepadui`, run `sudo oxp3-tool apply buttons` again."
             )
         cachyos = ctx.os_family == CACHYOS
-        if session == NATIVE_STEAM and cachyos and not ctx.steamos_manager:
+        if session == NATIVE_STEAM and cachyos and not ctx.steamos_manager \
+                and ctx.inputplumber.active in ("active", None):
             plan.messages.append(
                 "steamos-manager is not running, so Steam gets InputPlumber's Xbox Elite controller instead of the "
                 "Steam Deck one (Xbox button layout; Quick Access still works through Steam's Xbox+A shortcut). On "
@@ -969,8 +970,8 @@ class XeHdrBacklightFix(_KargFix):
         "trying it, make sure you can boot without it: on Bazzite run\n"
         "`ujust configure-grub show` so the boot menu can start the previous version (you\n"
         "need a keyboard there); on CachyOS edit the entry in the boot loader's menu for\n"
-        "one boot (you need a USB keyboard there; with Secure Boot or an enrolled Limine\n"
-        "config there is no editor, so keep a CachyOS USB stick ready). Or keep SSH ready.\n"
+        "one boot (you need a USB keyboard there; with an enrolled Limine config checksum\n"
+        "Limine has no editor, so keep a CachyOS USB stick ready). Or keep SSH ready.\n"
         "Test in Desktop Mode (System Settings > Display > HDR). Game Mode keeps HDR\n"
         "tone-mapped while oled-profile is applied. Needs a reboot."
     )

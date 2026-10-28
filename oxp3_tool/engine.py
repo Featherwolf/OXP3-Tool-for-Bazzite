@@ -91,7 +91,8 @@ def reconcile(ctx: Context, state: State) -> bool:
                 entry["kargs"].append(karg)
             changed = True
         for karg in list(entry.get("kargs_removal_pending", [])):
-            if not ctx.karg_left(karg) and not ctx.karg_active(karg):
+            # Active only because the user's own configuration sets it (a kernel's own command line): done.
+            if not ctx.karg_left(karg) and (not ctx.karg_active(karg) or ctx.karg_user_set(karg)):
                 entry["kargs_removal_pending"].remove(karg)
                 changed = True
         if entry_is_empty(entry) and (not entry.get("applied_at") or entry.get("reverted")):
@@ -517,10 +518,18 @@ class Engine:
         backend = self.ctx.karg_backend
         if missing or backend.unfinished():
             res = backend.change(missing, [], self._kept_kargs(), self.out)
+            self.ctx.invalidate_kargs()
             if not res.ok:
                 outcome.ok = False
                 outcome.errors.append(res.error)
-            self.ctx.invalidate_kargs()
+                if getattr(backend, "dropin", ""):
+                    # An argument neither in the drop-in nor in any boot entry is not this tool's any more
+                    # (one a killed run had left in the drop-in, now taken out): never write it back later.
+                    for fix, plan in plans:
+                        entry = self.state.entry(fix.id)
+                        for karg in plan.kargs:
+                            if karg in missing and karg in entry["kargs"] and not self.ctx.karg_left(karg):
+                                entry["kargs"].remove(karg)
             reconcile(self.ctx, self.state)
             # On a failure the error says what to do; a rebuild that did not finish must not be rebooted into.
             if res.ok and res.changed:
@@ -632,8 +641,9 @@ class Engine:
         return outcome
 
     def _revert_kargs(self, fix_ids: list[str], outcome: Outcome) -> None:
+        backend = self.ctx.karg_backend
         moving = [f for f in fix_ids if self._needs_kargs_change(self.state.fixes[f])]
-        if moving:
+        if moving or backend.unfinished():
             try:
                 self._check_kargs_preconditions()
             except EngineError as e:
@@ -658,15 +668,16 @@ class Engine:
 
         present = sorted({k for f in fix_ids for k in self.state.fixes[f]["kargs_removal_pending"]
                           if self.ctx.karg_left(k)})
-        if present:
-            backend = self.ctx.karg_backend
+        if present or backend.unfinished():  # an unfinished rebuild runs again
             res = backend.change([], present, self._kept_kargs(), self.out)
             self.ctx.invalidate_kargs()
             if not res.ok:
                 outcome.ok = False
                 outcome.errors.append(res.error)
-                # Whatever is still in the next boot's arguments (or the drop-in) is still ours to remove.
-                still = (self.ctx.pending_kargs or []) + self.ctx.owned_kargs
+                # Back to applied only what the next rebuild keeps: the drop-in's arguments (a kernel's
+                # stale entry is not), or rpm-ostree's next deployment.
+                still = self.ctx.owned_kargs if getattr(backend, "dropin", "") else \
+                    (self.ctx.pending_kargs or []) + self.ctx.owned_kargs
                 for fix_id in fix_ids:
                     entry = self.state.fixes[fix_id]
                     for karg in list(entry["kargs_removal_pending"]):

@@ -315,6 +315,7 @@ class RefreshState:
     game_mode: bool = True
     awaiting_reboot: frozenset = frozenset()  # kernel arguments set for the next boot only
     panel_replay_blocked: bool = False  # PSR kargs set that xe-panel-replay-off refuses to combine with
+    reboot_advice: str = "(reboot to activate it)"
 
     @property
     def top_mode(self) -> Optional[Mode]:
@@ -445,7 +446,7 @@ class RefreshState:
         if self.dsb_errors:
             if DSB_OFF_KARG in self.awaiting_reboot:
                 out.append(f"The kernel logged {self.dsb_errors} 'DSB poll error' messages this boot; xe-dsb-off "
-                           "is set for the next boot (reboot to activate it).")
+                           f"is set for the next boot {self.reboot_advice}.")
             else:
                 out.append(f"The kernel logged {self.dsb_errors} 'DSB poll error' messages this boot; the optional "
                            "xe-dsb-off fix stops them and the cursor trails or flicker that can come with them.")
@@ -461,7 +462,7 @@ class RefreshState:
         if replay_on and self.psr_errors and not self.panel_replay_blocked:
             if PANEL_REPLAY_OFF_KARG in self.awaiting_reboot:
                 out.append("Panel Replay is still on this boot; xe-panel-replay-off is set for the next boot "
-                           "(reboot to activate it).")
+                           f"{self.reboot_advice}.")
             else:
                 out.append(f"The kernel logged {self.psr_errors} Panel Replay/PSR errors this boot. If scrolling "
                            f"stutters or the picture tears at {full} Hz with Adaptive Sync off, the experimental "

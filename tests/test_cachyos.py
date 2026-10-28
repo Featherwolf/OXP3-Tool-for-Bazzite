@@ -395,6 +395,218 @@ class LimineTest(Base):
                          {"linux-cachyos": ["quiet", "rw", "root=UUID=x", "a=1"]})
 
 
+class LimineEdgeTest(Base):
+    """Limine setups and interruptions the review found: the tool's drop-in must never become a command line."""
+
+    def moved_default(self, *, lts_key=False):
+        """The user moves the command line out of /etc/default/limine after the tool's apply."""
+        self.f.write("/etc/default/limine", 'ESP_PATH="/boot"\n')
+        self.f.write("/etc/kernel/cmdline", "quiet rw root=UUID=abcd\n")
+
+    def test_dropin_left_as_the_whole_command_line_is_reported_and_reverted(self):
+        self.fake()
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume", "xe-dsb-off")[0], 0)
+        self.f.boot()
+        self.moved_default()
+        rc, out, _ = self.cli("status")
+        self.assertIn(f"{LIMINE_DROPIN} is now the whole command line of every kernel", out)
+        self.assertIn("`sudo oxp3-tool revert nvme-resume xe-dsb-off`", out)
+        # Reverting one of them would keep the drop-in as the whole command line: refused, nothing rebuilt.
+        self.f.runner.calls.clear()
+        rc, _, err = self.cli("revert", "--yes", "xe-dsb-off")
+        self.assertNotEqual(rc, 0)
+        self.assertIn(f"First delete {LIMINE_DROPIN}", err)
+        self.assertNotIn(["limine-mkinitcpio"], self.f.runner.calls)
+        for args in self.kernel_entries().values():
+            self.assertIn("root=UUID=abcd", args)
+        # Reverting both removes it, and the rebuilt entries take the user's /etc/kernel/cmdline.
+        rc, _, err = self.cli("revert", "--yes", "nvme-resume", "xe-dsb-off")
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(self.read(LIMINE_DROPIN))
+        for args in self.kernel_entries().values():
+            self.assertIn("root=UUID=abcd", args)
+            self.assertNotIn(NVME, args)
+
+    def test_dropin_left_as_a_kernels_whole_command_line(self):
+        self.fake(limine_default=('ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n'
+                                  'KERNEL_CMDLINE[linux-cachyos-lts]+="quiet rw root=UUID=abcd lts=1"\n'))
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        self.f.write("/etc/default/limine", 'ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n')
+        rc, out, _ = self.cli("status")
+        self.assertIn("is now the whole command line of linux-cachyos-lts", out)
+        rc, _, err = self.cli("revert", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(self.read(LIMINE_DROPIN))
+        for args in self.kernel_entries().values():
+            self.assertIn("root=UUID=abcd", args)
+
+    def test_untracked_leftover_dropin_says_to_delete_it(self):
+        self.fake(limine_default='ESP_PATH="/boot"\n')
+        self.f.write("/etc/kernel/cmdline", "quiet rw root=UUID=abcd\n")
+        self.f.regenerate()
+        self.f.write(LIMINE_DROPIN, kargs.LimineBackend(Context(self.f.system())).render([NVME]).decode())
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertNotEqual(rc, 0)
+        self.assertIn(f"First delete {LIMINE_DROPIN}", err)
+        rc, out, _ = self.cli("status")
+        self.assertIn(f"undo it with deleting {LIMINE_DROPIN}", out)
+
+    def test_leftover_conflicting_dropin_is_checked_and_taken_out(self):
+        # A run killed after writing its drop-in: re-running apply must check it like a new one.
+        self.fake(limine_default=('ESP_PATH="/boot"\n'
+                                  'KERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd xe.enable_dsb=1"\n'))
+        self.f.write(LIMINE_DROPIN, kargs.LimineBackend(Context(self.f.system())).render([DSB]).decode())
+        self.f.write(STATE_FILE, json.dumps({"schema": 1, "fixes": {"xe-dsb-off": {
+            "applied_at": None, "tool_version": "0.1.0", "kargs_pending_add": [DSB]}}}))
+        self.f.runner.calls.clear()
+        rc, _, err = self.cli("apply", "--yes", "xe-dsb-off")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("xe.enable_dsb=1 is set elsewhere and conflicts with xe.enable_dsb=0", err)
+        self.assertNotIn(["limine-mkinitcpio"], self.f.runner.calls)
+        self.assertIsNone(self.read(LIMINE_DROPIN))
+        self.assertEqual(self.state(), {})
+        # Another fix later does not write the argument back.
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(DSB, self.read(LIMINE_DROPIN))
+
+    def test_sigterm_during_the_dry_run_puts_the_configuration_back(self):
+        import signal
+        self.fake()
+        self.f.runner.kill = {"limine-entry-tool": (2, signal.SIGTERM)}  # after the baseline reads
+        rc, _, _ = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 130)
+        self.assertIsNone(self.read(LIMINE_DROPIN))
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_one_kernel_revert_with_the_kernel_left_out(self):
+        for kernels in ({"linux-cachyos-deckify": "7.2.11-1-cachyos-deckify"}, None):  # one, then both skipped
+            with self.subTest(kernels=kernels):
+                self.root = Path(self.tmp.name, "one" if kernels else "both")
+                self.fake(kernels=kernels)
+                self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+                self.f.boot()
+                self.f.runner.limine_skip = set(self.f.runner.kernels)
+                rc, _, err = self.cli("revert", "--yes", "nvme-resume")
+                self.assertNotEqual(rc, 0)
+                rc, out, _ = self.cli("status")
+                self.assertRegex(out, r"\[reverting +\] nvme-resume")
+                self.assertIn("run `sudo oxp3-tool revert nvme-resume` again", out)
+                self.assertNotIn("apply nvme-resume` again", out)
+                # Another kernel-argument fix does not bring the reverted argument back.
+                self.f.runner.limine_skip = set()
+                self.assertEqual(self.cli("apply", "--yes", "xe-dsb-off")[0], 0)
+                self.assertNotIn(NVME, self.read(LIMINE_DROPIN))
+                for args in self.kernel_entries().values():
+                    self.assertNotIn(NVME, args)
+
+    def test_argument_kept_by_a_kernels_own_line_settles(self):
+        self.fake(limine_default=('ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n'
+                                  'KERNEL_CMDLINE[linux-cachyos-lts]+="quiet rw root=UUID=abcd nvme.noacpi=1"\n'))
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        self.f.boot("linux-cachyos-lts")
+        rc, _, err = self.cli("revert", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("revert nvme-resume` again", out)
+        self.f.boot("linux-cachyos-lts")  # still has it, from the user's own line
+        self.cli("status")
+        self.assertEqual(self.state(), {})
+
+    def test_after_exit_3_no_line_says_reboot(self):
+        self.fake(secure_boot=True)
+        self.f.runner.limine_exit = 3
+        self.cli("apply", "--yes", "nvme-resume")
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("(reboot to activate)", out)
+        self.assertIn("nvme.noacpi=1 is set for the next boot (do not reboot before `sudo limine-update` has ended "
+                      "without errors; then reboot to activate)", out)
+        self.assertIn("this note stays until the next boot", out)
+        self.f.runner.limine_exit = 0
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        self.f.boot()
+        # Revert with exit 3: the next revert of the same fix rebuilds again.
+        self.f.runner.limine_exit = 3
+        self.cli("revert", "--yes", "nvme-resume")
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("(reboot to finish)", out)
+        self.assertIn("then reboot to finish)", out)
+        self.f.runner.limine_exit = 0
+        self.f.runner.calls.clear()
+        rc, out, err = self.cli("revert", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("rebuild the boot entries again", out)
+        self.assertIn(["limine-mkinitcpio"], self.f.runner.calls)
+        rc, out, _ = self.cli("status")
+        self.assertNotIn("do not reboot", out)
+
+    def test_interrupted_rebuild_says_do_not_reboot(self):
+        self.fake()
+        self.f.runner.interrupt = {"limine-mkinitcpio": 0}
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 130)
+        self.assertIn("A boot-entry rebuild did not finish: do not reboot before `sudo limine-mkinitcpio` has "
+                      "ended without errors.", err)
+
+    def test_status_without_the_boot_entries_does_not_call_a_removal_done(self):
+        from unittest import mock
+        self.fake()
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        self.f.boot()
+        self.f.runner.limine_skip = {"linux-cachyos-lts"}
+        self.cli("revert", "--yes", "nvme-resume")
+        with mock.patch.object(kargs.LimineBackend, "read_entries", return_value=None):  # ESP is root-only
+            rc, out, _ = self.cli("status")
+        self.assertIn("nvme.noacpi=1 is being removed; run `sudo oxp3-tool status` to read the boot entries", out)
+
+    def test_kernel_line_of_its_own_in_the_by_hand_steps(self):
+        # The CachyOS wiki's syntax: a quoted key and a plain =, which the drop-in cannot add to.
+        self.fake(limine_default=('ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n'
+                                  'KERNEL_CMDLINE["linux-cachyos-lts"]="quiet rw root=UUID=abcd mitigations=off"\n'))
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("Also add nvme.noacpi=1 inside the quotes of KERNEL_CMDLINE[linux-cachyos-lts]", err)
+        self.assertIsNone(self.read(LIMINE_DROPIN))
+        self.assertIn("mitigations=off", self.kernel_entries()["linux-cachyos-lts"])
+
+    def test_quoted_kernel_key_with_append(self):
+        self.fake(limine_default=('ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n'
+                                  'KERNEL_CMDLINE["linux-cachyos-lts"]+="quiet rw root=UUID=abcd lts=1"\n'))
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        self.assertIn('KERNEL_CMDLINE[linux-cachyos-lts]+="nvme.noacpi=1"', self.read(LIMINE_DROPIN))
+        self.assertIn("lts=1", self.kernel_entries()["linux-cachyos-lts"])
+        self.assertIn(NVME, self.kernel_entries()["linux-cachyos-lts"])
+
+    def test_without_etc_default_limine(self):
+        self.fake(loader_info=None)
+        (self.root / "etc/default/limine").unlink()
+        self.f.write("/etc/limine-entry-tool.conf",
+                     'ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n')
+        self.assertIsInstance(Context(self.f.system()).karg_backend, kargs.LimineBackend)
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        for args in self.kernel_entries().values():
+            self.assertIn(NVME, args)
+
+    def test_editor_only_off_when_a_checksum_is_enrolled(self):
+        from oxp3_tool.fixes import BY_ID
+
+        def hint():
+            plan = BY_ID["xe-hdr-backlight"].plan(Context(self.f.system()), {}, {})
+            return " ".join(m for m in plan.messages if m.startswith("Before rebooting"))
+        self.fake(secure_boot=True)  # Limine treats Secure Boot as off without an enrolled checksum
+        self.assertIn("press E", hint())
+        self.f.write("/etc/limine-entry-tool.conf", "ENABLE_ENROLL_LIMINE_CONFIG=yes\n")  # not read for this
+        self.assertIn("press E", hint())
+        self.f.write("/boot/EFI/limine/limine_x64.efi",
+                     b"MZ" + kargs.LIMINE_B2SUM_SIGNATURE + b"0" * 128 + b"\0")
+        self.assertIn("press E", hint())
+        self.f.write("/boot/EFI/limine/limine_x64.efi",
+                     b"MZ" + kargs.LIMINE_B2SUM_SIGNATURE + b"0f3a" * 32 + b"\0")
+        self.assertIn("entry editor is off", hint())
+
+
 class SdbootTest(Base):
     bootloader = "systemd-boot"
 
@@ -537,6 +749,16 @@ class CachyFixesTest(Base):
                 self.assertNotIn("Xbox Elite", out)
                 self.assertNotIn("Steam Deck controller", out)
 
+    def test_game_mode_line_with_inputplumber_stopped(self):
+        for manager in (False, True):
+            with self.subTest(steamos_manager=manager):
+                self.fake(steamos_manager=manager)
+                self.f.runner.unit_active["inputplumber.service"] = "inactive"
+                rc, out, _ = self.cli("status")
+                self.assertIn("Steam gets the kernel's plain Xbox 360 pad (InputPlumber is not running", out)
+                self.assertNotIn("Xbox Elite", out)
+                self.assertNotIn("Steam Deck controller", out)
+
     def test_volume_keys_rebuild_arch_hwdb(self):
         self.fake()
         rc, _, err = self.cli("apply", "--yes", "volume-keys")
@@ -583,6 +805,7 @@ class CachyFixesTest(Base):
 
     def test_diagnose_collects_cachyos_files(self):
         self.fake()
+        self.f.write("/home/gamer/.local/share/Steam/package/beta", "")
         archive = Path(self.tmp.name, "diag.tar.gz")
         rc, _, err = self.cli("diagnose", "-o", str(archive))
         self.assertEqual(rc, 0, err)
@@ -596,6 +819,15 @@ class CachyFixesTest(Base):
         self.assertIn("oxp3-diagnose/commands/limine-cmdline-linux-cachyos-deckify.txt", names)
         self.assertNotIn(MACHINE_ID, limine)
         self.assertIn("<machine-id>", limine)
+        with tarfile.open(archive) as tar:
+            user = tar.extractfile("oxp3-diagnose/commands/units-user-gamer.txt").read().decode()
+            units = tar.extractfile("oxp3-diagnose/commands/units-cachyos.txt").read().decode()
+            journal = tar.extractfile("oxp3-diagnose/commands/journal-game-mode-units-this-boot.txt").read().decode()
+        self.assertTrue(user.startswith("$ systemctl --user -M gamer@ status"), user)
+        self.assertIn("steamos-powerbuttond.service", user)
+        self.assertNotIn("steamos-powerbuttond", units)
+        self.assertIn("_SYSTEMD_USER_UNIT=steamos-powerbuttond.service", journal)
+        self.assertNotIn("--user-unit", journal)
 
 
 class BazziteUnchangedTest(unittest.TestCase):

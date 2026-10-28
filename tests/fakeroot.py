@@ -417,6 +417,12 @@ DEFAULT_GRUB = ("GRUB_DEFAULT='0'\nGRUB_TIMEOUT='5'\nGRUB_CMDLINE_LINUX_DEFAULT=
                 "zswap.enabled=0 splash loglevel=3'\nGRUB_CMDLINE_LINUX=\"\"\n")
 
 
+def _dquoted(value: str) -> str:
+    """removeSurrounding(value.trim(), "\""), as limine-entry-tool's ConfigReader does (double quotes only)."""
+    value = value.strip()
+    return value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value
+
+
 def _quoted(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -442,6 +448,8 @@ class FakeCachyRunner(FakeRunner):
         self.regenerations = 0
         # Command -> how many of its runs pass before one gets Ctrl+C (before it writes anything).
         self.interrupt: dict[str, int] = {}
+        # Command -> (runs that pass, signal this process then gets): a closed terminal or a stopped service.
+        self.kill: dict[str, tuple[int, int]] = {}
 
     def read(self, path: str) -> Optional[str]:
         p = self.root / path.lstrip("/")
@@ -467,6 +475,13 @@ class FakeCachyRunner(FakeRunner):
             if self.interrupt[cmd] < 0:
                 del self.interrupt[cmd]
                 raise KeyboardInterrupt
+        if cmd in self.kill:
+            passes, signum = self.kill[cmd]
+            if passes:
+                self.kill[cmd] = (passes - 1, signum)
+            else:
+                del self.kill[cmd]
+                os.kill(os.getpid(), signum)
         if self._failing(argv):
             return CommandResult(1, "", f"simulated failure of {shlex.join(argv)}")
         if cmd == "pacman" and argv[1] == "-Q":
@@ -483,16 +498,17 @@ class FakeCachyRunner(FakeRunner):
             return CommandResult(0, "some log line\n" + self.limine_cmdline(argv[2]) + "\n")
         if cmd == "limine-mkinitcpio":
             return self.limine_regen()
-        if cmd == "bash" and "/etc/sdboot-manage.conf" in argv[-1]:
+        script, skip = self.shell_script(argv)
+        if cmd == "bash" and "/etc/sdboot-manage.conf" in script:
             values = self.shell_vars(["/etc/sdboot-manage.conf", *self.files("/usr/lib/sdboot-manage.conf.d/*.conf"),
-                                      *self.files("/etc/sdboot-manage.conf.d/*.conf")])
+                                      *self.files("/etc/sdboot-manage.conf.d/*.conf")], skip)
             return CommandResult(0, f"{values.get('LINUX_OPTIONS', '')}\n{values.get('NO_AUTOGEN', '')}\n")
         if cmd == "sdboot-manage" and argv[1:] == ["gen"]:
             return self.sdboot_gen()
         if cmd == "bootctl" and "--print-esp-path" in argv:
             return CommandResult(0, "/boot\n")
-        if cmd == "sh" and "/etc/default/grub" in argv[-1]:
-            values = self.shell_vars(["/etc/default/grub", *self.files("/etc/default/grub.d/*.cfg")])
+        if cmd == "sh" and "/etc/default/grub" in script:
+            values = self.shell_vars(["/etc/default/grub", *self.files("/etc/default/grub.d/*.cfg")], skip)
             return CommandResult(0, f"{values.get('GRUB_CMDLINE_LINUX', '')} "
                                     f"{values.get('GRUB_CMDLINE_LINUX_DEFAULT', '')}\n")
         if cmd == "grub-mkconfig":
@@ -512,8 +528,8 @@ class FakeCachyRunner(FakeRunner):
                     continue
                 append = "+=" in line
                 key, value = line.split("+=" if append else "=", 1)
-                name = key[len("KERNEL_CMDLINE"):].strip("[] ") or "default"
-                value = _quoted(value)
+                name = _dquoted(key[len("KERNEL_CMDLINE"):].strip("[] ")) or "default"
+                value = _dquoted(value)
                 if append and name in cmdlines:
                     cmdlines[name] = value + " " + cmdlines[name]  # limine-entry-tool prepends
                 else:
@@ -558,9 +574,19 @@ class FakeCachyRunner(FakeRunner):
 
     # -- sdboot-manage / grub-mkconfig ----------------------------------------------
 
-    def shell_vars(self, files: list[str]) -> dict[str, str]:
+    @staticmethod
+    def shell_script(argv: list[str]) -> tuple[str, str]:
+        """(script, $1) of `bash|sh [...] -c SCRIPT NAME ARG`."""
+        if "-c" not in argv:
+            return "", ""
+        i = argv.index("-c")
+        return argv[i + 1] if len(argv) > i + 1 else "", argv[i + 3] if len(argv) > i + 3 else ""
+
+    def shell_vars(self, files: list[str], skip: str = "") -> dict[str, str]:
         values: dict[str, str] = {}
         for path in files:
+            if skip and path == skip:
+                continue
             for line in (self.read(path) or "").splitlines():
                 m = re.match(r"^\s*([A-Z_]+)(\+?)=(.*)$", line)
                 if not m:
@@ -704,12 +730,13 @@ class FakeCachyOS(FakeOxp3):
                     out[parts[1] + (" (recovery)" if "single" in parts else "")] = parts[2:]
         return out
 
-    def boot(self) -> None:
-        """Reboot into the first kernel's entry."""
+    def boot(self, kernel: Optional[str] = None) -> None:
+        """Reboot into a kernel's entry (the first kernel's by default)."""
         entries = self.entries()
-        first = next(iter(self.runner.kernels))
-        args = entries.get(first) or entries.get(f"/vmlinuz-{first}") or self.runner.kargs
+        kernel = kernel or next(iter(self.runner.kernels))
+        args = entries.get(kernel) or entries.get(f"/vmlinuz-{kernel}") or self.runner.kargs
         self.write("/proc/cmdline", " ".join(args) + "\n")
+        self.write("/proc/sys/kernel/osrelease", self.runner.kernels[kernel] + "\n")
         shutil.rmtree(self.root / "run", ignore_errors=True)  # a tmpfs
 
     def pacman_lock(self, on: bool = True) -> None:

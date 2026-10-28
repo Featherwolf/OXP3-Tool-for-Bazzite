@@ -413,9 +413,10 @@ class Context:
         return self.karg_backend.next_boot()
 
     @cached_property
-    def pending_kargs_any(self) -> Optional[list[str]]:
-        """Kernel arguments any entry of the next boot has (CachyOS: one kernel's entry may lag behind)."""
-        found = self.karg_backend.next_boot_any()
+    def kargs_left(self) -> Optional[list[str]]:
+        """Arguments some next-boot entry has beyond the user's own configuration (CachyOS: one kernel's entry
+        may lag behind a rebuild); on Bazzite the next deployment's arguments."""
+        found = self.karg_backend.left_in_entries()
         return self.pending_kargs if found is None else found
 
     @cached_property
@@ -449,7 +450,7 @@ class Context:
 
     def invalidate_kargs(self) -> None:
         """Forget cached kernel-argument facts after changing them."""
-        for name in ("pending_kargs", "pending_kargs_any", "rpm_ostree_status", "owned_kargs"):
+        for name in ("pending_kargs", "kargs_left", "rpm_ostree_status", "owned_kargs"):
             self.__dict__.pop(name, None)
         if "karg_backend" in self.__dict__:
             self.karg_backend.invalidate()
@@ -462,8 +463,19 @@ class Context:
         return karg in self.active_kargs
 
     def karg_left(self, karg: str) -> bool:
-        """Whether a removal still has something to remove: any next-boot entry, or this tool's drop-in."""
-        return karg in (self.pending_kargs_any or []) or karg in self.owned_kargs
+        """Whether a removal still has something to remove: a next-boot entry, or this tool's drop-in."""
+        return karg in (self.kargs_left or []) or karg in self.owned_kargs
+
+    def karg_user_set(self, karg: str) -> bool:
+        """Whether the user's own boot configuration gives the running kernel this argument."""
+        return karg in self.karg_backend.booted_user_args()
+
+    def reboot_advice(self, what: str) -> str:
+        """"(reboot to <what>)", unless a boot-entry rebuild has not finished: then not before it has."""
+        finish = self.karg_backend.unfinished()
+        if finish:
+            return f"(do not reboot before `sudo {finish}` has ended without errors; then reboot to {what})"
+        return f"(reboot to {what})"
 
     # -- systemd ---------------------------------------------------------
 
@@ -726,6 +738,8 @@ class Context:
         st.vbt_vswing_port = vbt_vswing_port(log)
         st.awaiting_reboot = frozenset(k for k in (DSB_OFF_KARG, PANEL_REPLAY_OFF_KARG)
                                        if self.karg_pending(k) and not self.karg_active(k))
+        if st.awaiting_reboot:
+            st.reboot_advice = self.reboot_advice("activate it")
         st.panel_replay_blocked = any(self.karg_active(k) or self.karg_pending(k)
                                       for k in ("xe.enable_psr=0", "xe.enable_psr2_sel_fetch=0"))
         st.kwin, st.kwin_is_mine = self._kwin_outputs(panel[1] if panel else None)

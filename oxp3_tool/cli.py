@@ -14,6 +14,7 @@ from . import PROJECT_URL, __version__, diagnose, steam_session, templates
 from .detect import CACHYOS, NATIVE_STEAM, OGUI, Context
 from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
 from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix
+from .kargs import REBUILD_MARKER
 from .state import State, StateError
 from .system import SimulatedRunner, System
 
@@ -40,8 +41,10 @@ def _fix_state(ctx: Context, state: State, fix: Fix) -> tuple[str, list[str]]:
                 why = ("came back with a system update installed before the reboot"
                        if ctx.karg_backend.name == "rpm-ostree" else "is still in the next boot's configuration")
                 lines.append(f"{karg} {why}; run `sudo oxp3-tool revert {fix.id}` again")
+            elif ctx.kargs_left is None and ctx.karg_backend.name != "rpm-ostree":
+                lines.append(f"{karg} is being removed; run `sudo oxp3-tool status` to read the boot entries")
             else:
-                lines.append(f"{karg} is removed from the next boot (reboot to finish)")
+                lines.append(f"{karg} is removed from the next boot {ctx.reboot_advice('finish')}")
         return "reverting", lines
     if entry and not entry.get("applied_at"):
         return "incomplete", [f"an earlier run did not finish; run `sudo oxp3-tool apply {fix.id}` "
@@ -107,8 +110,16 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(boot + (", Secure Boot on" if ctx.secure_boot else ""))
     finish = ctx.karg_backend.unfinished()
     if finish:
-        lines.append(f"          warning: a boot-entry rebuild did not finish (or is still running): do not reboot "
-                     f"before `sudo {finish}` has ended without errors")
+        lines.append(f"          warning: oxp3-tool's last boot-entry rebuild did not finish (or is still running): "
+                     f"do not reboot before `sudo {finish}` has ended without errors (this note stays until the "
+                     "next boot, also after that command succeeds)")
+    taken = getattr(ctx.karg_backend, "dropin_problem", lambda: None)()
+    if taken:
+        ids = [f.id for f in ALL_FIXES if (state.get(f.id) or {}).get("kargs") or
+               (state.get(f.id) or {}).get("kargs_pending_add")]
+        undo = f"`sudo oxp3-tool revert {' '.join(ids)}`" if ids else f"deleting {ctx.karg_backend.dropin}"
+        lines.append(f"          warning: {taken}. Before that, undo it with {undo}, or put your own "
+                     "KERNEL_CMDLINE line back")
 
     ip = ctx.inputplumber
     if ip.installed:
@@ -173,6 +184,11 @@ def status_text(ctx: Context, state: State) -> str:
             pad = "Handheld Daemon's controller"
         elif not ip.installed:
             pad = "the kernel's plain Xbox 360 pad (install InputPlumber)"
+        elif ip.active not in ("active", None):
+            pad = ("the kernel's plain Xbox 360 pad (InputPlumber is not running: reboot after installing it, or "
+                   "see `systemctl status inputplumber`)")
+        elif not ip.oxp3_config:
+            pad = "the kernel's plain Xbox 360 pad (InputPlumber has no OXP3 device config)"
         elif ctx.steamos_manager:
             pad = "the Steam Deck controller, which steamos-manager selects"
         else:
@@ -340,10 +356,11 @@ def cmd_revert(ctx: Context, state: State, args: argparse.Namespace) -> int:
             _out(f"    {verb} {rec['path']}")
         for unit in entry.get("units_enabled", []):
             _out(f"    disable {unit}")
-        for karg in entry.get("kargs", []) + [
-            k for k in entry.get("kargs_removal_pending", []) if ctx.karg_left(k)
-        ]:
+        kargs = entry.get("kargs", []) + [k for k in entry.get("kargs_removal_pending", []) if ctx.karg_left(k)]
+        for karg in kargs:
             _out(f"    remove kernel argument {karg} (reboot needed)")
+        if (kargs or entry.get("kargs_removal_pending")) and ctx.karg_backend.unfinished():
+            _out("    rebuild the boot entries again (the last rebuild did not finish)")
     if args.dry_run:
         _out("(dry run: nothing changed)")
         return 0
@@ -497,6 +514,13 @@ def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) 
         return 1
     except KeyboardInterrupt:
         _err("Interrupted.")
+        try:
+            finish = (system.read_text(REBUILD_MARKER) or "").strip()
+        except Exception:
+            finish = ""
+        if finish:
+            _err(f"A boot-entry rebuild did not finish: do not reboot before `sudo {finish}` has ended without "
+                 "errors.")
         return 130
     finally:
         if lock is not None:

@@ -21,9 +21,11 @@ the arguments stay.
 
 from __future__ import annotations
 
+import contextlib
 import re
+import signal
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional
 
 from .templates import OWN_MARKER, PROJECT_URL
 
@@ -40,6 +42,8 @@ EFIVARS = "/sys/firmware/efi/efivars"
 LOADER_INFO = f"{EFIVARS}/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 SECURE_BOOT = f"{EFIVARS}/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 ESP_CANDIDATES = ("/efi", "/boot", "/boot/efi", "/limine")  # limine-entry-tool's search order
+# Followed by 128 hex digits in Limine's EFI binary: all zeros unless `limine enroll-config` enrolled a checksum.
+LIMINE_B2SUM_SIGNATURE = b"++CONFIG_B2SUM_SIGNATURE++"
 
 HARDWARE_SETUP_UNIT = "bazzite-hardware-setup.service"
 KARGS_UPDATE_WARNING = (
@@ -109,9 +113,14 @@ class KargBackend:
         """Arguments in this tool's own configuration file (file-based boot loaders)."""
         return []
 
-    def next_boot_any(self) -> Optional[list[str]]:
-        """Arguments any kernel entry of the next boot has (None: the same as next_boot())."""
+    def left_in_entries(self) -> Optional[list[str]]:
+        """Arguments some next-boot entry has that the user's own configuration does not give it: what a
+        removal may still have to remove (None: the same as next_boot())."""
         return None
+
+    def booted_user_args(self) -> list[str]:
+        """Arguments the user's own boot configuration gives the running kernel (not this tool's)."""
+        return []
 
     def busy(self) -> Optional[str]:
         return None
@@ -309,11 +318,20 @@ class DropinBackend(KargBackend):
         lists = list(entries.values())
         return [t for t in lists[0] if all(t in other for other in lists[1:])]
 
-    def next_boot_any(self) -> Optional[list[str]]:
+    def user_args(self) -> Optional[dict[str, list[str]]]:
+        """Entry name -> the arguments the user's own configuration (without this tool's drop-in) gives it."""
+        return None
+
+    def booted_user_args(self) -> list[str]:
+        """Arguments the user's own configuration gives the kernel that is running."""
+        return []
+
+    def left_in_entries(self) -> Optional[list[str]]:
         entries = self.entries()
         if not entries:
             return None
-        return list(dict.fromkeys(t for args in entries.values() for t in args))
+        user = self.user_args() or {}
+        return list(dict.fromkeys(t for name, args in entries.items() for t in args if t not in user.get(name, [])))
 
     def invalidate(self) -> None:
         self._entries = None
@@ -403,23 +421,27 @@ class DropinBackend(KargBackend):
         problem = self.base_problem(keep) if keep else None
         if problem:
             return KargResult(False, problem)
-        before = self.effective()
-        if not before:
-            return KargResult(False, f"could not read the current kernel command line; {self.manual(keep)}")
         ours = set(self.owned()) | set(keep) | set(remove)
         content = self.render(keep)
-        if content != prev:
-            try:
-                problems = self._probe(content, before, ours, keep)
-            except BaseException:
-                self._restore(prev)
-                raise
-            if problems:
-                self._restore(prev)
-                return KargResult(False, f"{self.name}'s configuration does not take the change as expected "
-                                         f"({'; '.join(problems)}); nothing was changed. {self.manual(keep)}")
+        # Checked even when the drop-in already has this content: a killed run may have left it unchecked.
+        try:
+            with _signals_interrupt():
+                before, after, problems = self._probe(prev, content, ours, keep)
+        except BaseException:
+            self._restore(prev)
+            raise
+        if before is None:
+            self._restore(prev)
+            return KargResult(False, f"could not read the current kernel command line; {self.manual(keep)}")
+        if problems:
+            # Arguments being added now never stay behind unchecked, also when a killed run wrote them.
+            self._restore(_without(prev, add))
+            what = self.manual(keep) if keep else self.manual_remove()
+            return KargResult(False, f"{self.name}'s configuration does not take the change as expected "
+                                     f"({'; '.join(problems)}); nothing was changed. {what}")
+        effective = after or before
         if self.sys.read_bytes(self.dropin) == prev and self.unfinished() is None \
-                and self._entries_match(keep, remove, before):
+                and self._entries_match(keep, remove, effective):
             return KargResult(True, "", False)
         busy = self.busy()
         if busy:
@@ -444,7 +466,7 @@ class DropinBackend(KargBackend):
             self._mark(None if finished else (" ".join(self.regen) if restore else self.finish_command))
             return KargResult(False, f"{error}: {detail}" if detail else error, not restore)
         self._mark(None)
-        effective = self.effective() or before
+        effective = self.effective() or effective
         if not self._entries_match(keep, remove, effective):
             entries = self.entries()
             if entries is None:
@@ -458,9 +480,18 @@ class DropinBackend(KargBackend):
                                      "check its output", True)
         return KargResult(True, "", True)
 
-    def _probe(self, content: Optional[bytes], before: dict[str, list[str]], ours: set[str],
-               keep: list[str]) -> list[str]:
-        """Write ``content`` and return what is wrong with the command lines it gives (empty: nothing)."""
+    def _probe(self, prev: Optional[bytes], content: Optional[bytes], ours: set[str], keep: list[str]
+               ) -> tuple[Optional[dict[str, list[str]]], Optional[dict[str, list[str]]], list[str]]:
+        """(command lines without this tool's drop-in, with ``content``, what is wrong with the latter).
+
+        The baseline is the user's own configuration, so a drop-in that has taken over a command line
+        (root= included) cannot pass as the way things were. Leaves ``content`` (or a per-kernel retry) written.
+        """
+        if prev is not None:
+            self._write(None)
+        before = self.effective()
+        if not before:
+            return None, None, []
         self._write(content)
         after = self.effective()
         problems = self._check(before, after, ours, keep)
@@ -469,9 +500,10 @@ class DropinBackend(KargBackend):
         if retry:
             # A kernel with its own command-line key ignores the default one: name it too.
             self._write(self.render(keep, retry))
-            if not self._check(before, self.effective(), ours, keep):
-                return []
-        return problems
+            again = self.effective()
+            if not self._check(before, again, ours, keep):
+                return before, again, []
+        return before, after, problems
 
     def own_key_kernels(self, kernels: list[str]) -> list[str]:
         """Those of ``kernels`` whose command line is set by a key of their own elsewhere."""
@@ -482,6 +514,10 @@ class DropinBackend(KargBackend):
             self.sys.remove(self.dropin)
         else:
             self.sys.write_atomic(self.dropin, prev, mode=0o644)
+
+    def manual_remove(self) -> str:
+        return (f"To undo it by hand, delete {self.dropin}, then run `sudo {' '.join(self.regen)}` and check that "
+                "it ends without errors.")
 
     def _entries_match(self, keep: list[str], remove: list[str], effective: dict[str, list[str]]) -> bool:
         entries = self.entries()
@@ -501,6 +537,44 @@ class DropinBackend(KargBackend):
     manual_where = ""
 
 
+@contextlib.contextmanager
+def _signals_interrupt() -> Iterator[None]:
+    """Turn SIGHUP and SIGTERM into KeyboardInterrupt (a closed terminal or SSH session), so cleanup runs."""
+    def interrupt(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    old = {}
+    try:
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            old[sig] = signal.signal(sig, interrupt)
+    except ValueError:  # not the main thread
+        pass
+    try:
+        yield
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
+def _without(content: Optional[bytes], args: list[str]) -> Optional[bytes]:
+    """A drop-in without ``args``: lines left with no argument go, and an empty drop-in is no drop-in."""
+    if content is None or not args:
+        return content
+    lines, left = [], False
+    for line in content.decode("utf-8", "replace").splitlines():
+        if line.lstrip().startswith("#") or '"' not in line:
+            lines.append(line)
+            continue
+        head, _, rest = line.partition('"')
+        value, _, tail = rest.rpartition('"')
+        kept = [t for t in value.split() if t not in args]
+        if any(KARG_RE.match(t) for t in kept):
+            lead = value[:len(value) - len(value.lstrip())]  # sdboot-manage's += " ..." needs its space
+            lines.append(f'{head}"{lead}{" ".join(kept)}"{tail}')
+            left = True
+    return ("\n".join(lines) + "\n").encode() if left else None
+
+
 def _strip_quotes(value: str) -> str:
     value = value.strip()
     return value[1:-1] if len(value) >= 2 and value[0] == value[-1] == '"' else value
@@ -513,9 +587,7 @@ class LimineBackend(DropinBackend):
     regen_timeout = 900
     regen_what = "rebuilds every kernel's initramfs and Limine boot entry; this takes a minute or two"
     how = "Limine drop-in, then limine-mkinitcpio"
-    manual_where = "/etc/default/limine (inside the quotes of KERNEL_CMDLINE[default])"
     kernel_keys = True
-    CONFIGS = ("/etc/limine-entry-tool.conf", "/etc/default/limine")
 
     def render_lines(self, args: list[str], kernels: list[str]) -> list[str]:
         joined = " ".join(args)
@@ -536,20 +608,46 @@ class LimineBackend(DropinBackend):
                     value = _strip_quotes(line.split("=", 1)[1])
         return value
 
+    @staticmethod
+    def cmdline_lines(text: str) -> Iterator[tuple[str, bool, str]]:
+        """(key, appends, value) of each KERNEL_CMDLINE line, the way limine-entry-tool's ConfigReader reads it."""
+        for line in text.splitlines():
+            m = re.match(r"\s*KERNEL_CMDLINE(?:\[([^\]]*)\])?\s*(\+?)=(.*)$", line)
+            if m and not line.lstrip().startswith("#"):
+                yield _strip_quotes(m.group(1) or "") or "default", bool(m.group(2)), _strip_quotes(m.group(3))
+
     def cmdlines(self) -> dict[str, str]:
         """KERNEL_CMDLINE[key] values the way limine-entry-tool reads them, leaving out this tool's drop-in."""
         out: dict[str, str] = {}
         for path in self.config_files():
             if path == self.dropin:
                 continue
-            for line in (self.sys.read_text(path) or "").splitlines():
-                m = re.match(r"\s*KERNEL_CMDLINE(?:\[([^\]]*)\])?\s*(\+?)=(.*)$", line)
-                if not m or line.lstrip().startswith("#"):
-                    continue
-                key = _strip_quotes(m.group(1) or "") or "default"
-                value = _strip_quotes(m.group(3))
-                out[key] = f"{value} {out[key]}" if m.group(2) and key in out else value
+            for key, append, value in self.cmdline_lines(self.sys.read_text(path) or ""):
+                out[key] = f"{value} {out[key]}" if append and key in out else value
         return out
+
+    def default_file(self) -> str:
+        """The configuration file with the user's KERNEL_CMDLINE[default] line (the last one that has it)."""
+        found = "/etc/default/limine"
+        for path in self.config_files():
+            if path != self.dropin and any(k == "default" for k, _, _ in self.cmdline_lines(
+                    self.sys.read_text(path) or "")):
+                found = path
+        return found
+
+    def dropin_problem(self) -> Optional[str]:
+        """Which command lines this tool's drop-in has become all of: the next rebuild loses root= there."""
+        text = self.sys.read_text(self.dropin)
+        if not text or OWN_MARKER not in text:
+            return None
+        keys = self.cmdlines()
+        whole = [k for k, _, _ in self.cmdline_lines(text) if not keys.get(k, "").strip()]
+        if not whole:
+            return None
+        what = "every kernel" if "default" in whole else ", ".join(dict.fromkeys(whole))
+        return (f"no other file sets {' or '.join(f'KERNEL_CMDLINE[{k}]' for k in dict.fromkeys(whole))}, so "
+                f"{self.dropin} is now the whole command line of {what}: the next limine-mkinitcpio run or kernel "
+                "update writes boot entries without root=")
 
     def base_problem(self, args: list[str]) -> Optional[str]:
         if not self.cmdlines().get("default", "").strip():
@@ -559,6 +657,32 @@ class LimineBackend(DropinBackend):
     def own_key_kernels(self, kernels: list[str]) -> list[str]:
         keys = self.cmdlines()
         return [k for k in kernels if keys.get(k, "").strip()]
+
+    def _user_cmdline(self, name: str, keys: dict[str, str]) -> list[str]:
+        value = keys.get(name, "")
+        if not value.strip() and "fallback" in name:
+            value = keys.get("fallback", "")
+        if not value.strip():
+            value = keys.get("default", "")
+        if value.strip():
+            return tokens(value)
+        etc = (self.sys.read_text("/etc/kernel/cmdline") or "").replace("\n", " ").strip()
+        return tokens(etc) if etc else list(self.ctx.active_kargs)
+
+    def user_args(self) -> Optional[dict[str, list[str]]]:
+        entries = self.entries()
+        if not entries:
+            return None
+        keys = self.cmdlines()
+        return {name: self._user_cmdline(name, keys) for name in entries}
+
+    def booted_user_args(self) -> list[str]:
+        release = self.ctx.kernel_release or ""
+        if not re.fullmatch(r"[A-Za-z0-9._+-]+", release):
+            return []
+        res = self.sys.run(["pacman", "-Qqo", f"/usr/lib/modules/{release}/modules.builtin"], timeout=60)
+        name = res.stdout.strip() if res.ok else ""
+        return self._user_cmdline(name, self.cmdlines()) if re.fullmatch(r"[A-Za-z0-9@._+-]+", name) else []
 
     @property
     def esp(self) -> Optional[str]:
@@ -626,30 +750,56 @@ class LimineBackend(DropinBackend):
 
     @property
     def editor_off(self) -> bool:
-        """Limine's entry editor is off: Secure Boot, or a config checksum enrolled into Limine."""
-        return self.ctx.secure_boot or (self.config_value("ENABLE_ENROLL_LIMINE_CONFIG") or "").lower() == "yes"
+        """Limine's entry editor is off after the next rebuild: a config checksum is enrolled in its EFI binary,
+        limine-mkinitcpio will enroll one, or limine.conf turns the editor off.
+
+        Secure Boot alone does not: Limine treats Secure Boot as inactive without an enrolled checksum.
+        """
+        enroll = ""
+        for line in (self.sys.read_text("/etc/default/limine") or "").splitlines():
+            if line.strip().startswith("ENABLE_ENROLL_LIMINE_CONFIG="):  # read from this file only, as it is
+                enroll = _strip_quotes(line.split("=", 1)[1]).lower()
+        if enroll == "yes":
+            return True
+        esp = self.esp
+        for path in (f"{esp}/EFI/limine/limine_x64.efi", f"{esp}/EFI/BOOT/BOOTX64.EFI") if esp else ():
+            data = self.sys.read_bytes(path)
+            at = data.find(LIMINE_B2SUM_SIGNATURE) if data else -1
+            if at >= 0 and data[at + len(LIMINE_B2SUM_SIGNATURE):at + len(LIMINE_B2SUM_SIGNATURE) + 128].strip(b"0"):
+                return True
+        conf = (self.sys.read_text(f"{esp}/limine.conf") if esp else None) or ""
+        return re.search(r"(?im)^\s*editor_enabled\s*:\s*no\b", conf) is not None
 
     def recovery_hint(self) -> str:
         if self.editor_off:
-            return ("Limine's entry editor is off here (Secure Boot or an enrolled config checksum), so have SSH or "
-                    "a CachyOS USB stick ready")
+            return ("Limine's entry editor is off here (its config checksum is enrolled, or limine.conf turns it "
+                    "off), so have SSH or a CachyOS USB stick ready")
         return ("the Limine menu shows at each boot (timeout in limine.conf); with a USB keyboard, pick the entry, "
                 "press E and delete the argument for one boot, or keep SSH ready")
 
     def remove_hint(self, karg: str) -> str:
-        return (f"remove {karg} from the KERNEL_CMDLINE lines in /etc/default/limine and "
+        return (f"remove {karg} from the KERNEL_CMDLINE lines in {self.default_file()} and "
                 "/etc/limine-entry-tool.d/, then run `sudo limine-mkinitcpio`")
 
     def manual(self, args: list[str]) -> str:
         what = " ".join(args) or "the arguments"
+        own = self.own_key_kernels(self.kernels())
+        also = (f" Also add {what} inside the quotes of {' and '.join(f'KERNEL_CMDLINE[{k}]' for k in own)}: a "
+                "kernel with a command line of its own ignores KERNEL_CMDLINE[default].") if own else ""
         if self.cmdlines().get("default", "").strip():
-            return super().manual(args)
-        return ("This system has no KERNEL_CMDLINE[default] line, so Limine takes its command line from "
-                "/etc/kernel/cmdline (or /proc/cmdline when that file is missing or empty). To set it by hand, add "
-                f"{what} to /etc/kernel/cmdline (if it does not exist, create it with the words of /proc/cmdline "
+            return (f"To set it by hand, add {what} to the kernel command line in {self.default_file()} (inside the "
+                    f"quotes of KERNEL_CMDLINE[default]), then run `sudo limine-mkinitcpio` and reboot.{also}")
+        first = ""
+        if self.sys.exists(self.dropin):
+            first = (f"First delete {self.dropin} (reverting this tool's kernel-argument fixes does it): no other "
+                     "file sets KERNEL_CMDLINE[default], so it is now Limine's whole command line, and the next "
+                     "limine-mkinitcpio run or kernel update writes boot entries without root=. ")
+        return (f"{first}This system has no other KERNEL_CMDLINE[default] line, so Limine takes its command line "
+                "from /etc/kernel/cmdline (or /proc/cmdline when that file is missing or empty). To set it by hand, "
+                f"add {what} to /etc/kernel/cmdline (if it does not exist, create it with the words of /proc/cmdline "
                 f"except BOOT_IMAGE= and initrd=, plus {what}), then run `sudo limine-mkinitcpio` and reboot. Do not "
                 "add a KERNEL_CMDLINE[default] line holding only the new argument: it replaces the whole command "
-                "line, root= included.")
+                f"line, root= included.{also}")
 
 
 def parse_limine_conf(text: str, machine_id: str) -> dict[str, list[str]]:
@@ -673,10 +823,11 @@ def parse_limine_conf(text: str, machine_id: str) -> dict[str, list[str]]:
     return out
 
 
+# $1: a drop-in to leave out ("" for none).
 SDBOOT_EVAL = (
     '. /etc/sdboot-manage.conf; '
     'for f in /usr/lib/sdboot-manage.conf.d/*.conf /etc/sdboot-manage.conf.d/*.conf; do '
-    '[ -f "$f" ] && . "$f"; done; '
+    '[ "$f" = "$1" ] && continue; [ -f "$f" ] && . "$f"; done; '
     'printf "%s\\n%s\\n" "$LINUX_OPTIONS" "$NO_AUTOGEN"'
 )
 
@@ -694,8 +845,8 @@ class SdbootBackend(DropinBackend):
     def render_lines(self, args: list[str], kernels: list[str]) -> list[str]:
         return [f'LINUX_OPTIONS+=" {" ".join(args)}"']
 
-    def _eval(self) -> Optional[tuple[str, str]]:
-        res = self.sys.run(["bash", "--noprofile", "--norc", "-c", SDBOOT_EVAL], timeout=60)
+    def _eval(self, skip: str = "") -> Optional[tuple[str, str]]:
+        res = self.sys.run(["bash", "--noprofile", "--norc", "-c", SDBOOT_EVAL, "bash", skip], timeout=60)
         if not res.ok:
             return None
         lines = res.stdout.split("\n")
@@ -727,6 +878,17 @@ class SdbootBackend(DropinBackend):
         if values is None or not entries:
             return None
         return {name: tokens(values[0]) for name in entries}
+
+    def booted_user_args(self) -> list[str]:
+        values = self._eval(self.dropin)
+        return tokens(values[0]) if values else []
+
+    def user_args(self) -> Optional[dict[str, list[str]]]:
+        entries = self.entries()
+        if not entries:
+            return None
+        mine = self.booted_user_args()
+        return {name: mine for name in entries}
 
     def read_entries(self) -> Optional[dict[str, list[str]]]:
         res = self.sys.run(["bootctl", "--print-esp-path"], timeout=30)
@@ -761,9 +923,10 @@ class SdbootBackend(DropinBackend):
         return f"remove {karg} from LINUX_OPTIONS in /etc/sdboot-manage.conf, then run `sudo sdboot-manage gen`"
 
 
+# $1: a drop-in to leave out ("" for none).
 GRUB_EVAL = (
     '. /etc/default/grub; '
-    'for f in /etc/default/grub.d/*.cfg; do [ -f "$f" ] && . "$f"; done; '
+    'for f in /etc/default/grub.d/*.cfg; do [ "$f" = "$1" ] && continue; [ -f "$f" ] && . "$f"; done; '
     'printf "%s %s\\n" "$GRUB_CMDLINE_LINUX" "$GRUB_CMDLINE_LINUX_DEFAULT"'
 )
 
@@ -790,12 +953,26 @@ class GrubBackend(DropinBackend):
         refusal = self.refusal()
         return refusal.replace(self.manual([]), self.manual([karg])) if refusal else None
 
+    def _eval(self, skip: str = "") -> Optional[list[str]]:
+        res = self.sys.run(["sh", "-c", GRUB_EVAL, "sh", skip], timeout=60)
+        return tokens(res.stdout.strip()) if res.ok else None
+
     def effective(self) -> Optional[dict[str, list[str]]]:
-        res = self.sys.run(["sh", "-c", GRUB_EVAL], timeout=60)
+        args = self._eval()
         entries = self.entries()
-        if not res.ok or not entries:
+        if args is None or not entries:
             return None
-        return {name: tokens(res.stdout.strip()) for name in entries}
+        return {name: args for name in entries}
+
+    def booted_user_args(self) -> list[str]:
+        return self._eval(self.dropin) or []
+
+    def user_args(self) -> Optional[dict[str, list[str]]]:
+        entries = self.entries()
+        if not entries:
+            return None
+        mine = self.booted_user_args()
+        return {name: mine for name in entries}
 
     def read_entries(self) -> Optional[dict[str, list[str]]]:
         text = self.sys.read_text("/boot/grub/grub.cfg")
@@ -847,7 +1024,7 @@ def detect_cachyos_backend(ctx: Context) -> KargBackend:
     """Pick the boot loader this CachyOS install uses, or a manual backend when it is not clear."""
     sys = ctx.sys
     complete = {
-        "limine": all(sys.exists(p) for p in ("/usr/bin/limine-entry-tool", "/etc/default/limine")),
+        "limine": sys.exists("/usr/bin/limine-entry-tool"),
         "systemd-boot": all(sys.exists(p) for p in ("/usr/bin/sdboot-manage", "/etc/sdboot-manage.conf")),
         "grub": all(sys.exists(p) for p in ("/usr/bin/grub-mkconfig", "/etc/default/grub")),
     }
@@ -877,5 +1054,7 @@ def detect_cachyos_backend(ctx: Context) -> KargBackend:
         return ManualBackend(ctx, "rEFInd boots this system", REFIND_STEPS)
     if not found:
         return ManualBackend(ctx, "no supported boot loader configuration was found")
+    if len(found) == 1:
+        return ManualBackend(ctx, f"{found[0]} is set up, but its configuration tools are missing")
     return ManualBackend(ctx, f"more than one boot loader is set up ({', '.join(found)}), so it is not clear "
                               "which one boots this system")
