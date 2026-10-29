@@ -10,7 +10,7 @@ import textwrap
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import PROJECT_URL, __version__, diagnose, steam_session, templates
+from . import PROJECT_URL, __version__, diagnose, kernel_cmd, steam_session, templates
 from .detect import CACHYOS, NATIVE_STEAM, OGUI, Context
 from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
 from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix
@@ -134,6 +134,9 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(f"          warning: the boot entries of {', '.join(rootless)} have no root=, so booting them "
                      "fails: do not reboot before " + ("undoing the drop-in above" if taken and taken[0] else
                                                        "`sudo limine-mkinitcpio` has rebuilt them"))
+
+    for note in kernel_cmd.status_lines(ctx) if ctx.os_family == CACHYOS else []:
+        lines.append(_wrap(note, "          ", "          "))
 
     ip = ctx.inputplumber
     if ip.installed:
@@ -440,6 +443,20 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_kernel(ctx: Context, state: State, args: argparse.Namespace) -> int:
+    action = args.kernel_action
+    if action and not args.dry_run:
+        need = _need_root(ctx.sys)
+        if need is not None:
+            return need
+    try:
+        return kernel_cmd.cmd_kernel(ctx, action, getattr(args, "package", None), args.yes, args.dry_run, _out,
+                                     _confirm)
+    except kernel_cmd.KernelError as e:
+        _err(f"error: {e}")
+        return 1
+
+
 # -- main ----------------------------------------------------------------------------
 
 
@@ -488,6 +505,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("diagnose", help="write a diagnostic archive for bug reports")
     d.add_argument("-o", "--output", help="archive path (default: oxp3-diagnose-<time>.tar.gz)")
+
+    k = sub.add_parser("kernel", help="CachyOS with Limine: list the kernels, boot another one once safely, keep it",
+                       description="Without an action: the installed kernels and what Limine boots next. `try "
+                                   "PACKAGE` boots PACKAGE once; a power-on after that (also after a hang) boots "
+                                   "Limine's default entry. `keep` keeps booting the kernel running now.")
+    k.set_defaults(kernel_action=None, dry_run=False, yes=False)
+    kinds = k.add_subparsers(dest="kernel_action")
+    t = kinds.add_parser("try", help="boot an installed kernel once (no keyboard needed to get back)")
+    t.add_argument("package", help="the kernel's package, e.g. linux-cachyos-deckify-vsw")
+    keep = kinds.add_parser("keep", help="keep booting the kernel running now (undoes what try changed)")
+    for kp in (t, keep):
+        kp.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
+        kp.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     return p
 
 
@@ -498,6 +528,7 @@ COMMANDS = {
     "apply": cmd_apply,
     "revert": cmd_revert,
     "diagnose": cmd_diagnose,
+    "kernel": cmd_kernel,
 }
 
 
@@ -532,7 +563,8 @@ def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) 
     ctx = Context(system, force=args.force)
     lock = None
     try:
-        mutating = args.command in MUTATING and not getattr(args, "dry_run", False)
+        mutating = (args.command in MUTATING or getattr(args, "kernel_action", None)) \
+            and not getattr(args, "dry_run", False)
         if not system.is_real_root or os.geteuid() == 0:
             lock = acquire_lock(system)
         if mutating and lock is None:

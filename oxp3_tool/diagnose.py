@@ -26,7 +26,8 @@ PATTERNS: list[tuple[str, str]] = [
     (r"Timed out waiting PSR idle state", "Panel Self Refresh did not idle; xe-panel-replay-off may help."),
     (r"Selective fetch area calculation failed", "PSR2/Panel Replay selective-fetch failure."),
     (r"asks to use VBT vswing/preemph tables",
-     "The firmware asks for its own eDP signal levels, which this kernel ignores; on the OXP3 this goes with "
+     "The firmware asks for its own eDP signal levels, which a kernel without the fix ignores (a kernel with it "
+     "no longer logs this); on the OXP3 this goes with "
      "random white dots that flicker on dark scenes (kernel-anatase#7). Fixed by the 'Vswing / Pre-emphasis "
      "Override' series, part of Linux 7.4 (mainline commits 3018008dc1c3..4bda5543b3c6)."),
     (r"Failed to write aux backlight level", "Backlight control over the DisplayPort AUX channel failed."),
@@ -194,6 +195,12 @@ def scan_patterns(text: str) -> list[tuple[str, int, str]]:
     return hits
 
 
+def boot_kernel(log: str) -> str:
+    """The kernel release a boot's log starts with ("Linux version <release> ...")."""
+    m = re.search(r"Linux version (\S+)", log)
+    return m.group(1) if m else "kernel unknown"
+
+
 def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
     sys = ctx.sys
     bundle = Bundle()
@@ -323,12 +330,21 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
         if v is not None:
             hw.append(f"xe.{param} = {v}")
     bundle.add("hardware.txt", "\n".join(hw) + "\n")
+    if ctx.os_family == CACHYOS and isinstance(ctx.karg_backend, LimineBackend):
+        from . import kernel_cmd
+        lines: list[str] = []
+        try:
+            kernel_cmd.cmd_kernel(ctx, None, None, False, False, lines.append, lambda *_: False)
+        except kernel_cmd.KernelError as e:
+            lines.append(f"not read: {e}")
+        bundle.add("kernels.txt", "\n".join(lines) + "\n")
 
-    # The whole logs, not the archived copies, which may be cut: findings then match status.
-    kernel_logs = ctx.kernel_log(0) + ctx.kernel_log(-1)
+    # The whole logs, not the archived copies, which may be cut: findings then match status. Each says its boot
+    # and kernel: right after switching kernels the previous boot ran the other one.
     findings = []
-    for pattern, count, meaning in scan_patterns(kernel_logs):
-        findings.append(f"{count:6d}x  /{pattern}/  {meaning}")
+    for when, log in (("this boot", ctx.kernel_log(0)), ("previous boot", ctx.kernel_log(-1))):
+        for pattern, count, meaning in scan_patterns(log):
+            findings.append(f"{count:6d}x  /{pattern}/  ({when}, {boot_kernel(log)}) {meaning}")
     text = "\n".join(findings) or "No known problem patterns in the kernel logs."
     advice = ctx.refresh_state.advice() if ctx.show_refresh else []
     if advice:

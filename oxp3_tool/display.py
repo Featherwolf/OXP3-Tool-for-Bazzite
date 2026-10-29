@@ -192,42 +192,49 @@ def driver_start_logged(kernel_log: str) -> bool:
 
 
 def vbt_vswing_ports(vbt: bytes) -> list[str]:
-    """Ports whose VBT entry asks for the VBT's own vswing/pre-emphasis tables (child use_vbt_vswing).
+    """Ports whose VBT entry asks for the VBT's own vswing/pre-emphasis tables (child use_vbt_vswing)."""
+    return vbt_vswing_info(vbt)[0]
+
+
+def vbt_vswing_info(vbt: bytes) -> tuple[list[str], int, bool]:
+    """(ports asking for the VBT's own vswing/pre-emphasis tables, BDB version, the VBT has block 57).
 
     Read the way the kernel's intel_bios.c does: the $VBT header points to the BDB, whose block 2 (general
     definitions) holds one child device per output; byte 23 bit 5 is use_vbt_vswing. "?" for a port whose
-    letter depends on the platform.
+    letter depends on the platform. Block 57 holds the level tables the 'Vswing / Pre-emphasis Override'
+    series (Linux 7.4) applies; it reads them from BDB version 218 on.
     """
     def u16(b: bytes, at: int) -> int:
         return int.from_bytes(b[at:at + 2], "little")
 
     if len(vbt) < 0x30 or not vbt.startswith(b"$VBT"):
-        return []
+        return [], 0, False
     bdb = vbt[int.from_bytes(vbt[0x1c:0x20], "little"):]
     if len(bdb) < 22 or not bdb.startswith(b"BIOS_DATA_BLOCK"):
-        return []
-    index, total = u16(bdb, 18), min(u16(bdb, 20), len(bdb))
-    block = b""
+        return [], 0, False
+    version, index, total = u16(bdb, 16), u16(bdb, 18), min(u16(bdb, 20), len(bdb))
+    block, tables = b"", False
     while index + 3 < total:
         block_id, size = bdb[index], u16(bdb, index + 1)
         if block_id == 53 and bdb[index + 3] >= 3:  # MIPI sequence v3+ has a 32-bit size
             size = int.from_bytes(bdb[index + 4:index + 8], "little")
         index += 3
         if index + size > total:
-            return []
-        if block_id == 2:
-            block = bdb[index:index + size]
             break
+        if block_id == 2 and not block:
+            block = bdb[index:index + size]
+        elif block_id == 57 and size >= 2:
+            tables = True
         index += size
     if len(block) < 5 or block[4] < 24:
-        return []
+        return [], version, tables
     child_size = block[4]
     ports = []
     for at in range(5, len(block) - child_size + 1, child_size):
         child = block[at:at + child_size]
         if u16(child, 2) and child[23] >> 5 & 1:  # a device (type != 0) with use_vbt_vswing
             ports.append(_DVO_PORT_LETTER.get(child[16], "?"))
-    return list(dict.fromkeys(ports))
+    return list(dict.fromkeys(ports)), version, tables
 
 
 def _kwin_int(value: object) -> Optional[int]:
@@ -357,6 +364,7 @@ class RefreshState:
     psr_errors: int = 0
     vbt_vswing_port: Optional[str] = None  # the kernel ignored the firmware's eDP drive levels for this port
     vbt_vswing_from_table: bool = False  # found in the VBT itself: the kernel log no longer had the warning
+    vspeo: Optional[str] = None  # the kernel has the vswing/pre-emphasis override: "tables" (the VBT has them), "none"
     kernel_version: Optional[tuple[int, int]] = None  # (major, minor) of the running kernel
     remove_karg_hint: str = "`sudo rpm-ostree kargs --delete=xe.enable_dc_balance`"
     kernel_update_hint: str = "until Bazzite ships kernel 7.2.10 or later"
@@ -428,6 +436,13 @@ class RefreshState:
         else:
             kernel = "the kernel predates the variable-refresh fix (7.2.10)"
         lines.append(f"display firmware (DMC) {dmc}; {kernel}")
+        if self.vspeo == "tables":
+            lines.append("eDP signal levels: the firmware's own (VBT), which this kernel's 'Vswing / Pre-emphasis "
+                         "Override' fix (the white dots) applies")
+        elif self.vspeo == "none":
+            lines.append("eDP signal levels: this kernel has the 'Vswing / Pre-emphasis Override' fix, but the "
+                         "firmware's VBT has no level tables for it (block 57, VBT version 218 or later), so Intel's "
+                         "generic levels stay")
         seen = []
         for out in self.kwin:
             text = f"Desktop Mode setting{self._label(out)}: {out.describe()}"

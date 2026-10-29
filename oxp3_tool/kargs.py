@@ -827,17 +827,23 @@ class LimineBackend(DropinBackend):
         return True, f"limine-mkinitcpio failed ({code}); the previous configuration was put back"
 
     @property
+    def enroll_enabled(self) -> bool:
+        """limine-mkinitcpio and limine-enroll-config enroll limine.conf's checksum (ENABLE_ENROLL_LIMINE_CONFIG=yes,
+        read from /etc/default/limine only)."""
+        enroll = ""
+        for line in (self.sys.read_text("/etc/default/limine") or "").splitlines():
+            if line.strip().startswith("ENABLE_ENROLL_LIMINE_CONFIG="):  # a shell file: either quote
+                enroll = _strip_quotes(line.split("=", 1)[1]).strip("'").lower()
+        return enroll == "yes"
+
+    @property
     def editor_off(self) -> bool:
         """Limine's entry editor is off after the next rebuild: a config checksum is enrolled in its EFI binary,
         limine-mkinitcpio will enroll one, or limine.conf turns the editor off.
 
         Secure Boot alone does not: Limine treats Secure Boot as inactive without an enrolled checksum.
         """
-        enroll = ""
-        for line in (self.sys.read_text("/etc/default/limine") or "").splitlines():
-            if line.strip().startswith("ENABLE_ENROLL_LIMINE_CONFIG="):  # read from this file only, as it is
-                enroll = _strip_quotes(line.split("=", 1)[1]).lower()
-        if enroll == "yes":
+        if self.enroll_enabled:
             return True
         esp = self.esp
         for path in (f"{esp}/EFI/limine/limine_x64.efi", f"{esp}/EFI/BOOT/BOOTX64.EFI") if esp else ():

@@ -29,6 +29,18 @@ if [[ -f "$STATE" && "${1:-}" != "--keep-fixes" ]]; then
     exit 1
 fi
 
+# `oxp3-tool kernel try` turned Limine's remember_last_entry off (a comment above the line says so).
+if [[ "${1:-}" != "--keep-fixes" ]]; then
+    for conf in /boot/limine.conf /efi/limine.conf /boot/efi/limine.conf; do
+        if [[ -f "$conf" ]] && grep -q '^[[:space:]]*# oxp3-tool kernel try:' "$conf"; then
+            echo "$conf has remember_last_entry: no from \`oxp3-tool kernel try\`." >&2
+            echo "Run: sudo oxp3-tool kernel keep (on the kernel to keep booting); then run this again," >&2
+            echo "or pass --keep-fixes to leave it as it is." >&2
+            exit 1
+        fi
+    done
+fi
+
 rm -f "$BIN" "$DESKTOP"
 rm -rf "$DEST"
 

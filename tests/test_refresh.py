@@ -280,7 +280,7 @@ class RefreshStateTest(unittest.TestCase):
         self.assertFalse([c for c in self.f.runner.calls if c[0] == "journalctl"])
 
     @staticmethod
-    def vbt(*children, mipi_v3=False):
+    def vbt(*children, mipi_v3=False, tables=False):
         """A VBT the way intel_bios.c reads it: $VBT header, BDB header, blocks; children are (dvo_port, vswing)."""
         child_size = 40
         devices = b""
@@ -295,6 +295,8 @@ class RefreshStateTest(unittest.TestCase):
         if mipi_v3:  # version 3+: a 32-bit size after the version byte, counting the whole block data
             blocks += bytes([53]) + (0).to_bytes(2, "little") + bytes([3]) + (11).to_bytes(4, "little") + b"\0" * 6
         blocks += bytes([2]) + len(general).to_bytes(2, "little") + general
+        if tables:  # block 57: the vswing/pre-emphasis override tables
+            blocks += bytes([57]) + (4).to_bytes(2, "little") + b"\x01\x00\x00\x00"
         bdb = b"BIOS_DATA_BLOCK " + (251).to_bytes(2, "little") + (22).to_bytes(2, "little")
         bdb += (22 + len(blocks)).to_bytes(2, "little") + blocks
         header = bytearray(0x30)
@@ -322,6 +324,28 @@ class RefreshStateTest(unittest.TestCase):
         # With the driver's start in the log and no warning, the kernel has the fix (or the VBT does not ask).
         self.f.runner.journal["0"] = "xe 0000:00:02.0: [drm] Initialized xe 1.1.0 for 0000:00:02.0 on minor 0\n"
         self.assertNotIn("signal levels", self.status())
+
+    def test_vbt_tables_block(self):
+        from oxp3_tool.display import vbt_vswing_info
+        self.assertEqual(vbt_vswing_info(self.vbt((10, True))), (["A"], 251, False))
+        self.assertEqual(vbt_vswing_info(self.vbt((10, True), tables=True)), (["A"], 251, True))
+
+    def test_kernel_with_the_vswing_fix(self):
+        """linux-cachyos-deckify-vsw: still 7.2, but its xe has the series' functions; it logs no warning."""
+        self.f.display_debugfs()
+        self.f.write("/sys/kernel/debug/dri/0000:00:02.0/i915_vbt", self.vbt((10, True)))
+        self.f.runner.journal["0"] = "xe 0000:00:02.0: [drm] *ERROR* DSB 0 poll error\n" * 3  # flooded
+        self.f.write("/proc/kallsyms", "0000000000000000 T vfs_read\n0000000000000000 t intel_bios_get_c10_vspeo\t[xe]\n")
+        out = " ".join(self.status().split())
+        self.assertNotIn("this kernel ignores them", out)
+        self.assertIn("this kernel has the 'Vswing / Pre-emphasis Override' fix, but the firmware's VBT has no level "
+                      "tables for it", out)
+        self.f.write("/sys/kernel/debug/dri/0000:00:02.0/i915_vbt", self.vbt((10, True), tables=True))
+        out = " ".join(self.status().split())
+        self.assertIn("eDP signal levels: the firmware's own (VBT), which this kernel's 'Vswing / Pre-emphasis "
+                      "Override' fix (the white dots) applies", out)
+        self.f.write("/proc/kallsyms", "0000000000000000 T vfs_read\n")
+        self.assertIn("this kernel ignores them", " ".join(self.status().split()))
 
     def test_ignored_vbt_drive_levels_are_explained(self):
         self.f.display_debugfs()

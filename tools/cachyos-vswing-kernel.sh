@@ -1,18 +1,24 @@
 #!/bin/bash
 # Build CachyOS's Handheld Edition kernel, linux-cachyos-deckify 7.2.11-1, with Intel's
 # "Vswing / Pre-emphasis Override" fix (mainline Linux 7.4) for the white dots on the OXP3's
-# screen, as a second kernel next to the stock one.
+# screen, as a second kernel (linux-cachyos-deckify-vsw) next to the stock one.
 #
 # It uses CachyOS's own build recipe and sources, pinned to the 7.2.11-1 release, adds the
-# eight patches from Linus Torvalds' tree, builds with makepkg and prints the install command.
-# Nothing is installed or changed outside $WORK until you run that command yourself.
+# eight patches from Linus Torvalds' tree, builds for x86-64-v3 like CachyOS's published
+# package, and prints the install command. The kernel is not installed until you run that
+# command yourself. Before that, the script installs base-devel and git, makepkg adds the build
+# tools (rust, rust-src, rust-bindgen with clang, pahole, ...; about 1 GB, and they stay
+# installed), and gpg adds CachyOS's two signing keys to ~/.gnupg.
 #
-# Run it as your normal user (not with sudo), on AC power:
+# Run it as your normal user (not with sudo), plugged in, from Desktop Mode:
 #   bash cachyos-vswing-kernel.sh
 #   WORK=/path/on/disk bash cachyos-vswing-kernel.sh   # build somewhere else (default: ~/kbuild)
+#   REBUILD=1 bash cachyos-vswing-kernel.sh            # build again although the packages exist
 #
-# Needs about 30 GB free in $WORK and 30-60+ minutes. makepkg asks for your password once to
-# install the build tools (base-devel, rust, pahole, ...).
+# Needs about 30 GB free in $WORK (ext4, btrfs, xfs or f2fs; not a FAT/exFAT microSD) and 1-2 hours.
+# In the first minutes it asks for your password twice (sudo for base-devel and git, then
+# makepkg's own sudo for rust, pahole, ...) and pacman asks you to confirm each install; after
+# that it runs unattended. Returning to Gaming Mode or closing the terminal stops the build.
 set -euo pipefail
 
 LC_COMMIT=4a8d2ec8509d0da7d5fd5293f42251ea99d5ea3c  # CachyOS/linux-cachyos: "7.2.11-1"
@@ -34,6 +40,7 @@ VSWING=(
     4bda5543b3c6697ca435e89aeea655eea9087f96
 )
 SUFFIX=cachyos-deckify-vsw
+VERSION=7.2.11-1
 WORK="${WORK:-$HOME/kbuild}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -44,27 +51,33 @@ command -v pacman >/dev/null || die "this is for CachyOS (pacman not found)"
 
 mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
-[ "$(findmnt -no FSTYPE -T "$WORK" 2>/dev/null || true)" != tmpfs ] ||
-    die "$WORK is in RAM (tmpfs); set WORK= to a folder on disk"
+case $WORK in
+    *[[:space:]:]*) die "WORK ($WORK) must not contain spaces or colons: the kernel build refuses them" ;;
+esac
+fstype=$(findmnt -no FSTYPE -T "$WORK" 2>/dev/null || true)
+case $fstype in
+    ext4 | btrfs | xfs | f2fs) ;;
+    *) die "$WORK is on ${fstype:-an unknown file system}; set WORK= to a folder on an ext4, btrfs, xfs or f2fs disk" ;;
+esac
 free_gb=$(df -Pk "$WORK" | awk 'NR==2 {print int($4 / 1048576)}')
 [ "$free_gb" -ge 30 ] || die "$WORK has ${free_gb} GB free; the build needs about 30 GB (set WORK= to another disk)"
 on_ac=no
 for p in /sys/class/power_supply/*; do
     [ "$(cat "$p/type" 2>/dev/null)" = Mains ] && [ "$(cat "$p/online" 2>/dev/null)" = 1 ] && on_ac=yes
 done
-[ "$on_ac" = yes ] || echo "warning: not on AC power; the build runs every CPU core flat out for up to an hour"
+[ "$on_ac" = yes ] || echo "warning: no charger seen; the build runs every CPU core flat out for 1-2 hours"
 
 step "Build tools"
 sudo pacman -S --needed base-devel git
 
-step "CachyOS's recipe for linux-cachyos-deckify 7.2.11-1"
+step "CachyOS's recipe for linux-cachyos-deckify $VERSION"
 cd "$WORK"
 [ -d linux-cachyos/.git ] || git clone --filter=blob:none --no-checkout https://github.com/CachyOS/linux-cachyos.git
 git -C linux-cachyos cat-file -e "$LC_COMMIT^{commit}" 2>/dev/null || git -C linux-cachyos fetch origin
 git -C linux-cachyos checkout -q --force "$LC_COMMIT"
 cd linux-cachyos/linux-cachyos-deckify
 if ! { grep -qx '_major=7.2' PKGBUILD && grep -qx '_minor=11' PKGBUILD && grep -qx 'pkgrel=1' PKGBUILD; }; then
-    die "unexpected PKGBUILD (not 7.2.11-1)"
+    die "unexpected PKGBUILD (not $VERSION)"
 fi
 
 # The recipe downloads its patches from kernel-patches' moving master branch; pin the ones the published
@@ -76,6 +89,11 @@ sed -i "s|'$HANDHELD_OLD'|'$HANDHELD_NEW'|" PKGBUILD
 # A package of its own (linux-cachyos-deckify-vsw), so the stock kernel stays installed and bootable.
 sed -i "s|^    _pkgsuffix=\"cachyos-deckify\"\$|    _pkgsuffix=\"$SUFFIX\"|" PKGBUILD
 [ "$(grep -c "_pkgsuffix=\"$SUFFIX\"" PKGBUILD)" = 1 ] || die "could not rename the package"
+# x86-64-v3, like the published package from the cachyos-v3 repository (the recipe's default is
+# -march=native), so the two kernels differ only by the patches.
+sed -i 's/_processor_opt:=}/_processor_opt:=GENERIC_V3}/' PKGBUILD
+# shellcheck disable=SC2016  # the PKGBUILD's literal text
+grep -qxF ': "${_processor_opt:=GENERIC_V3}"' PKGBUILD || die "could not set the CPU target to x86-64-v3"
 
 step "The vswing/pre-emphasis patches from torvalds/linux"
 rm -f vswing-*.patch
@@ -91,17 +109,57 @@ printf '\nsource+=("vswing-override.patch")\nb2sums+=("%s")\n' "$(b2sum vswing-o
 
 step "CachyOS's signing keys for the kernel source"
 for key in E18447AC260021D31F3FF6C4C8A2A4774B8B63C4 E8B9AA39F054E30E8290D492C3C4820857F654FE; do
-    gpg --list-keys "$key" >/dev/null 2>&1 || gpg --recv-keys "$key" ||
-        curl -fsSL --retry 3 "https://keys.openpgp.org/vks/v1/by-fingerprint/$key" | gpg --import
+    if ! gpg --list-keys "$key" >/dev/null 2>&1; then
+        gpg --recv-keys "$key" ||
+            { curl -fsSL --retry 3 "https://keys.openpgp.org/vks/v1/by-fingerprint/$key" | gpg --import; } || true
+    fi
     gpg --list-keys "$key" >/dev/null 2>&1 || die "could not get CachyOS's signing key $key"
 done
 
-step "Building (30-60+ minutes); the log must show 'Applying patch vswing-override.patch...'"
-mkdir -p "$WORK/pkg"
-BUILDDIR="$WORK/build" PKGDEST="$WORK/pkg" makepkg -s --cleanbuild
-rm -rf "$WORK/build"
+find_packages() {
+    shopt -s nullglob
+    kpkg=("$WORK/pkg/linux-$SUFFIX-$VERSION-"*.pkg.tar.zst)
+    hpkg=("$WORK/pkg/linux-$SUFFIX-headers-$VERSION-"*.pkg.tar.zst)
+    shopt -u nullglob
+}
+mkdir -p "$WORK/pkg" "$WORK/logs"
+# The edited PKGBUILD pins every source by checksum: packages built from another one are built again.
+stamp="$WORK/pkg/.linux-$SUFFIX.recipe"
+recipe="$(b2sum PKGBUILD | cut -d' ' -f1)"
+find_packages
+if [ -z "${REBUILD:-}" ] && [ ${#kpkg[@]} -eq 1 ] && [ ${#hpkg[@]} -eq 1 ] &&
+    [ "$(cat "$stamp" 2>/dev/null)" = "$recipe" ]; then
+    step "Already built from this recipe (REBUILD=1 bash $0 builds again)"
+else
+    rm -f "${kpkg[@]}" "${hpkg[@]}" "$stamp"
+    step "Building (1-2 hours; logs in $WORK/logs). Stay in Desktop Mode and keep this window open until it says Done"
+    inhibit=(systemd-inhibit --what=sleep --who=cachyos-vswing-kernel --why="Building a kernel")
+    "${inhibit[@]}" true 2>/dev/null || { inhibit=(); echo "note: could not keep the device awake; do not let it sleep"; }
+    # makepkg stops with "A failure occurred in prepare()" if any patch, vswing-override.patch included, does
+    # not apply, so a finished build always has the series.
+    "${inhibit[@]}" env BUILDDIR="$WORK/build" PKGDEST="$WORK/pkg" LOGDEST="$WORK/logs" PKGEXT=.pkg.tar.zst \
+        makepkg -s -f --cleanbuild --log ||
+        die "the build failed; the newest *.log in $WORK/logs has the error near its end. Nothing was installed."
+    echo "$recipe" > "$stamp"
+    rm -rf "$WORK/build"
+    find_packages
+    [ ${#kpkg[@]} -eq 1 ] && [ ${#hpkg[@]} -eq 1 ] ||
+        die "expected one kernel and one headers package in $WORK/pkg, found: ${kpkg[*]} ${hpkg[*]}"
+fi
 
 step "Done. Install it next to your stock kernel with:"
-packages=("$WORK/pkg/linux-$SUFFIX-7.2.11-1-"*.pkg.tar.zst "$WORK/pkg/linux-$SUFFIX-headers-7.2.11-1-"*.pkg.tar.zst)
-echo "  sudo pacman -U ${packages[*]}"
-echo "Limine then gets a 'linux-$SUFFIX' entry; the stock linux-cachyos-deckify entry stays."
+printf '  sudo pacman -U'; printf ' %q' "${kpkg[0]}" "${hpkg[0]}"; echo
+cat <<EOF
+
+Limine then lists linux-$SUFFIX after the stock kernel and keeps booting the stock one. Do not
+pick the new kernel in Limine's menu or with bootctl: CachyOS's limine.conf has
+'remember_last_entry: yes', so whatever boots once boots at every power-on, also if it hangs.
+Instead, with oxp3-tool 0.3.0 or later (update it with the get.sh line from its README):
+  sudo oxp3-tool kernel try linux-$SUFFIX
+  systemctl reboot
+If it hangs or the screen stays dark, hold the power button about 10 seconds until the device is
+off, then turn it on: Limine boots the stock kernel. On the new kernel, \`uname -r\` shows
+$VERSION-$SUFFIX; to keep booting it: sudo oxp3-tool kernel keep
+To remove it later: sudo oxp3-tool kernel try linux-cachyos-deckify, reboot, then
+  sudo pacman -R linux-$SUFFIX linux-$SUFFIX-headers
+EOF

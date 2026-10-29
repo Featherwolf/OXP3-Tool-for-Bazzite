@@ -218,7 +218,9 @@ class System:
     def makedirs(self, p: str, mode: int = 0o755) -> None:
         self.path(p).mkdir(parents=True, exist_ok=True, mode=mode)
 
-    def write_atomic(self, p: str, data: bytes, mode: int = 0o644) -> None:
+    def write_atomic(self, p: str, data: bytes, mode: Optional[int] = 0o644) -> None:
+        """Replace ``p`` through a temporary file in its folder; ``mode`` None leaves the mode alone (vfat
+        refuses a chmod its mount options cannot show)."""
         target = self.path(p)
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + TMP_SUFFIX)
@@ -227,8 +229,17 @@ class System:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            os.chmod(tmp, mode)
+            if mode is not None:
+                os.chmod(tmp, mode)
             os.replace(tmp, target)
+            try:  # the rename itself, before anything relies on the new content
+                fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
         finally:
             try:
                 os.unlink(tmp)

@@ -34,7 +34,7 @@ from .display import (
     parse_psr_mode,
     safe_name,
     vbt_vswing_port,
-    vbt_vswing_ports,
+    vbt_vswing_info,
 )
 from .system import System
 
@@ -80,6 +80,9 @@ STEAM_CONFIG_VDF_MAX = 16 * 1024 * 1024
 _SCREEN_READER_RE = re.compile(rb'"ScreenReaderEnabled"\s+"1"')
 # gamescope DRM backend: "Got known display: <key> (<pretty name>)"
 _KNOWN_DISPLAY_RE = re.compile(r"Got known display: ([A-Za-z0-9_.-]+) \(")
+# Functions the 'Vswing / Pre-emphasis Override' series (Linux 7.4) adds to the display code (intel_bios.c).
+_VSPEO_SYMBOL_RE = re.compile(rb"\s(?:intel_bios_get_c10_vspeo|intel_bios_get_c20_vspeo|"
+                              rb"intel_bios_encoder_requests_vspeo)\s")
 # InputPlumber 0.82 oxp_hid: "failed to parse B2 report: <err>: [b2 3f 01 01 1f 80 25 ...]" (byte 6 = button id)
 _UNDECODED_RE = re.compile(r"failed to parse B2 report: .*?\[b2 3f(?: [0-9a-f]{2}){4} ([0-9a-f]{2})")
 
@@ -691,12 +694,14 @@ class Context:
             st.remove_karg_hint = self.karg_backend.remove_hint("xe.enable_dc_balance=1")
             st.kernel_update_hint = "until you update to kernel 7.2.10 or later (`sudo pacman -Syu`, then reboot)"
             st.vswing_hint = ("on CachyOS, linux-cachyos-rc has it from 7.4-rc1 on (`pacman -Si linux-cachyos-rc`; it "
-                              "installs next to your kernel), or build linux-cachyos-deckify with the series (README)")
+                              "installs next to your kernel, and `sudo oxp3-tool kernel try linux-cachyos-rc` boots it "
+                              "once), or build linux-cachyos-deckify-vsw with tools/cachyos-vswing-kernel.sh (README)")
         st.game_mode = self.has_game_mode
         panel = self.internal_panel
         st.connector = re.sub(r"^card\d+-", "", panel[0]) if panel else None
         debugfs_read = False
         vbt_ports: list[str] = []
+        vbt_version, vbt_tables = 0, False
         if st.connector:
             for info in self.sys.glob(f"{DEBUGFS_DRI}/*/i915_display_info"):
                 text = self.sys.read_text(info)
@@ -711,7 +716,7 @@ class Context:
                     psr = self.sys.read_text(f"{d}/i915_edp_psr_status")
                 st.psr_mode = parse_psr_mode(psr) if psr else None
                 st.dmc_loaded, st.dmc_version = parse_dmc_info(self.sys.read_text(f"{d}/i915_dmc_info") or "")
-                vbt_ports = vbt_vswing_ports(self.sys.read_bytes(f"{d}/i915_vbt") or b"")
+                vbt_ports, vbt_version, vbt_tables = vbt_vswing_info(self.sys.read_bytes(f"{d}/i915_vbt") or b"")
                 if st.mode is None:
                     st.debugfs_why = f"no active display pipe drives {st.connector} (screen off?)"
                 break
@@ -742,10 +747,12 @@ class Context:
         st.dsb_errors = count_dsb_errors(log)
         st.psr_errors = count_psr_errors(log)
         st.vbt_vswing_port = vbt_vswing_port(log)
-        if st.vbt_vswing_port is None and vbt_ports and not driver_start_logged(log) \
-                and (st.kernel_version or (0, 0)) < (7, 4):
-            # A log flood (DSB errors) can push the boot-time warning out; the VBT itself still says it.
-            st.vbt_vswing_port, st.vbt_vswing_from_table = vbt_ports[0], True
+        if st.vbt_vswing_port is None and vbt_ports:
+            if (st.kernel_version or (0, 0)) >= (7, 4) or self.display_has_vspeo:
+                st.vspeo = "tables" if vbt_version >= 218 and vbt_tables else "none"
+            elif not driver_start_logged(log):
+                # A log flood (DSB errors) can push the boot-time warning out; the VBT itself still says it.
+                st.vbt_vswing_port, st.vbt_vswing_from_table = vbt_ports[0], True
         st.awaiting_reboot = frozenset(k for k in (DSB_OFF_KARG, PANEL_REPLAY_OFF_KARG)
                                        if self.karg_pending(k) and not self.karg_active(k))
         if st.awaiting_reboot:
@@ -754,6 +761,12 @@ class Context:
                                       for k in ("xe.enable_psr=0", "xe.enable_psr2_sel_fetch=0"))
         st.kwin, st.kwin_is_mine = self._kwin_outputs(panel[1] if panel else None)
         return st
+
+    @cached_property
+    def display_has_vspeo(self) -> bool:
+        """The loaded display driver has the 'Vswing / Pre-emphasis Override' series (Linux 7.4, or a backport such
+        as linux-cachyos-deckify-vsw): functions it adds to xe.ko and i915.ko, called across files, so in kallsyms."""
+        return _VSPEO_SYMBOL_RE.search(self.sys.read_bytes("/proc/kallsyms") or b"") is not None
 
     @property
     def show_refresh(self) -> bool:

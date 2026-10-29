@@ -7,6 +7,7 @@ the same structure as the 0.82.0 originals.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -408,6 +409,12 @@ class FakeOxp3:
 # -- CachyOS ---------------------------------------------------------------------
 
 MACHINE_ID = "0123456789abcdef0123456789abcdef"
+EFIVARS = "/sys/firmware/efi/efivars"
+ONESHOT_VAR = f"{EFIVARS}/LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+LAST_BOOTED_VAR = f"{EFIVARS}/LimineLastBootedEntry-513ee0d0-6e43-cb05-b272-f146a2fcb88a"
+SELECTED_VAR = f"{EFIVARS}/LoaderEntrySelected-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+LIMINE_EFI = "/boot/EFI/limine/limine_x64.efi"
+B2SUM_SIGNATURE = b"++CONFIG_B2SUM_SIGNATURE++"
 CACHY_KERNELS = {"linux-cachyos-deckify": "7.2.11-1-cachyos-deckify", "linux-cachyos-lts": "6.18.55-2-cachyos-lts"}
 CALAMARES_LIMINE = ('ESP_PATH="/boot"\n'
                     'KERNEL_CMDLINE[default]+="quiet nowatchdog splash rw rootflags=subvol=/@ root=UUID=abcd"\n')
@@ -446,6 +453,8 @@ class FakeCachyRunner(FakeRunner):
         self.limine_skip: set[str] = set()
         self.gen_fail = 0  # how many sdboot-manage/grub-mkconfig runs fail next
         self.regenerations = 0
+        self.enroll_exit = 0
+        self.enroll_strips = False  # a failing limine-enroll-config leaves the binary without a checksum
         # Command -> how many of its runs pass before one gets Ctrl+C (before it writes anything).
         self.interrupt: dict[str, int] = {}
         # Command -> (runs that pass, signal this process then gets): a closed terminal or a stopped service.
@@ -467,7 +476,7 @@ class FakeCachyRunner(FakeRunner):
         argv = list(argv)
         cmd = argv[0]
         if cmd not in ("pacman", "limine-entry-tool", "limine-mkinitcpio", "bash", "sh", "sdboot-manage",
-                       "grub-mkconfig", "bootctl"):
+                       "grub-mkconfig", "bootctl", "limine-enroll-config"):
             return super().__call__(argv, timeout)
         self.calls.append(argv)
         if cmd in self.interrupt:
@@ -507,6 +516,17 @@ class FakeCachyRunner(FakeRunner):
             return self.sdboot_gen()
         if cmd == "bootctl" and "--print-esp-path" in argv:
             return CommandResult(0, "/boot\n")
+        if cmd == "bootctl" and argv[1:2] == ["set-oneshot"]:
+            var = self.root / ONESHOT_VAR.lstrip("/")
+            if argv[2]:
+                var.parent.mkdir(parents=True, exist_ok=True)
+                var.write_bytes(b"\x07\x00\x00\x00" + (argv[2] + "\0").encode("utf-16-le"))
+            else:
+                var.unlink(missing_ok=True)
+            return CommandResult(0)
+        if cmd == "limine-enroll-config":
+            self.enroll()
+            return CommandResult(self.enroll_exit, "", "simulated failure" if self.enroll_exit else "")
         if cmd == "sh" and "/etc/default/grub" in script:
             values = self.shell_vars(["/etc/default/grub", *self.files("/etc/default/grub.d/*.cfg")], skip)
             return CommandResult(0, f"{values.get('GRUB_CMDLINE_LINUX', '')} "
@@ -551,12 +571,14 @@ class FakeCachyRunner(FakeRunner):
         if self.limine_exit in (1, 2):
             return CommandResult(self.limine_exit, "", "simulated limine-mkinitcpio failure")
         old = self.read("/boot/limine.conf") or ""
+        # limine-entry-tool keeps every line above the first entry as it is.
+        head = old.split("\n/", 1)[0].split("\n") if "\n/" in old else \
+            ["timeout: 5", "default_entry: 2", "remember_last_entry: yes", "", f"comment: machine-id={MACHINE_ID}"]
         # As limine-entry-tool: entries are found by their kernel-id comment and keep the name they have.
         old_blocks = {m.group(2): (m.group(1), m.group(0).rstrip("\n"))
                       for m in re.finditer(r"  //([^\n]+)\n(?:    (?!comment: kernel-id=).*\n)*"
                                            r"    comment: kernel-id=([^\n]+)\n(?:    .*\n)*", old)}
-        lines = ["timeout: 5", "default_entry: 2", "", f"comment: machine-id={MACHINE_ID}", "/+CachyOS",
-                 f"    comment: machine-id={MACHINE_ID}"]
+        lines = head + ["/+CachyOS", f"    comment: machine-id={MACHINE_ID}"]
         for kernel, version in self.kernels.items():
             for name in (kernel, f"{kernel}-fallback"):
                 if kernel in self.limine_skip:
@@ -566,6 +588,8 @@ class FakeCachyRunner(FakeRunner):
                     continue
                 title = old_blocks.get(name, (name, ""))[0]
                 initramfs = "initramfs-fallback" if name.endswith("-fallback") else "initramfs"
+                for f in ("vmlinuz", initramfs):  # copied to the ESP
+                    self.write(f"/boot/{MACHINE_ID}/{kernel}/{f}", "")
                 lines += [f"  //{title}", f"    comment: Kernel version: {version}", f"    comment: kernel-id={name}",
                           "    protocol: linux",
                           f"    module_path: boot():/{MACHINE_ID}/{kernel}/{initramfs}#00",
@@ -574,7 +598,22 @@ class FakeCachyRunner(FakeRunner):
         lines += ["  //Snapshots", "    ///1 2026-10-27", f"      path: boot():/{MACHINE_ID}/limine_history/vmlinuz#00",
                   "      cmdline: quiet rw root=UUID=abcd snapshot=1"]
         self.write("/boot/limine.conf", "\n".join(lines) + "\n")
+        self.enroll()
         return CommandResult(self.limine_exit, "==> Building image\n", "")
+
+    def enroll(self) -> None:
+        """limine-enroll-config: with ENABLE_ENROLL_LIMINE_CONFIG=yes, limine.conf's BLAKE2b into the EFI binary."""
+        if self.enroll_exit and self.enroll_strips:  # limine-enroll-config put back the binary without one
+            p = self.root / LIMINE_EFI.lstrip("/")
+            if p.is_file():
+                p.write_bytes(b"MZ\0" + B2SUM_SIGNATURE + b"0" * 128 + b"\0")
+        if self.enroll_exit or not re.search(r"^ENABLE_ENROLL_LIMINE_CONFIG=[\"']?yes", self.read("/etc/default/limine")
+                                             or "", re.M):
+            return
+        digest = hashlib.blake2b((self.root / "boot/limine.conf").read_bytes(), digest_size=64).hexdigest()
+        p = self.root / LIMINE_EFI.lstrip("/")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"MZ\0" + B2SUM_SIGNATURE + digest.encode() + b"\0")
 
     # -- sdboot-manage / grub-mkconfig ----------------------------------------------
 
@@ -646,6 +685,7 @@ class FakeCachyOS(FakeOxp3):
         self.root = Path(root)
         self.runner = FakeCachyRunner(self.root, kernels or CACHY_KERNELS)
         self.bootloader = bootloader
+        self.hangs: set[str] = set()
         self.build(inputplumber=inputplumber, gm7=gm7)
         self.cachyos(bootloader, limine_default, loader_info, handheld, inputplumber, steamos_manager, secure_boot)
 
@@ -682,7 +722,7 @@ class FakeCachyOS(FakeOxp3):
             self.write("/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f",
                        b"\x06\x00\x00\x00" + (info + "\0").encode("utf-16-le"))
         if bootloader == "limine":
-            for tool in ("limine", "limine-entry-tool", "limine-mkinitcpio"):
+            for tool in ("limine", "limine-entry-tool", "limine-mkinitcpio", "limine-enroll-config"):
                 self.write(f"/usr/bin/{tool}", "")
             self.write("/etc/default/limine", limine_default)
             self.write("/etc/limine-entry-tool.conf", "### defaults\n#KERNEL_CMDLINE[default]=\n")
@@ -744,6 +784,68 @@ class FakeCachyOS(FakeOxp3):
         self.write("/proc/cmdline", " ".join(args) + "\n")
         self.write("/proc/sys/kernel/osrelease", self.runner.kernels[kernel] + "\n")
         shutil.rmtree(self.root / "run", ignore_errors=True)  # a tmpfs
+
+    def power_on(self) -> Optional[str]:
+        """Limine 12.9 at power-on, for the limine.conf layout the fake writes: the one-shot entry (erased once
+        read), else with remember_last_entry: yes the entry that booted last, else default_entry (an index among
+        the visible entries, or a path). Boots it and returns its kernel-id; None when Limine waits in its menu.
+        A kernel in ``self.hangs`` boots (Limine records it) but never reaches userspace."""
+        conf = (self.root / "boot/limine.conf").read_bytes()
+        efi = self.root / LIMINE_EFI.lstrip("/")
+        if efi.is_file():
+            data = efi.read_bytes()
+            at = data.find(B2SUM_SIGNATURE)
+            enrolled = data[at + len(B2SUM_SIGNATURE):at + len(B2SUM_SIGNATURE) + 128].decode() if at >= 0 else ""
+            if enrolled.strip("0") and enrolled != hashlib.blake2b(conf, digest_size=64).hexdigest():
+                raise RuntimeError("Limine: !!! CHECKSUM MISMATCH FOR CONFIG FILE !!!")
+        lines = [ln.strip() for ln in conf.decode().splitlines()]
+
+        def option(key: str) -> Optional[str]:
+            for ln in lines:
+                if ln.lower().startswith(key + ":"):
+                    return ln.split(":", 1)[1].strip()
+            return None
+        visible: list[tuple[str, Optional[str]]] = []  # (path, kernel-id; None for a directory)
+        top = sub = None
+        for i, ln in enumerate(lines):
+            if ln.startswith("///"):
+                continue  # in a collapsed directory (Snapshots)
+            if ln.startswith("//"):
+                sub = ln[2:].lstrip("+").strip()
+                is_dir = any(x.startswith("///") for x in lines[i + 1:i + 2])
+                kid = next((x.split("=", 1)[1].strip() for x in lines[i + 1:i + 6] if x.startswith("comment: kernel-id=")),
+                           sub)
+                visible.append((f"{top}/{sub}", None if is_dir else kid))
+            elif ln.startswith("/"):
+                top = ln[1:].lstrip("+").strip()
+                visible.append((top, None))
+
+        def find(value: Optional[str]) -> Optional[tuple[str, Optional[str]]]:
+            return next((v for v in visible if value in (v[0], v[0].replace("/", "."))), None) if value else None
+        var = self.root / ONESHOT_VAR.lstrip("/")
+        chosen = None
+        if var.is_file():
+            chosen = find(var.read_bytes()[4:].decode("utf-16-le").rstrip("\0"))
+            var.unlink()
+        last = self.root / LAST_BOOTED_VAR.lstrip("/")
+        if chosen is None and (option("remember_last_entry") or "").lower() == "yes" and last.is_file():
+            chosen = find(last.read_bytes()[4:].decode().rstrip("\0"))
+        if chosen is None:
+            default = option("default_entry") or "1"
+            if default.isdigit():
+                n = max(int(default) - 1, 0)
+                chosen = visible[n] if n < len(visible) else visible[0]
+            else:
+                chosen = find(default)
+            if chosen is None or chosen[1] is None or option("timeout") == "no":
+                return None
+        path, kid = chosen
+        self.write(LAST_BOOTED_VAR, b"\x07\x00\x00\x00" + path.encode() + b"\0")
+        self.write(SELECTED_VAR, b"\x06\x00\x00\x00" + (path.replace("/", ".") + "\0").encode("utf-16-le"))
+        if kid in self.hangs:
+            return kid
+        self.boot(kid)
+        return kid
 
     def pacman_lock(self, on: bool = True) -> None:
         if on:
