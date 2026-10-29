@@ -113,6 +113,7 @@ DEBUGFS_GLOBS = [
     "/sys/kernel/debug/dri/*/i915_edp_psr_status",
     "/sys/kernel/debug/dri/*/i915_display_info",
     "/sys/kernel/debug/dri/*/i915_dmc_info",
+    "/sys/kernel/debug/dri/*/i915_vbt",
     "/sys/kernel/debug/dri/*/eDP-*/i915_psr_status",
     "/sys/kernel/debug/dri/*/eDP-*/vrr_range",
     "/sys/kernel/debug/pmc_core/substate_residencies",

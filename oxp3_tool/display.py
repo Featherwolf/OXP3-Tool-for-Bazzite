@@ -181,6 +181,55 @@ def vbt_vswing_port(kernel_log: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+_DRIVER_START_RE = re.compile(r"\[drm\] Initialized (xe|i915) ")
+# DVO port -> DDI port letter where it is the same on every platform (the eDP is port A).
+_DVO_PORT_LETTER = {0: "A", 10: "A", 1: "B", 7: "B", 2: "C", 8: "C"}
+
+
+def driver_start_logged(kernel_log: str) -> bool:
+    """Whether the log still has the graphics driver's start (a flood can push early boot lines out)."""
+    return _DRIVER_START_RE.search(kernel_log) is not None
+
+
+def vbt_vswing_ports(vbt: bytes) -> list[str]:
+    """Ports whose VBT entry asks for the VBT's own vswing/pre-emphasis tables (child use_vbt_vswing).
+
+    Read the way the kernel's intel_bios.c does: the $VBT header points to the BDB, whose block 2 (general
+    definitions) holds one child device per output; byte 23 bit 5 is use_vbt_vswing. "?" for a port whose
+    letter depends on the platform.
+    """
+    def u16(b: bytes, at: int) -> int:
+        return int.from_bytes(b[at:at + 2], "little")
+
+    if len(vbt) < 0x30 or not vbt.startswith(b"$VBT"):
+        return []
+    bdb = vbt[int.from_bytes(vbt[0x1c:0x20], "little"):]
+    if len(bdb) < 22 or not bdb.startswith(b"BIOS_DATA_BLOCK"):
+        return []
+    index, total = u16(bdb, 18), min(u16(bdb, 20), len(bdb))
+    block = b""
+    while index + 3 < total:
+        block_id, size = bdb[index], u16(bdb, index + 1)
+        if block_id == 53 and bdb[index + 3] >= 3:  # MIPI sequence v3+ has a 32-bit size
+            size = int.from_bytes(bdb[index + 4:index + 8], "little")
+        index += 3
+        if index + size > total:
+            return []
+        if block_id == 2:
+            block = bdb[index:index + size]
+            break
+        index += size
+    if len(block) < 5 or block[4] < 24:
+        return []
+    child_size = block[4]
+    ports = []
+    for at in range(5, len(block) - child_size + 1, child_size):
+        child = block[at:at + child_size]
+        if u16(child, 2) and child[23] >> 5 & 1:  # a device (type != 0) with use_vbt_vswing
+            ports.append(_DVO_PORT_LETTER.get(child[16], "?"))
+    return list(dict.fromkeys(ports))
+
+
 def _kwin_int(value: object) -> Optional[int]:
     return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2 ** 31 else None
 
@@ -307,6 +356,7 @@ class RefreshState:
     dsb_errors: int = 0
     psr_errors: int = 0
     vbt_vswing_port: Optional[str] = None  # the kernel ignored the firmware's eDP drive levels for this port
+    vbt_vswing_from_table: bool = False  # found in the VBT itself: the kernel log no longer had the warning
     kernel_version: Optional[tuple[int, int]] = None  # (major, minor) of the running kernel
     remove_karg_hint: str = "`sudo rpm-ostree kargs --delete=xe.enable_dc_balance`"
     kernel_update_hint: str = "until Bazzite ships kernel 7.2.10 or later"
@@ -452,9 +502,13 @@ class RefreshState:
                 out.append(f"The kernel logged {self.dsb_errors} 'DSB poll error' messages this boot; the optional "
                            "xe-dsb-off fix stops them and the cursor trails or flicker that can come with them.")
         if self.vbt_vswing_port:
-            out.append(f"The kernel logged 'Port {self.vbt_vswing_port} asks to use VBT vswing/preemph tables': the "
-                       "firmware asks for its own signal levels on the link to the screen, and this kernel ignores "
-                       "them and uses Intel's generic ones. On OXP3 units this goes with random white dots or short "
+            port = f"Port {self.vbt_vswing_port}" if self.vbt_vswing_port != "?" else "a display port"
+            seen = (f"The firmware's video table (VBT) asks for its own signal levels on {port}, the link to the "
+                    "screen (this boot's kernel log no longer reaches back to the graphics driver's start, so its "
+                    "warning is not in it), and this kernel ignores them" if self.vbt_vswing_from_table else
+                    f"The kernel logged '{port} asks to use VBT vswing/preemph tables': the firmware asks for its "
+                    "own signal levels on the link to the screen, and this kernel ignores them")
+            out.append(f"{seen} and uses Intel's generic ones. On OXP3 units this goes with random white dots or short "
                        "lines that flicker, most visibly on dark scenes, and never show in screenshots "
                        "(kernel-anatase issue #7, where one tester's dots stopped with the fix). The fix ('Vswing / "
                        "Pre-emphasis Override') is part of Linux 7.4, first in 7.4-rc1, and is not marked for older "

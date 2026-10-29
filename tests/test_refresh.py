@@ -279,6 +279,50 @@ class RefreshStateTest(unittest.TestCase):
         Engine(ctx, State(self.f.system()), out=lambda _: None).plan([BY_ID["xe-dsb-off"]], {})
         self.assertFalse([c for c in self.f.runner.calls if c[0] == "journalctl"])
 
+    @staticmethod
+    def vbt(*children, mipi_v3=False):
+        """A VBT the way intel_bios.c reads it: $VBT header, BDB header, blocks; children are (dvo_port, vswing)."""
+        child_size = 40
+        devices = b""
+        for dvo_port, vswing in children:
+            child = bytearray(child_size)
+            child[2:4] = (0x1806).to_bytes(2, "little")  # device type: a DisplayPort/eDP output
+            child[16] = dvo_port
+            child[23] = 0x20 if vswing else 0
+            devices += bytes(child)
+        general = bytes([0, 0, 0, 0, child_size]) + devices
+        blocks = bytes([1]) + (4).to_bytes(2, "little") + b"\0" * 4
+        if mipi_v3:  # version 3+: a 32-bit size after the version byte, counting the whole block data
+            blocks += bytes([53]) + (0).to_bytes(2, "little") + bytes([3]) + (11).to_bytes(4, "little") + b"\0" * 6
+        blocks += bytes([2]) + len(general).to_bytes(2, "little") + general
+        bdb = b"BIOS_DATA_BLOCK " + (251).to_bytes(2, "little") + (22).to_bytes(2, "little")
+        bdb += (22 + len(blocks)).to_bytes(2, "little") + blocks
+        header = bytearray(0x30)
+        header[0:4] = b"$VBT"
+        header[0x1c:0x20] = (0x30).to_bytes(4, "little")
+        return bytes(header) + bdb
+
+    def test_vbt_parser(self):
+        from oxp3_tool.display import vbt_vswing_ports
+        self.assertEqual(vbt_vswing_ports(self.vbt((10, True), (8, False))), ["A"])
+        self.assertEqual(vbt_vswing_ports(self.vbt((10, False))), [])
+        self.assertEqual(vbt_vswing_ports(self.vbt((13, True))), ["?"])  # TC port: letter depends on the platform
+        self.assertEqual(vbt_vswing_ports(self.vbt((10, True), mipi_v3=True)), ["A"])
+        self.assertEqual(vbt_vswing_ports(self.vbt((10, True))[:60]), [])  # truncated
+        self.assertEqual(vbt_vswing_ports(b"garbage"), [])
+
+    def test_vbt_request_found_when_the_log_lost_the_warning(self):
+        self.f.display_debugfs()
+        self.f.write("/sys/kernel/debug/dri/0000:00:02.0/i915_vbt", self.vbt((10, True)))
+        # A DSB flood pushed the driver's start (and its warning) out of this boot's log.
+        self.f.runner.journal["0"] = "xe 0000:00:02.0: [drm] *ERROR* DSB 0 poll error\n" * 3
+        out = " ".join(self.status().split())
+        self.assertIn("The firmware's video table (VBT) asks for its own signal levels on Port A", out)
+        self.assertIn("is part of Linux 7.4", out)
+        # With the driver's start in the log and no warning, the kernel has the fix (or the VBT does not ask).
+        self.f.runner.journal["0"] = "xe 0000:00:02.0: [drm] Initialized xe 1.1.0 for 0000:00:02.0 on minor 0\n"
+        self.assertNotIn("signal levels", self.status())
+
     def test_ignored_vbt_drive_levels_are_explained(self):
         self.f.display_debugfs()
         self.assertNotIn("VBT vswing", self.status())

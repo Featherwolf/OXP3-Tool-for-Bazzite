@@ -26,6 +26,7 @@ from .display import (
     count_dsb_errors,
     count_psr_errors,
     dmc_version_from_log,
+    driver_start_logged,
     parse_crtc_mode,
     parse_dmc_info,
     parse_fixed_modes,
@@ -33,6 +34,7 @@ from .display import (
     parse_psr_mode,
     safe_name,
     vbt_vswing_port,
+    vbt_vswing_ports,
 )
 from .system import System
 
@@ -694,6 +696,7 @@ class Context:
         panel = self.internal_panel
         st.connector = re.sub(r"^card\d+-", "", panel[0]) if panel else None
         debugfs_read = False
+        vbt_ports: list[str] = []
         if st.connector:
             for info in self.sys.glob(f"{DEBUGFS_DRI}/*/i915_display_info"):
                 text = self.sys.read_text(info)
@@ -708,6 +711,7 @@ class Context:
                     psr = self.sys.read_text(f"{d}/i915_edp_psr_status")
                 st.psr_mode = parse_psr_mode(psr) if psr else None
                 st.dmc_loaded, st.dmc_version = parse_dmc_info(self.sys.read_text(f"{d}/i915_dmc_info") or "")
+                vbt_ports = vbt_vswing_ports(self.sys.read_bytes(f"{d}/i915_vbt") or b"")
                 if st.mode is None:
                     st.debugfs_why = f"no active display pipe drives {st.connector} (screen off?)"
                 break
@@ -738,6 +742,10 @@ class Context:
         st.dsb_errors = count_dsb_errors(log)
         st.psr_errors = count_psr_errors(log)
         st.vbt_vswing_port = vbt_vswing_port(log)
+        if st.vbt_vswing_port is None and vbt_ports and not driver_start_logged(log) \
+                and (st.kernel_version or (0, 0)) < (7, 4):
+            # A log flood (DSB errors) can push the boot-time warning out; the VBT itself still says it.
+            st.vbt_vswing_port, st.vbt_vswing_from_table = vbt_ports[0], True
         st.awaiting_reboot = frozenset(k for k in (DSB_OFF_KARG, PANEL_REPLAY_OFF_KARG)
                                        if self.karg_pending(k) and not self.karg_active(k))
         if st.awaiting_reboot:
