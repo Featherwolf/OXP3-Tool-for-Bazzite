@@ -96,6 +96,15 @@ class PlatformTest(Base):
         rc, out, _ = self.cli("status")
         self.assertIn("`sudo pacman -S inputplumber`, then reboot", out)
 
+    def test_ignored_vbt_drive_levels_name_the_cachyos_kernel(self):
+        self.fake()
+        self.f.display_debugfs()
+        self.f.runner.journal["0"] = "xe 0000:00:02.0: [drm] Port A asks to use VBT vswing/preemph tables\n"
+        rc, out, _ = self.cli("status")
+        out = " ".join(out.split())
+        self.assertIn("linux-cachyos-rc has it from 7.4-rc1 on", out)
+        self.assertNotIn("Bazzite gets it", out)
+
     def test_lts_kernel_has_no_dc_balance_bug(self):
         self.fake(kernels={"linux-cachyos-lts": "6.18.55-2-cachyos-lts"})
         self.f.display_debugfs()

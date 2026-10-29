@@ -288,7 +288,8 @@ class RefreshStateTest(unittest.TestCase):
         self.assertEqual(ctx.refresh_state.vbt_vswing_port, "A")
         out = " ".join(self.status().split())
         self.assertIn("'Port A asks to use VBT vswing/preemph tables'", out)
-        self.assertIn("queued for Linux 7.4; no kernel argument or oxp3-tool fix works around it", out)
+        self.assertIn("is part of Linux 7.4, first in 7.4-rc1", out)
+        self.assertIn("No kernel argument or oxp3-tool fix works around it", out)
 
     def test_dsb_hint_after_apply_says_reboot(self):
         self.f.display_debugfs()

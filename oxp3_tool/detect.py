@@ -688,6 +688,8 @@ class Context:
         if self.os_family == CACHYOS:
             st.remove_karg_hint = self.karg_backend.remove_hint("xe.enable_dc_balance=1")
             st.kernel_update_hint = "until you update to kernel 7.2.10 or later (`sudo pacman -Syu`, then reboot)"
+            st.vswing_hint = ("on CachyOS, linux-cachyos-rc has it from 7.4-rc1 on (`pacman -Si linux-cachyos-rc`; it "
+                              "installs next to your kernel), or build linux-cachyos-deckify with the series (README)")
         st.game_mode = self.has_game_mode
         panel = self.internal_panel
         st.connector = re.sub(r"^card\d+-", "", panel[0]) if panel else None

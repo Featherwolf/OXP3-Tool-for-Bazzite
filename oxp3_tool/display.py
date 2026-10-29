@@ -56,8 +56,8 @@ _DMC_LOG_RE = re.compile(r"Finished loading DMC firmware \S+ \(v(\d+)\.(\d+)\)")
 _DMC_LOG_DEV_RE = re.compile(r"(\S+): \[drm\] $")
 _DSB_ERROR_RE = re.compile(r"DSB \d+ poll error")
 _PSR_ERROR_RE = re.compile(r"Selective fetch area calculation failed|Timed out waiting PSR idle state|PSR aux error")
-# Kernels before the "Vswing / Pre-emphasis Override" series (drm-next, for Linux 7.4) warn and use Intel's generic
-# eDP drive levels when the firmware's VBT asks for its own.
+# Kernels without the "Vswing / Pre-emphasis Override" series (mainline for Linux 7.4, merged 2026-10-23) warn and use
+# Intel's generic eDP drive levels when the firmware's VBT asks for its own; with it the warning is gone.
 _VBT_VSWING_RE = re.compile(r"Port ([A-I]) asks to use VBT vswing/preemph tables")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -316,6 +316,7 @@ class RefreshState:
     awaiting_reboot: frozenset = frozenset()  # kernel arguments set for the next boot only
     panel_replay_blocked: bool = False  # PSR kargs set that xe-panel-replay-off refuses to combine with
     reboot_advice: str = "(reboot to activate it)"
+    vswing_hint: str = "Bazzite gets it with its 7.4 kernel"
 
     @property
     def top_mode(self) -> Optional[Mode]:
@@ -452,12 +453,13 @@ class RefreshState:
                            "xe-dsb-off fix stops them and the cursor trails or flicker that can come with them.")
         if self.vbt_vswing_port:
             out.append(f"The kernel logged 'Port {self.vbt_vswing_port} asks to use VBT vswing/preemph tables': the "
-                       "firmware asks for its own signal levels on the link to the screen, and kernels before Linux "
-                       "7.4 ignore them and use Intel's generic ones. On OXP3 units this goes with random white dots "
-                       "or short lines that flicker, most visibly on dark scenes, and never show in screenshots "
-                       "(kernel-anatase issue #7). The fix ('Vswing / Pre-emphasis Override') is queued for Linux "
-                       "7.4; no kernel argument or oxp3-tool fix works around it, and xe-panel-replay-off does not "
-                       "stop the dots.")
+                       "firmware asks for its own signal levels on the link to the screen, and this kernel ignores "
+                       "them and uses Intel's generic ones. On OXP3 units this goes with random white dots or short "
+                       "lines that flicker, most visibly on dark scenes, and never show in screenshots "
+                       "(kernel-anatase issue #7, where one tester's dots stopped with the fix). The fix ('Vswing / "
+                       "Pre-emphasis Override') is part of Linux 7.4, first in 7.4-rc1, and is not marked for older "
+                       f"stable kernels; {self.vswing_hint}. No kernel argument or oxp3-tool fix works around it, "
+                       "and xe-panel-replay-off does not stop the dots.")
         replay_on = bool(self.psr_mode and self.psr_mode.startswith("Panel Replay") and "enabled" in self.psr_mode)
         if replay_on and self.psr_errors and not self.panel_replay_blocked:
             if PANEL_REPLAY_OFF_KARG in self.awaiting_reboot:

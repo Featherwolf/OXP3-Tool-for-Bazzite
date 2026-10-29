@@ -26,9 +26,9 @@ PATTERNS: list[tuple[str, str]] = [
     (r"Timed out waiting PSR idle state", "Panel Self Refresh did not idle; xe-panel-replay-off may help."),
     (r"Selective fetch area calculation failed", "PSR2/Panel Replay selective-fetch failure."),
     (r"asks to use VBT vswing/preemph tables",
-     "The firmware asks for its own eDP signal levels, which kernels before 7.4 ignore; on the OXP3 this goes with "
+     "The firmware asks for its own eDP signal levels, which this kernel ignores; on the OXP3 this goes with "
      "random white dots that flicker on dark scenes (kernel-anatase#7). Fixed by the 'Vswing / Pre-emphasis "
-     "Override' series, queued for Linux 7.4."),
+     "Override' series, part of Linux 7.4 (mainline commits 3018008dc1c3..4bda5543b3c6)."),
     (r"Failed to write aux backlight level", "Backlight control over the DisplayPort AUX channel failed."),
     (r"Chip id not found", "bmi160 probed the BMI260 IMU and failed (gyro); see the gyro fix."),
     (r"DMC \d+ has \d+ handlers for event",
