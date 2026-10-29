@@ -134,13 +134,15 @@ def _karg_live_state(ctx: Context, karg: str, fix_id: str, entry: Optional[dict[
     again = f"run `sudo oxp3-tool apply {fix_id}` again"
     why = ctx.karg_backend.missing_text()
     dropin = getattr(ctx.karg_backend, "dropin", "")
-    if dropin and (active or pending) and entry and karg in entry.get("kargs", []) and karg not in ctx.owned_kargs:
+    lost = dropin and entry and karg in entry.get("kargs", []) and karg not in ctx.owned_kargs
+    if lost and (pending or (active and ctx.pending_kargs is None)):
         return [f"{karg} is {'active' if active else 'set for the next boot'}, but {dropin} no longer has it, so "
                 f"the next rebuild or kernel update drops it; {again}"]
     if active and (pending or ctx.pending_kargs is None):
         return [f"{karg} is active"]
     if active:
-        return [f"{karg} is active now but missing from the next boot ({why}); {again}"]
+        return [f"{karg} is active now but missing from the next boot ({why}"
+                f"{f'; {dropin} no longer has it' if lost else ''}); {again}"]
     if pending:
         return [f"{karg} is set for the next boot {ctx.reboot_advice('activate')}"]
     if ctx.pending_kargs is None and ctx.karg_backend.name != "rpm-ostree":

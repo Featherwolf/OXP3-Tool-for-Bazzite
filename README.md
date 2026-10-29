@@ -4,7 +4,7 @@
 
 It checks what your machine needs and shows the exact changes before making them. Every change is recorded, so `oxp3-tool revert` undoes exactly what it did. It never changes files that packages install, never installs packages, and never writes to the controller's firmware. (On CachyOS it rebuilds the generated udev hardware database and the boot entries the same way pacman's own hooks do; see [CachyOS](#cachyos).)
 
-> **Status: untested on real hardware.** Every fix is based on bugs reported by OXP3 owners on Bazzite, SteamOS and CachyOS, checked against the source of the kernel, InputPlumber and gamescope that Bazzite ships (October 2026), and against the CachyOS packages of 28 October 2026 (kernel, InputPlumber 0.83.1, gamescope 3.17, limine-entry-tool, sdboot-manage, grub). The CachyOS support has not been run on a CachyOS install yet. Please report what works and what doesn't, attaching the archive from `oxp3-tool diagnose`.
+> **Status: untested on real hardware.** Every fix is based on bugs reported by OXP3 owners on Bazzite, SteamOS and CachyOS, checked against the source of the kernel, InputPlumber and gamescope that Bazzite ships (October 2026), and against the CachyOS packages of 28 October 2026 (kernel, InputPlumber 0.83.1, gamescope 3.17, limine-entry-tool, sdboot-manage, grub). The CachyOS support has been run on one CachyOS Handheld Edition OXP3 (`status`); its fixes have not been confirmed there yet. Please report what works and what doesn't, attaching the archive from `sudo oxp3-tool diagnose`.
 
 ## Install
 

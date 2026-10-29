@@ -23,8 +23,8 @@ if [[ -x "$BIN" ]]; then
 fi
 
 if [[ -f "$STATE" && "${1:-}" != "--keep-fixes" ]]; then
-    echo "Some fixes are still applied (see: oxp3-tool status)." >&2
-    echo "Revert them first with: sudo oxp3-tool revert --all" >&2
+    echo "oxp3-tool still tracks fixes (see: sudo oxp3-tool status)." >&2
+    echo "Run: sudo oxp3-tool revert --all, and reboot if it or status says 'reboot to finish'; then run this again." >&2
     echo "or pass --keep-fixes to remove only the program." >&2
     exit 1
 fi

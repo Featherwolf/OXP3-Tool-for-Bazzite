@@ -448,8 +448,11 @@ class DropinBackend(KargBackend):
         effective = after or before
         left = [r for r in remove if any(r in v for v in effective.values())]
         stuck = self.removal_stuck(left) if left else ""
-        if self.sys.read_bytes(self.dropin) == prev and self.unfinished() is None \
+        now = self.sys.read_bytes(self.dropin)
+        if (now == prev or self.unused_lines_only(prev, now)) and self.unfinished() is None \
                 and self._entries_match(keep, remove, effective):
+            if now != prev:
+                out(f"  rewrote {self.dropin} (no boot entry reads the lines it dropped, so nothing is rebuilt)")
             return KargResult(not stuck, stuck, False)
         busy = self.busy()
         if busy:
@@ -526,6 +529,10 @@ class DropinBackend(KargBackend):
     def own_key_kernels(self, kernels: list[str]) -> list[str]:
         """Those of ``kernels`` whose command line is set by a key of their own elsewhere."""
         return []
+
+    def unused_lines_only(self, prev: Optional[bytes], now: Optional[bytes]) -> bool:
+        """Whether ``prev`` and ``now`` differ only in lines no installed kernel's boot entry reads."""
+        return False
 
     def dropin_problem(self) -> Optional[tuple[bool, str]]:
         """(urgent, text) when this tool's drop-in has become a whole command line, else None."""
@@ -696,8 +703,9 @@ class LimineBackend(DropinBackend):
             return []
         keys = self.cmdlines()
         has_root = lambda args: any(t.startswith(("root=", "zfs=")) for t in args)  # noqa: E731
+        # Without any configured command line Limine copies /proc/cmdline, which has root=.
         return [name for name, args in entries.items()
-                if not has_root(args) and has_root(self._user_cmdline(name, keys))]
+                if not has_root(args) and has_root(self._user_cmdline(name, keys) or list(self.ctx.active_kargs))]
 
     def removal_stuck(self, left: list[str]) -> str:
         if self.cmdlines().get("default", "").strip() or (self.sys.read_text("/etc/kernel/cmdline") or "").strip():
@@ -716,6 +724,15 @@ class LimineBackend(DropinBackend):
     def own_key_kernels(self, kernels: list[str]) -> list[str]:
         keys = self.cmdlines()
         return [k for k in kernels if keys.get(k, "").strip()]
+
+    def unused_lines_only(self, prev: Optional[bytes], now: Optional[bytes]) -> bool:
+        installed = self.kernels()
+        read = {"default", "fallback", *installed, *(f"{k}-fallback" for k in installed)}
+
+        def used(content: Optional[bytes]) -> list[tuple[str, bool, str]]:
+            text = (content or b"").decode("utf-8", "replace")
+            return [line for line in self.cmdline_lines(text) if line[0] in read]
+        return prev is not None and now is not None and used(prev) == used(now)
 
     def _user_cmdline(self, name: str, keys: dict[str, str]) -> list[str]:
         value = keys.get(name, "")
@@ -873,7 +890,9 @@ class LimineBackend(DropinBackend):
 def parse_limine_conf(text: str, machine_id: str) -> dict[str, list[str]]:
     """Kernel name -> command line of the entries limine-entry-tool writes (path boot():/<machine-id>/<kernel>/vmlinuz).
 
-    Fallback entries (named <kernel>-fallback) and snapshot entries never match their own name in the path.
+    An entry is the kernel's by its `comment: kernel-id=<package>` (limine-entry-tool keeps a name the user
+    gave it), else by its name. Fallback entries (kernel-id <package>-fallback) and snapshot entries never
+    match their own id in the path; limine-entry-tool updates the first entry with a kernel's id.
     """
     blocks: list[tuple[str, dict[str, str]]] = []
     for raw in text.splitlines():
@@ -882,11 +901,17 @@ def parse_limine_conf(text: str, machine_id: str) -> dict[str, list[str]]:
             blocks.append((line.lstrip("/").lstrip("+").strip(), {}))
         elif blocks and ":" in line and not line.startswith("#"):
             key, _, value = line.partition(":")
-            blocks[-1][1].setdefault(key.strip().lower(), value.strip())
+            key = key.strip().lower()
+            m = re.search(r"kernel-id=([A-Za-z0-9@._+-]+)", value, re.I) if key == "comment" else None
+            if m:
+                blocks[-1][1]["kernel-id"] = m.group(1)
+            blocks[-1][1].setdefault(key, value.strip())
     out: dict[str, list[str]] = {}
     for name, opts in blocks:
+        name = opts.get("kernel-id") or name
         path = opts.get("path") or opts.get("kernel_path") or ""
-        if re.fullmatch(rf"boot\(\):/{re.escape(machine_id)}/{re.escape(name)}/vmlinuz(#[0-9a-f]*)?", path):
+        if name not in out and re.fullmatch(
+                rf"boot\(\):/{re.escape(machine_id)}/{re.escape(name)}/vmlinuz(#[0-9a-f]*)?", path):
             out[name] = tokens(opts.get("cmdline", opts.get("kernel_cmdline", "")))
     return out
 

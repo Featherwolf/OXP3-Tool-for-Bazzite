@@ -550,19 +550,23 @@ class FakeCachyRunner(FakeRunner):
         self.regenerations += 1
         if self.limine_exit in (1, 2):
             return CommandResult(self.limine_exit, "", "simulated limine-mkinitcpio failure")
+        old = self.read("/boot/limine.conf") or ""
+        # As limine-entry-tool: entries are found by their kernel-id comment and keep the name they have.
+        old_blocks = {m.group(2): (m.group(1), m.group(0).rstrip("\n"))
+                      for m in re.finditer(r"  //([^\n]+)\n(?:    (?!comment: kernel-id=).*\n)*"
+                                           r"    comment: kernel-id=([^\n]+)\n(?:    .*\n)*", old)}
         lines = ["timeout: 5", "default_entry: 2", "", f"comment: machine-id={MACHINE_ID}", "/+CachyOS",
                  f"    comment: machine-id={MACHINE_ID}"]
-        old = self.read("/boot/limine.conf") or ""
         for kernel, version in self.kernels.items():
             for name in (kernel, f"{kernel}-fallback"):
                 if kernel in self.limine_skip:
                     # Keep whatever the old file had for this kernel (process_kernel failed, exit 0).
-                    m = re.search(rf"  //{re.escape(name)}\n(?:    .*\n)+", old)
-                    if m:
-                        lines += m.group(0).rstrip("\n").split("\n")
+                    if name in old_blocks:
+                        lines += old_blocks[name][1].split("\n")
                     continue
+                title = old_blocks.get(name, (name, ""))[0]
                 initramfs = "initramfs-fallback" if name.endswith("-fallback") else "initramfs"
-                lines += [f"  //{name}", f"    comment: Kernel version: {version}", f"    comment: kernel-id={kernel}",
+                lines += [f"  //{title}", f"    comment: Kernel version: {version}", f"    comment: kernel-id={name}",
                           "    protocol: linux",
                           f"    module_path: boot():/{MACHINE_ID}/{kernel}/{initramfs}#00",
                           f"    path: boot():/{MACHINE_ID}/{kernel}/vmlinuz#00",
@@ -712,10 +716,12 @@ class FakeCachyOS(FakeOxp3):
         """Boot entry name -> its kernel arguments, as the fake generators wrote them."""
         out: dict[str, list[str]] = {}
         if self.bootloader == "limine":
-            name = None
+            name = None  # the entry's kernel-id when it has one (a renamed entry keeps it), else its title
             for line in (self.runner.read("/boot/limine.conf") or "").splitlines():
                 if line.startswith("  //"):
                     name = line.strip()[2:]
+                elif name and line.strip().startswith("comment: kernel-id="):
+                    name = line.split("=", 1)[1].strip()
                 elif name and line.strip().startswith("cmdline:"):
                     out[name] = line.split(":", 1)[1].split()
         elif self.bootloader == "systemd-boot":

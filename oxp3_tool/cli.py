@@ -123,8 +123,12 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(f"          warning: {taken[1]}. Undo it now with {undo}, or put your own KERNEL_CMDLINE line "
                      "back and run `sudo limine-mkinitcpio`, before rebooting or updating")
     elif taken:
-        again = f"`sudo oxp3-tool apply {' '.join(ids)}`" if ids else f"`sudo rm {backend.dropin}`"
-        lines.append(f"          warning: {taken[1]}; {again} rewrites it without those lines")
+        owned = set(ctx.owned_kargs) if not ids else set()
+        adopt = ids or [f.id for f in ALL_FIXES if getattr(f, "karg", "") in owned]
+        again = (f"`sudo oxp3-tool apply {' '.join(adopt)}` rewrites it without those lines" if adopt else
+                 f"delete those lines from {backend.dropin} (that kernel is not installed, so nothing needs "
+                 "rebuilding)")
+        lines.append(f"          warning: {taken[1]}; {again}")
     rootless = getattr(backend, "entries_without_root", lambda: [])()
     if rootless:
         lines.append(f"          warning: the boot entries of {', '.join(rootless)} have no root=, so booting them "
@@ -342,6 +346,17 @@ def cmd_apply(ctx: Context, state: State, args: argparse.Namespace) -> int:
     return _report(engine.apply(plans))
 
 
+def _revert_settled(ctx: Context, entry: Optional[dict]) -> bool:
+    """A fix whose revert has done everything it can; only the reboot is left."""
+    if not entry or not entry.get("reverted") or ctx.karg_backend.unfinished():
+        return False
+    if any(entry.get(k) for k in ("files", "dirs_created", "kargs", "kargs_pending_add", "units_enabled")):
+        return False
+    if ctx.kargs_left is None and ctx.karg_backend.name != "rpm-ostree":
+        return False  # the boot entries could not be read
+    return not any(ctx.karg_left(k) for k in entry.get("kargs_removal_pending", []))
+
+
 def cmd_revert(ctx: Context, state: State, args: argparse.Namespace) -> int:
     if args.all:
         ids = [f.id for f in ALL_FIXES if state.get(f.id)] + [i for i in state.fixes if i not in BY_ID]
@@ -354,6 +369,15 @@ def cmd_revert(ctx: Context, state: State, args: argparse.Namespace) -> int:
     if not ids:
         _out("Nothing applied by this tool.")
         return 0
+    settled = [i for i in ids if _revert_settled(ctx, state.get(i))]
+    if settled and len(settled) == len(ids):
+        for fix_id in settled:
+            _out(f"  {fix_id}: already reverted")
+        _out(f"Nothing left to revert {ctx.reboot_advice('finish')}.")
+        return 0
+    ids = [i for i in ids if i not in settled]
+    for fix_id in settled:
+        _out(f"  {fix_id}: already reverted {ctx.reboot_advice('finish')}")
     _out("Will revert:")
     for fix_id in ids:
         entry = state.get(fix_id)

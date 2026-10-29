@@ -163,7 +163,16 @@ class Bundle:
     def add(self, name: str, data: bytes | str) -> None:
         if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
-        self.files[name] = self.redact(data).encode()[:MAX_FILE]
+        raw = self.redact(data).encode()
+        if len(raw) > MAX_FILE:
+            # Keep the start (driver probe, firmware loads) and the end (the latest failure); a flood in
+            # between, such as tens of thousands of DSB errors, is what goes.
+            head = raw[:MAX_FILE // 4]
+            marker = f"\n[... oxp3-tool cut {{}} bytes here to keep the file under {MAX_FILE >> 20} MiB ...]\n"
+            room = MAX_FILE - len(head) - len(marker) - 12
+            marker = marker.format(len(raw) - len(head) - room).encode()
+            raw = head + marker + raw[-room:]
+        self.files[name] = raw
 
     def write(self, fileobj) -> None:
         stamp = int(datetime.datetime.now().timestamp())
@@ -254,8 +263,14 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
                                                             "--no-pager", "--lines=10", *CACHYOS_USER_UNITS]))
         backend = ctx.karg_backend
         if isinstance(backend, LimineBackend):
-            for kernel in backend.kernels():
-                commands.append((f"limine-cmdline-{kernel}.txt", ["limine-entry-tool", "--get-cmdline", kernel]))
+            if not sys.is_real_root or os.geteuid() == 0:
+                for kernel in backend.kernels():
+                    commands.append((f"limine-cmdline-{kernel}.txt",
+                                     ["limine-entry-tool", "--get-cmdline", kernel]))
+            else:
+                # Without root, limine-entry-tool re-runs itself through sudo: a password prompt mid-run.
+                bundle.add("limine-cmdline.txt", "not collected: limine-entry-tool needs root "
+                                                 "(run `sudo oxp3-tool diagnose`)\n")
         bundle.add("boot.txt", f"kernel arguments: {backend.name}; {backend.describe() or backend.refusal()}\n")
     for name, argv in commands:
         res = sys.run(argv, timeout=120)
@@ -309,9 +324,8 @@ def collect(ctx: Context, status_text: str) -> tuple[Bundle, list[str]]:
             hw.append(f"xe.{param} = {v}")
     bundle.add("hardware.txt", "\n".join(hw) + "\n")
 
-    kernel_logs = ""
-    for name in ("journal-kernel-this-boot.txt", "journal-kernel-previous-boot.txt"):
-        kernel_logs += bundle.files.get(f"commands/{name}", b"").decode(errors="replace")
+    # The whole logs, not the archived copies, which may be cut: findings then match status.
+    kernel_logs = ctx.kernel_log(0) + ctx.kernel_log(-1)
     findings = []
     for pattern, count, meaning in scan_patterns(kernel_logs):
         findings.append(f"{count:6d}x  /{pattern}/  {meaning}")

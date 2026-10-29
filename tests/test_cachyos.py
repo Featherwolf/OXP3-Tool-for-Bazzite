@@ -791,6 +791,108 @@ class LimineRound3Test(Base):
         self.assertIn("press E", hint())  # only global options count
 
 
+class Round4Test(Base):
+    def test_diagnose_keeps_the_end_of_a_flooded_log(self):
+        self.fake()
+        flood = "[ 5.000000] xe 0000:00:02.0: [drm] *ERROR* [CRTC:151:pipe A] DSB 0 poll error\n" * 61442
+        self.f.runner.journal["-1"] = ("[ 1.000000] xe 0000:00:02.0: [drm] Finished loading DMC firmware\n" + flood +
+                                       "[ 900.000000] PM: suspend entry (s2idle)\n"
+                                       "[ 901.000000] xe 0000:00:02.0: [drm] *ERROR* flip_done timed out\n")
+        archive = Path(self.tmp.name, "diag.tar.gz")
+        rc, out, err = self.cli("diagnose", "-o", str(archive))
+        self.assertEqual(rc, 0, err)
+        with tarfile.open(archive) as tar:
+            prev = tar.extractfile("oxp3-diagnose/commands/journal-kernel-previous-boot.txt").read().decode()
+            findings = tar.extractfile("oxp3-diagnose/findings.txt").read().decode()
+        self.assertIn("Finished loading DMC firmware", prev)
+        self.assertIn("flip_done timed out", prev)
+        self.assertIn("bytes here to keep the file under 4 MiB", prev)
+        self.assertIn("61442x", findings)
+        self.assertIn("flip_done", findings)
+
+    def test_diagnose_without_root_does_not_run_limine_entry_tool(self):
+        from unittest import mock
+        self.fake()
+        archive = Path(self.tmp.name, "diag.tar.gz")
+        system = self.f.system()
+        with mock.patch.object(type(system), "is_real_root", new=True), \
+                mock.patch("os.geteuid", return_value=1000):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                main(["diagnose", "-o", str(archive)], system=system)
+        self.assertFalse([c for c in self.f.runner.calls if c[0] == "limine-entry-tool"])
+        with tarfile.open(archive) as tar:
+            note = tar.extractfile("oxp3-diagnose/limine-cmdline.txt").read().decode()
+        self.assertIn("sudo oxp3-tool diagnose", note)
+
+    def test_revert_all_after_the_reverts_says_reboot(self):
+        self.fake()
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume", "xe-dsb-off")[0], 0)
+        self.f.boot()
+        self.assertEqual(self.cli("revert", "--yes", "nvme-resume")[0], 0)
+        self.assertEqual(self.cli("revert", "--yes", "xe-dsb-off")[0], 0)
+        rc, out, _ = self.cli("revert", "--all")  # no --yes: nothing to confirm
+        self.assertEqual(rc, 0)
+        self.assertIn("Nothing left to revert (reboot to finish)", out)
+        self.assertNotIn("Done.", out)
+
+    def test_renamed_limine_entry_is_found_by_its_kernel_id(self):
+        self.fake(kernels={"linux-cachyos-deckify": "7.2.11-1-cachyos-deckify"})
+        conf = self.read("/boot/limine.conf").replace("  //linux-cachyos-deckify\n", "  //CachyOS Handheld\n")
+        self.f.write("/boot/limine.conf", conf)
+        rc, _, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        conf = self.read("/boot/limine.conf")
+        self.assertIn("//CachyOS Handheld", conf)  # limine-entry-tool keeps the name
+        self.assertIn(NVME, self.kernel_entries()["linux-cachyos-deckify"])
+
+    def test_lost_dropin_after_a_rebuild_says_the_next_boot_lacks_it(self):
+        self.fake()
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        self.f.boot()
+        (self.root / LIMINE_DROPIN.lstrip("/")).unlink()
+        self.f.regenerate()  # a kernel update
+        rc, out, _ = self.cli("status")
+        self.assertIn("nvme.noacpi=1 is active now but missing from the next boot", out)
+        self.assertIn(f"{LIMINE_DROPIN} no longer has it", out)
+        self.assertNotIn("the next rebuild or kernel update drops it", out)
+
+    def test_entries_without_root_on_a_calamares_install(self):
+        self.fake()  # no /etc/kernel/cmdline, as Calamares sets up Limine
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        self.f.boot()
+        self.f.write("/etc/default/limine", 'ESP_PATH="/boot"\n')
+        self.f.regenerate()
+        rc, out, _ = self.cli("status")
+        self.assertIn("have no root=, so booting them fails", out)
+
+    def test_rewriting_a_line_for_a_removed_kernel_does_not_rebuild(self):
+        self.fake(limine_default=LimineRound3Test.LTS_KEY)
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        version = self.f.runner.kernels.pop("linux-cachyos-lts")
+        (self.root / f"usr/lib/modules/{version}/modules.builtin").unlink()
+        self.f.write("/etc/default/limine", 'ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n')
+        self.f.regenerate()
+        self.f.runner.calls.clear()
+        rc, out, err = self.cli("apply", "--yes", "nvme-resume")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["limine-mkinitcpio"], self.f.runner.calls)
+        self.assertNotIn("Reboot to finish", out)
+        self.assertNotIn("KERNEL_CMDLINE[linux-cachyos-lts]", self.read(LIMINE_DROPIN))
+
+    def test_stale_line_warning_without_state_names_the_apply(self):
+        self.fake(limine_default=LimineRound3Test.LTS_KEY)
+        self.assertEqual(self.cli("apply", "--yes", "nvme-resume")[0], 0)
+        version = self.f.runner.kernels.pop("linux-cachyos-lts")
+        (self.root / f"usr/lib/modules/{version}/modules.builtin").unlink()
+        self.f.write("/etc/default/limine", 'ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n')
+        (self.root / STATE_FILE.lstrip("/")).unlink()
+        rc, out, _ = self.cli("status")
+        out = " ".join(out.split())
+        self.assertIn("`sudo oxp3-tool apply nvme-resume` rewrites it without those lines", out)
+        self.assertNotIn("sudo rm", out)
+
+
 class SdbootGrubBaselineTest(Base):
     def test_baseline_never_deletes_the_dropin(self):
         from unittest import mock
