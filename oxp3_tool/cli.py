@@ -113,13 +113,23 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(f"          warning: oxp3-tool's last boot-entry rebuild did not finish (or is still running): "
                      f"do not reboot before `sudo {finish}` has ended without errors (this note stays until the "
                      "next boot, also after that command succeeds)")
-    taken = getattr(ctx.karg_backend, "dropin_problem", lambda: None)()
-    if taken:
-        ids = [f.id for f in ALL_FIXES if (state.get(f.id) or {}).get("kargs") or
-               (state.get(f.id) or {}).get("kargs_pending_add")]
-        undo = f"`sudo oxp3-tool revert {' '.join(ids)}`" if ids else f"deleting {ctx.karg_backend.dropin}"
-        lines.append(f"          warning: {taken}. Before that, undo it with {undo}, or put your own "
-                     "KERNEL_CMDLINE line back")
+    backend = ctx.karg_backend
+    taken = getattr(backend, "dropin_problem", lambda: None)()
+    ids = [f.id for f in ALL_FIXES if (state.get(f.id) or {}).get("kargs") or
+           (state.get(f.id) or {}).get("kargs_pending_add")]
+    if taken and taken[0]:
+        undo = (f"`sudo oxp3-tool revert {' '.join(ids)}` (it rebuilds the entries)" if ids else
+                f"`sudo rm {backend.dropin}` and `sudo limine-mkinitcpio`")
+        lines.append(f"          warning: {taken[1]}. Undo it now with {undo}, or put your own KERNEL_CMDLINE line "
+                     "back and run `sudo limine-mkinitcpio`, before rebooting or updating")
+    elif taken:
+        again = f"`sudo oxp3-tool apply {' '.join(ids)}`" if ids else f"`sudo rm {backend.dropin}`"
+        lines.append(f"          warning: {taken[1]}; {again} rewrites it without those lines")
+    rootless = getattr(backend, "entries_without_root", lambda: [])()
+    if rootless:
+        lines.append(f"          warning: the boot entries of {', '.join(rootless)} have no root=, so booting them "
+                     "fails: do not reboot before " + ("undoing the drop-in above" if taken and taken[0] else
+                                                       "`sudo limine-mkinitcpio` has rebuilt them"))
 
     ip = ctx.inputplumber
     if ip.installed:

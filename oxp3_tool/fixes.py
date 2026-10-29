@@ -128,11 +128,15 @@ class Fix:
         return []
 
 
-def _karg_live_state(ctx: Context, karg: str, fix_id: str) -> list[str]:
+def _karg_live_state(ctx: Context, karg: str, fix_id: str, entry: Optional[dict[str, Any]] = None) -> list[str]:
     active = ctx.karg_active(karg)
     pending = ctx.karg_pending(karg)
     again = f"run `sudo oxp3-tool apply {fix_id}` again"
     why = ctx.karg_backend.missing_text()
+    dropin = getattr(ctx.karg_backend, "dropin", "")
+    if dropin and (active or pending) and entry and karg in entry.get("kargs", []) and karg not in ctx.owned_kargs:
+        return [f"{karg} is {'active' if active else 'set for the next boot'}, but {dropin} no longer has it, so "
+                f"the next rebuild or kernel update drops it; {again}"]
     if active and (pending or ctx.pending_kargs is None):
         return [f"{karg} is active"]
     if active:
@@ -777,7 +781,7 @@ class _KargFix(Fix):
         return Plan(kargs=[self.karg])
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
-        return _karg_live_state(ctx, self.karg, self.id)
+        return _karg_live_state(ctx, self.karg, self.id, entry)
 
 
 class NvmeResumeFix(_KargFix):
@@ -837,7 +841,7 @@ class NvmeResumeFix(_KargFix):
         return plan
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
-        lines = _karg_live_state(ctx, self.karg, self.id)
+        lines = _karg_live_state(ctx, self.karg, self.id, entry)
         if ctx.karg_active(self.karg):
             value = ctx.sys.read_attr("/sys/module/nvme/parameters/noacpi")
             if value is not None:
@@ -1002,7 +1006,7 @@ class XeHdrBacklightFix(_KargFix):
         return Check(True, f"the panel reports {caps.describe()}; untested, not shown to fix HDR")
 
     def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
-        lines = _karg_live_state(ctx, self.karg, self.id)
+        lines = _karg_live_state(ctx, self.karg, self.id, entry)
         caps = ctx.edp_caps
         if caps is not None:
             lines.append(f"panel: {caps.describe()}")

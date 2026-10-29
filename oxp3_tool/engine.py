@@ -247,6 +247,9 @@ class Engine:
                 lines.append(f"keep kernel argument {karg} (cancels the pending removal)")
         if plan.kargs and backend.unfinished():
             lines.append("rebuild the boot entries again (the last rebuild did not finish)")
+        taken = getattr(backend, "dropin_problem", lambda: None)() if plan.kargs else None
+        if taken:
+            lines.append(f"rewrite {backend.dropin} (it has lines no other file backs)")
         for unit in plan.enable_units:
             if self.ctx.unit_enabled(unit) != "enabled":
                 lines.append(f"enable {unit}")
@@ -516,7 +519,7 @@ class Engine:
         self.state.save()  # write-ahead
 
         backend = self.ctx.karg_backend
-        if missing or backend.unfinished():
+        if missing or backend.unfinished() or getattr(backend, "dropin_problem", lambda: None)():
             res = backend.change(missing, [], self._kept_kargs(), self.out)
             self.ctx.invalidate_kargs()
             if not res.ok:

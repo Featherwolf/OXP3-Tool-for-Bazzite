@@ -423,6 +423,7 @@ class DropinBackend(KargBackend):
             return KargResult(False, problem)
         ours = set(self.owned()) | set(keep) | set(remove)
         content = self.render(keep)
+        prev_bad = self.dropin_problem() if prev is not None else None
         # Checked even when the drop-in already has this content: a killed run may have left it unchecked.
         try:
             with _signals_interrupt():
@@ -434,15 +435,22 @@ class DropinBackend(KargBackend):
             self._restore(prev)
             return KargResult(False, f"could not read the current kernel command line; {self.manual(keep)}")
         if problems:
-            # Arguments being added now never stay behind unchecked, also when a killed run wrote them.
-            self._restore(_without(prev, add))
+            # Arguments being added never stay behind unchecked (a killed run may have written them), but
+            # one a finished rebuild already put into a boot entry stays: the other kernels still use it.
+            built = self.left_in_entries() or []
+            restored = _without(prev, [a for a in add if a not in built])
+            self._restore(restored)
+            done = "nothing was changed" if restored == prev else \
+                f"{self.dropin} was put back without {' '.join(a for a in add if a not in built)}"
             what = self.manual(keep) if keep else self.manual_remove()
             return KargResult(False, f"{self.name}'s configuration does not take the change as expected "
-                                     f"({'; '.join(problems)}); nothing was changed. {what}")
+                                     f"({'; '.join(problems)}); {done}. {what}")
         effective = after or before
+        left = [r for r in remove if any(r in v for v in effective.values())]
+        stuck = self.removal_stuck(left) if left else ""
         if self.sys.read_bytes(self.dropin) == prev and self.unfinished() is None \
                 and self._entries_match(keep, remove, effective):
-            return KargResult(True, "", False)
+            return KargResult(not stuck, stuck, False)
         busy = self.busy()
         if busy:
             self._restore(prev)
@@ -454,6 +462,13 @@ class DropinBackend(KargBackend):
         if not res.ok:
             restore, error = self.regen_failed(res.returncode)
             detail = (res.stderr or res.stdout).strip()[-400:]
+            if restore and prev_bad and prev_bad[0]:
+                # Never rebuild from a drop-in that is a whole command line: keep the checked new one.
+                self._mark(" ".join(self.regen))
+                error = (f"`{' '.join(self.regen)}` failed ({res.returncode}); the previous drop-in was not put "
+                         f"back, because {prev_bad[1]}. Do not reboot until `sudo {' '.join(self.regen)}` "
+                         "succeeds")
+                return KargResult(False, f"{error}: {detail}" if detail else error, True)
             finished = False
             if restore:
                 self._restore(prev)
@@ -472,13 +487,12 @@ class DropinBackend(KargBackend):
             if entries is None:
                 return KargResult(False, f"`{' '.join(self.regen)}` finished, but the boot entries could not be "
                                          "read back to check them", True)
-            gone = [r for r in remove if not any(r in v for v in effective.values())]
-            bad = [name for name, args in entries.items()
-                   if not all(k in args for k in keep) or any(r in args for r in gone)]
+            bad = [name for name, args in entries.items() if not self._entry_matches(name, args, keep, remove,
+                                                                                     effective)]
             return KargResult(False, f"`{' '.join(self.regen)}` finished, but these boot entries lack the change: "
                                      f"{', '.join(bad) or 'unknown'}; run `sudo {' '.join(self.regen)}` again and "
                                      "check its output", True)
-        return KargResult(True, "", True)
+        return KargResult(not stuck, stuck, True)
 
     def _probe(self, prev: Optional[bytes], content: Optional[bytes], ours: set[str], keep: list[str]
                ) -> tuple[Optional[dict[str, list[str]]], Optional[dict[str, list[str]]], list[str]]:
@@ -487,9 +501,7 @@ class DropinBackend(KargBackend):
         The baseline is the user's own configuration, so a drop-in that has taken over a command line
         (root= included) cannot pass as the way things were. Leaves ``content`` (or a per-kernel retry) written.
         """
-        if prev is not None:
-            self._write(None)
-        before = self.effective()
+        before = self.baseline(prev is not None)
         if not before:
             return None, None, []
         self._write(content)
@@ -505,9 +517,27 @@ class DropinBackend(KargBackend):
                 return before, again, []
         return before, after, problems
 
+    def baseline(self, present: bool) -> Optional[dict[str, list[str]]]:
+        """The command lines without this tool's drop-in (``present``: it is on disk now)."""
+        if present:
+            self._write(None)  # the generator cannot leave it out; change() puts it back on any exception
+        return self.effective()
+
     def own_key_kernels(self, kernels: list[str]) -> list[str]:
         """Those of ``kernels`` whose command line is set by a key of their own elsewhere."""
         return []
+
+    def dropin_problem(self) -> Optional[tuple[bool, str]]:
+        """(urgent, text) when this tool's drop-in has become a whole command line, else None."""
+        return None
+
+    def entries_without_root(self) -> list[str]:
+        """Boot entries that lost root= although the user's own configuration has it."""
+        return []
+
+    def removal_stuck(self, left: list[str]) -> str:
+        """Why removed arguments that are still in the command lines cannot be taken out ("": they can)."""
+        return ""
 
     def _restore(self, prev: Optional[bytes]) -> None:
         if prev is None:
@@ -519,13 +549,18 @@ class DropinBackend(KargBackend):
         return (f"To undo it by hand, delete {self.dropin}, then run `sudo {' '.join(self.regen)}` and check that "
                 "it ends without errors.")
 
+    @staticmethod
+    def _entry_matches(name: str, args: list[str], keep: list[str], remove: list[str],
+                       effective: dict[str, list[str]]) -> bool:
+        """The entry has ``keep``, and no removed argument that its own kernel's command line no longer gives it."""
+        own = effective.get(name, [])
+        return all(k in args for k in keep) and not any(r in args and r not in own for r in remove)
+
     def _entries_match(self, keep: list[str], remove: list[str], effective: dict[str, list[str]]) -> bool:
         entries = self.entries()
         if not entries:
             return False
-        wanted_gone = [r for r in remove if not any(r in v for v in effective.values())]
-        return all(all(k in args for k in keep) and not any(r in args for r in wanted_gone)
-                   for args in entries.values())
+        return all(self._entry_matches(name, args, keep, remove, effective) for name, args in entries.items())
 
     def describe(self) -> str:
         return f"Boot:     {self.name} ({self.dropin}, then `{' '.join(self.regen)}`)"
@@ -546,7 +581,8 @@ def _signals_interrupt() -> Iterator[None]:
     old = {}
     try:
         for sig in (signal.SIGHUP, signal.SIGTERM):
-            old[sig] = signal.signal(sig, interrupt)
+            if signal.getsignal(sig) != signal.SIG_IGN:  # nohup: an ignored hangup stays ignored
+                old[sig] = signal.signal(sig, interrupt)
     except ValueError:  # not the main thread
         pass
     try:
@@ -635,19 +671,42 @@ class LimineBackend(DropinBackend):
                 found = path
         return found
 
-    def dropin_problem(self) -> Optional[str]:
-        """Which command lines this tool's drop-in has become all of: the next rebuild loses root= there."""
+    def dropin_problem(self) -> Optional[tuple[bool, str]]:
         text = self.sys.read_text(self.dropin)
         if not text or OWN_MARKER not in text:
             return None
         keys = self.cmdlines()
-        whole = [k for k, _, _ in self.cmdline_lines(text) if not keys.get(k, "").strip()]
+        whole = list(dict.fromkeys(k for k, _, _ in self.cmdline_lines(text) if not keys.get(k, "").strip()))
         if not whole:
             return None
-        what = "every kernel" if "default" in whole else ", ".join(dict.fromkeys(whole))
-        return (f"no other file sets {' or '.join(f'KERNEL_CMDLINE[{k}]' for k in dict.fromkeys(whole))}, so "
-                f"{self.dropin} is now the whole command line of {what}: the next limine-mkinitcpio run or kernel "
-                "update writes boot entries without root=")
+        installed = self.kernels()
+        now = [k for k in whole if k in ("default", "fallback") or k in installed]
+        lines = " or ".join(f"KERNEL_CMDLINE[{k}]" for k in (now or whole))
+        if not now:
+            return False, (f"no other file sets {lines}, so {self.dropin} would be the whole command line of "
+                           f"{', '.join(whole)} if it is installed again (its boot entries would get no root=)")
+        what = "every kernel" if "default" in now else ", ".join(now)
+        return True, (f"no other file sets {lines}, so {self.dropin} is now the whole command line of {what}: "
+                      "limine-mkinitcpio and kernel updates write boot entries without root= from it (if one has "
+                      "run since that change, the entries already lack root=: do not reboot)")
+
+    def entries_without_root(self) -> list[str]:
+        entries = self.entries()
+        if not entries:
+            return []
+        keys = self.cmdlines()
+        has_root = lambda args: any(t.startswith(("root=", "zfs=")) for t in args)  # noqa: E731
+        return [name for name, args in entries.items()
+                if not has_root(args) and has_root(self._user_cmdline(name, keys))]
+
+    def removal_stuck(self, left: list[str]) -> str:
+        if self.cmdlines().get("default", "").strip() or (self.sys.read_text("/etc/kernel/cmdline") or "").strip():
+            return ""
+        what = " ".join(left)
+        return (f"{what} stays in the boot entries: no file sets KERNEL_CMDLINE[default] and /etc/kernel/cmdline "
+                "is missing, so Limine copies the running command line (/proc/cmdline), this tool's arguments "
+                "included. Create /etc/kernel/cmdline with the words of /proc/cmdline except BOOT_IMAGE=, initrd= "
+                f"and {what}, then run `sudo limine-mkinitcpio`")
 
     def base_problem(self, args: list[str]) -> Optional[str]:
         if not self.cmdlines().get("default", "").strip():
@@ -667,7 +726,9 @@ class LimineBackend(DropinBackend):
         if value.strip():
             return tokens(value)
         etc = (self.sys.read_text("/etc/kernel/cmdline") or "").replace("\n", " ").strip()
-        return tokens(etc) if etc else list(self.ctx.active_kargs)
+        # Without it Limine copies /proc/cmdline, which is what booted, this tool's arguments included: that is
+        # never the user's own configuration.
+        return tokens(etc) if etc else []
 
     def user_args(self) -> Optional[dict[str, list[str]]]:
         entries = self.entries()
@@ -768,7 +829,13 @@ class LimineBackend(DropinBackend):
             if at >= 0 and data[at + len(LIMINE_B2SUM_SIGNATURE):at + len(LIMINE_B2SUM_SIGNATURE) + 128].strip(b"0"):
                 return True
         conf = (self.sys.read_text(f"{esp}/limine.conf") if esp else None) or ""
-        return re.search(r"(?im)^\s*editor_enabled\s*:\s*no\b", conf) is not None
+        for raw in conf.splitlines():  # as Limine reads it: the first global editor_enabled, on only if "yes"
+            line = raw.strip(" \t\r")
+            if line.startswith("/"):
+                break  # global options end at the first entry
+            if line[:15].lower() == "editor_enabled:":
+                return line[15:].strip(" \t") != "yes"
+        return False
 
     def recovery_hint(self) -> str:
         if self.editor_off:
@@ -791,9 +858,10 @@ class LimineBackend(DropinBackend):
                     f"quotes of KERNEL_CMDLINE[default]), then run `sudo limine-mkinitcpio` and reboot.{also}")
         first = ""
         if self.sys.exists(self.dropin):
-            first = (f"First delete {self.dropin} (reverting this tool's kernel-argument fixes does it): no other "
-                     "file sets KERNEL_CMDLINE[default], so it is now Limine's whole command line, and the next "
-                     "limine-mkinitcpio run or kernel update writes boot entries without root=. ")
+            first = (f"First delete {self.dropin} (`sudo rm {self.dropin}`; if `oxp3-tool status` names "
+                     "kernel-argument fixes to revert, reverting them does it too): no other file sets "
+                     "KERNEL_CMDLINE[default], so it is now Limine's whole command line, and limine-mkinitcpio and "
+                     "kernel updates write boot entries without root= from it. ")
         return (f"{first}This system has no other KERNEL_CMDLINE[default] line, so Limine takes its command line "
                 "from /etc/kernel/cmdline (or /proc/cmdline when that file is missing or empty). To set it by hand, "
                 f"add {what} to /etc/kernel/cmdline (if it does not exist, create it with the words of /proc/cmdline "
@@ -872,12 +940,15 @@ class SdbootBackend(DropinBackend):
                     + self.manual([]))
         return None
 
-    def effective(self) -> Optional[dict[str, list[str]]]:
-        values = self._eval()
+    def effective(self, skip: str = "") -> Optional[dict[str, list[str]]]:
+        values = self._eval(skip)
         entries = self.entries()
         if values is None or not entries:
             return None
         return {name: tokens(values[0]) for name in entries}
+
+    def baseline(self, present: bool) -> Optional[dict[str, list[str]]]:
+        return self.effective(self.dropin)  # the drop-in stays on disk, also if this run is killed
 
     def booted_user_args(self) -> list[str]:
         values = self._eval(self.dropin)
@@ -957,12 +1028,15 @@ class GrubBackend(DropinBackend):
         res = self.sys.run(["sh", "-c", GRUB_EVAL, "sh", skip], timeout=60)
         return tokens(res.stdout.strip()) if res.ok else None
 
-    def effective(self) -> Optional[dict[str, list[str]]]:
-        args = self._eval()
+    def effective(self, skip: str = "") -> Optional[dict[str, list[str]]]:
+        args = self._eval(skip)
         entries = self.entries()
         if args is None or not entries:
             return None
         return {name: args for name in entries}
+
+    def baseline(self, present: bool) -> Optional[dict[str, list[str]]]:
+        return self.effective(self.dropin)  # the drop-in stays on disk, also if this run is killed
 
     def booted_user_args(self) -> list[str]:
         return self._eval(self.dropin) or []
