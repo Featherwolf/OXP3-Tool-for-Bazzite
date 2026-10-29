@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,12 +131,26 @@ class TryTest(Base):
         self.cli("kernel", "try", VSW, "-y")
         self.f.power_on()
         self.cli("kernel", "keep", "-y")
+        # Back to the stock kernel (Limine's default entry, perhaps a version never booted here): a failed boot must
+        # come back to the kernel running now, so the default entry points at it until `keep`.
         rc, out, err = self.cli("kernel", "try", STOCK, "-y")
         self.assertEqual(rc, 0, err + out)
-        self.assertNotIn("set-oneshot", out)  # the default entry needs no one-shot
-        self.assertFalse((self.root / ONESHOT_VAR.lstrip("/")).exists())
+        self.assertIn("change `default_entry: 2` to `default_entry: CachyOS/linux-cachyos-deckify-vsw`", out)
+        self.assertIn("do not remove linux-cachyos-deckify-vsw", out)
+        self.assertIn("Limine boots linux-cachyos-deckify-vsw after 5 seconds", out)
+        self.f.hangs.add(STOCK)
         self.assertEqual(self.f.power_on(), STOCK)
-        self.assertEqual(self.cli("kernel", "keep", "-y")[0], 0)
+        self.assertEqual(self.f.power_on(), VSW)  # the way back
+        self.f.hangs.clear()
+        self.assertEqual(self.cli("kernel", "try", STOCK, "-y")[0], 0)
+        self.assertEqual(self.f.power_on(), STOCK)
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("put `default_entry: 2` back", out)
+        self.assertNotIn("oxp3-tool", self.conf())
+        self.assertIn("default_entry: 2\nremember_last_entry: yes\n", self.conf())
+        self.assertEqual(self.f.power_on(), STOCK)
+        self.remove_vsw()
         self.assertEqual(self.f.power_on(), STOCK)
 
     def test_keep_before_rebooting_cancels_the_try(self):
@@ -213,21 +228,40 @@ class RefusalTest(Base):
         self.assertIn("is not an installed kernel package (installed: linux-cachyos-deckify, "
                       "linux-cachyos-deckify-vsw)", self.refused("try", "linux-cachyos-rc", "-y"))
 
-    def test_no_fallback_entry(self):
+    def test_running_kernel_without_its_own_entry(self):
         self.fake()
-        self.f.write(CONF, self.conf().replace("default_entry: 2", "default_entry: CachyOS/linux-cachyos-lts"))
-        self.assertIn("nothing to fall back to", self.refused("try", VSW, "-y"))
-        self.f.write(CONF, self.conf().replace("default_entry: CachyOS/linux-cachyos-lts", "default_entry: 1"))
-        self.assertIn("nothing to fall back to", self.refused("try", VSW, "-y"))  # the CachyOS directory
+        self.f.write("/proc/sys/kernel/osrelease", "7.2.11-1-cachyos-deckify-snapshot\n")
+        self.assertIn("has no usable Limine entry of its own", self.refused("try", VSW, "-y"))
+
+    def test_changed_kernel_files(self):
+        self.fake()
+        self.f.write(f"/boot/0123456789abcdef0123456789abcdef/{VSW}/vmlinuz", "other")
+        self.assertIn("files on the ESP are missing or changed", self.refused("try", VSW, "-y"))
+
+    def test_crlf(self):
+        self.fake()
+        self.f.write(CONF, self.conf().replace("\n", "\r\n"))
+        self.assertIn("Windows (CRLF) line endings", self.refused("try", VSW, "-y"))
+
+    def test_default_naming_nothing_is_replaced(self):
+        """A default_entry Limine cannot boot (a directory, a removed kernel): the trial's fallback replaces it."""
+        self.fake()
+        for value in ("1", "CachyOS/linux-cachyos-lts", "9"):
+            self.f.write(CONF, re.sub(r"default_entry: .*", f"default_entry: {value}", self.conf(), count=1))
+            rc, out, err = self.cli("kernel", "try", VSW, "-n")
+            self.assertEqual(rc, 0, err)
+            self.assertIn(f"change `default_entry: {value}` to `default_entry: CachyOS/linux-cachyos-deckify`", out)
 
     def test_default_is_the_kernel_being_tried(self):
         self.fake()
         self.f.write(CONF, self.conf().replace("default_entry: 2", "default_entry: CachyOS/linux-cachyos-deckify-vsw"))
         rc, out, err = self.cli("kernel", "try", VSW, "-y")
         self.assertEqual(rc, 0, err)
-        self.assertIn("linux-cachyos-deckify-vsw is Limine's default entry: with remember_last_entry off, every "
-                      "power-on boots it", out)
-        self.assertNotIn("set-oneshot", out)
+        self.assertIn("change `default_entry: CachyOS/linux-cachyos-deckify-vsw` to `default_entry: "
+                      "CachyOS/linux-cachyos-deckify`", out)  # to the running kernel
+        self.f.hangs.add(VSW)
+        self.assertEqual(self.f.power_on(), VSW)
+        self.assertEqual(self.f.power_on(), STOCK)
 
     def test_timeout_no(self):
         self.fake()
@@ -262,6 +296,88 @@ class RefusalTest(Base):
         self.assertIn("is for CachyOS booting with Limine", err)
 
 
+class ConcurrencyTest(Base):
+    def test_waits_for_the_boot_partition_lock(self):
+        import fcntl
+        import os
+        from oxp3_tool import kernel_cmd
+        self.fake()
+        conf = self.conf()
+        path = self.root / "run/lock/boot-partition.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # limine-snapper-sync is rewriting limine.conf
+        self.addCleanup(os.close, fd)
+        old = kernel_cmd.LimineKernels.lock_timeout
+        kernel_cmd.LimineKernels.lock_timeout = 0.2
+        self.addCleanup(setattr, kernel_cmd.LimineKernels, "lock_timeout", old)
+        rc, out, err = self.cli("kernel", "try", VSW, "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("is changing the boot partition", err)
+        self.assertEqual(self.conf(), conf)
+        self.assertFalse((self.root / ONESHOT_VAR.lstrip("/")).exists())
+
+    def test_rewritten_while_asking(self):
+        from oxp3_tool import cli
+        self.fake()
+
+        def confirm(prompt, yes):
+            self.f.regenerate()  # a kernel update finished meanwhile
+            self.f.write(CONF, self.conf() + "\n")
+            return True
+        old = cli._confirm
+        cli._confirm = confirm
+        self.addCleanup(setattr, cli, "_confirm", old)
+        rc, out, err = self.cli("kernel", "try", VSW)
+        self.assertEqual(rc, 1)
+        self.assertIn("changed while this ran", err)
+        self.assertNotIn("oxp3-tool", self.conf())
+
+    def test_a_stale_save_after_the_change_cancels_the_one_shot(self):
+        self.fake()
+        conf = self.conf()
+        self.f.runner.after_oneshot = lambda: self.f.write(CONF, conf)  # another tool saves the old tree
+        rc, out, err = self.cli("kernel", "try", VSW, "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("the one boot of linux-cachyos-deckify-vsw was cancelled", err)
+        self.assertFalse((self.root / ONESHOT_VAR.lstrip("/")).exists())
+        self.assertEqual(self.f.power_on(), STOCK)
+
+    def test_ctrl_c_and_hangup_during_enrolling_do_not_stop_it(self):
+        import signal
+        for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
+            self.tmp.cleanup()
+            self.fake(limine_default=ENROLL)
+            self.f.regenerate()
+            self.f.runner.kill["limine-enroll-config"] = (0, signum)
+            rc, out, err = self.cli("kernel", "try", VSW, "-y")
+            self.assertEqual(rc, 0, err + out)
+            self.f.hangs.add(VSW)
+            self.assertEqual(self.f.power_on(), VSW)
+            self.assertEqual(self.f.power_on(), STOCK)  # checksum fine
+
+    def test_mismatched_checksum_is_shown(self):
+        self.fake(limine_default=ENROLL)
+        self.f.regenerate()
+        self.f.write(CONF, self.conf() + "# edited\n")
+        rc, out, _ = self.cli("kernel")
+        self.assertIn("DO NOT REBOOT: limine.conf does not match the checksum enrolled", out)
+        self.assertIn("DO NOT REBOOT", self.cli("status")[1])
+
+
+class RootTest(Base):
+    def test_needs_root_before_the_lock(self):
+        from unittest import mock
+        from oxp3_tool.system import System
+        self.fake()
+        with mock.patch.object(System, "is_real_root", new_callable=mock.PropertyMock, return_value=True), \
+                mock.patch("os.geteuid", return_value=1000):
+            for argv in (("kernel", "keep"), ("kernel", "try", VSW, "-y")):
+                rc, out, err = self.cli(*argv)
+                self.assertEqual(rc, 1)
+                self.assertIn("This needs root. Run it with sudo.", err)
+
+
 class EnrolledTest(Base):
     def test_try_and_keep_enroll_the_new_checksum(self):
         self.fake(limine_default=ENROLL)
@@ -271,7 +387,7 @@ class EnrolledTest(Base):
                          {"EFI/limine/limine_x64.efi": lm.b2sum(self.conf().encode())})
         rc, out, err = self.cli("kernel", "try", VSW, "-y")
         self.assertEqual(rc, 0, err + out)
-        self.assertIn("and enroll its checksum", out)
+        self.assertIn("then enroll its checksum", out)
         self.f.hangs.add(VSW)
         self.assertEqual(self.f.power_on(), VSW)
         self.assertEqual(self.f.power_on(), STOCK)  # no checksum mismatch
@@ -312,7 +428,7 @@ class EnrolledTest(Base):
 
 
 class MenuTest(unittest.TestCase):
-    CONF = ("timeout: 3\n default_entry: 3 \nRemember_Last_Entry: Yes\r\n"
+    CONF = ("timeout: 3\n default_entry: 3 \nRemember_Last_Entry: Yes\n"
             "/+CachyOS\n  //linux-cachyos-deckify\n    comment: kernel-id=linux-cachyos-deckify\n"
             "    protocol: linux\n    path: boot():/m/linux-cachyos-deckify/vmlinuz#00\n"
             "  //Renamed\n    comment: kernel-id=linux-cachyos-lts \n    path: boot():/m/linux-cachyos-lts/vmlinuz\n"
@@ -343,7 +459,44 @@ class MenuTest(unittest.TestCase):
     def test_defaults_that_stop_at_the_menu(self):
         for value in ("1", "CachyOS", "CachyOS/missing", "9"):
             menu = lm.parse(self.CONF.replace("default_entry: 3", f"default_entry: {value}"))
-            self.assertIsNone(menu.default(), value)  # 9: past the end, so the first entry: the directory
+            self.assertIsNone(menu.default(), value)  # 9: past the end names nothing
+        flat = lm.parse("default_entry: 5\n/a\n  path: boot():/a\n/b\n  path: boot():/b\n")
+        self.assertIsNone(flat.default())  # not the first entry, as an older model had it
+        self.assertEqual(flat.by_index(1).name, "b")
+
+    def test_globals_end_at_the_first_entry(self):
+        menu = lm.parse("timeout: 3\n/+CachyOS\n  //k\n    path: boot():/k\ndefault_entry: 2\nremember_last_entry: yes\n")
+        self.assertIsNone(menu.value("default_entry"))
+        self.assertFalse(menu.remembers())
+        self.assertIsNone(menu.default())  # index 0: the directory
+        self.assertEqual(lm.parse("/k\n  path: boot():/k\ndefault_entry: 1\n").value("default_entry"), "1")
+
+    def test_arch_conditions(self):
+        def hidden(cond):
+            return lm.parse(f"/k\n  {cond}\n  path: boot():/k\n").top[0].skipped()
+        for cond in ("if_arch: x86_64", "if_arch: amd64", "if_arch: x86-64,aarch64", "if_loader_arch: ia-32",
+                     "if_fw_type: bios", "protocol: bios"):
+            self.assertTrue(hidden(cond), cond)
+        for cond in ("if_arch: X86-64 aarch64", "if_loader_arch: x86-64", "if_fw_type: UEFI", "protocol: linux"):
+            self.assertFalse(hidden(cond), cond)
+
+    def test_paths_round_trip(self):
+        menu = lm.parse("/A\\\n  //x\n/snap #3\n  path: boot():/a\n/snap #3\n  path: boot():/b\n/linux é\n  path: boot():/c\n")
+        for e in menu.walk():
+            self.assertIs(menu.by_path(menu.path(e)), e, menu.path(e))
+        self.assertEqual(menu.bli_id(menu.top[3]), "linux---")  # one '-' per UTF-8 byte, as Limine
+        long = lm.parse("/" + "a" * 300 + "\n  path: boot():/a\n")
+        self.assertEqual(len(menu.bli_id(long.top[0]) if False else long.bli_id(long.top[0])), 232)
+
+    def test_refused_files(self):
+        with self.assertRaises(lm.MenuError):
+            lm.parse("timeout: 3\r\n/k\n")
+        with self.assertRaises(lm.MenuError):
+            lm.parse("${OS}=CachyOS\n/+${OS}\n")
+
+    def test_a_directory_named_by_the_one_shot_stops_at_the_menu(self):
+        menu = lm.parse(self.CONF)
+        self.assertEqual(menu.boots("CachyOS", None), (None, "the one-shot entry is a directory"))
 
     def test_set_global_and_marker(self):
         text = lm.set_global(self.CONF, "remember_last_entry", "remember_last_entry: no",
@@ -352,7 +505,7 @@ class MenuTest(unittest.TestCase):
         self.assertFalse(menu.remembers())
         self.assertEqual(lm.marked_original(menu), "Remember_Last_Entry: Yes")
         back = lm.set_global(text, "remember_last_entry", "Remember_Last_Entry: Yes", marker=None)
-        self.assertEqual(back, self.CONF.replace("Yes\r\n", "Yes\n"))
+        self.assertEqual(back, self.CONF)
         with self.assertRaises(lm.MenuError):
             lm.set_global(self.CONF, "editor_enabled", "editor_enabled: no")
 

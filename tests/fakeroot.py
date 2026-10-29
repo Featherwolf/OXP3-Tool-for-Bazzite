@@ -454,6 +454,7 @@ class FakeCachyRunner(FakeRunner):
         self.gen_fail = 0  # how many sdboot-manage/grub-mkconfig runs fail next
         self.regenerations = 0
         self.enroll_exit = 0
+        self.after_oneshot = None  # called after `bootctl set-oneshot` (another tool's write in the same moment)
         self.enroll_strips = False  # a failing limine-enroll-config leaves the binary without a checksum
         # Command -> how many of its runs pass before one gets Ctrl+C (before it writes anything).
         self.interrupt: dict[str, int] = {}
@@ -523,6 +524,8 @@ class FakeCachyRunner(FakeRunner):
                 var.write_bytes(b"\x07\x00\x00\x00" + (argv[2] + "\0").encode("utf-16-le"))
             else:
                 var.unlink(missing_ok=True)
+            if self.after_oneshot:
+                self.after_oneshot()
             return CommandResult(0)
         if cmd == "limine-enroll-config":
             self.enroll()
@@ -590,10 +593,11 @@ class FakeCachyRunner(FakeRunner):
                 initramfs = "initramfs-fallback" if name.endswith("-fallback") else "initramfs"
                 for f in ("vmlinuz", initramfs):  # copied to the ESP
                     self.write(f"/boot/{MACHINE_ID}/{kernel}/{f}", "")
+                empty = hashlib.blake2b(b"", digest_size=64).hexdigest()  # what limine-entry-tool appends: b2sum
                 lines += [f"  //{title}", f"    comment: Kernel version: {version}", f"    comment: kernel-id={name}",
                           "    protocol: linux",
-                          f"    module_path: boot():/{MACHINE_ID}/{kernel}/{initramfs}#00",
-                          f"    path: boot():/{MACHINE_ID}/{kernel}/vmlinuz#00",
+                          f"    module_path: boot():/{MACHINE_ID}/{kernel}/{initramfs}#{empty}",
+                          f"    path: boot():/{MACHINE_ID}/{kernel}/vmlinuz#{empty}",
                           f"    cmdline: {self.limine_cmdline(name)}"]
         lines += ["  //Snapshots", "    ///1 2026-10-27", f"      path: boot():/{MACHINE_ID}/limine_history/vmlinuz#00",
                   "      cmdline: quiet rw root=UUID=abcd snapshot=1"]

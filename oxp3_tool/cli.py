@@ -445,10 +445,6 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
 
 def cmd_kernel(ctx: Context, state: State, args: argparse.Namespace) -> int:
     action = args.kernel_action
-    if action and not args.dry_run:
-        need = _need_root(ctx.sys)
-        if need is not None:
-            return need
     try:
         return kernel_cmd.cmd_kernel(ctx, action, getattr(args, "package", None), args.yes, args.dry_run, _out,
                                      _confirm)
@@ -565,6 +561,8 @@ def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) 
     try:
         mutating = (args.command in MUTATING or getattr(args, "kernel_action", None)) \
             and not getattr(args, "dry_run", False)
+        if mutating and _need_root(system) is not None:
+            return 1
         if not system.is_real_root or os.geteuid() == 0:
             lock = acquire_lock(system)
         if mutating and lock is None:

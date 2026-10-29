@@ -42,6 +42,7 @@ class Entry:
     parent: Optional["Entry"] = None
     children: list["Entry"] = field(default_factory=list)
     options: dict[str, str] = field(default_factory=dict)  # first value of each (lower-case) key in its own body
+    files: list[str] = field(default_factory=list)  # every path/kernel_path/module_path value, in order
 
     @property
     def is_dir(self) -> bool:
@@ -60,8 +61,11 @@ class Entry:
         fw = self.options.get("if_fw_type")
         if fw is not None and fw.lower() != "uefi":
             return True
-        arch = self.options.get("if_arch")
-        return arch is not None and not re.search(r"(^|[\s,])(x86[-_]64|x86_64|amd64)($|[\s,])", arch.lower())
+        for key in ("if_arch", "if_loader_arch"):  # arch_in_list: whitespace-separated, compared with "x86-64"
+            value = self.options.get(key)
+            if value is not None and "x86-64" not in re.split(r"[ \t\n\r\v\f]+", value.lower()):
+                return True
+        return False
 
 
 def _escape(name: str) -> str:
@@ -71,18 +75,19 @@ def _escape(name: str) -> str:
 @dataclass
 class Menu:
     text: str
-    lines: list[str]  # as Limine sees them: CRs dropped, spaces and tabs stripped at both ends
+    lines: list[str]  # as Limine sees them: spaces and tabs stripped at both ends
     top: list[Entry]
 
     def value(self, key: str) -> Optional[str]:
-        """A global option as Limine's config_get_value(NULL, 0, key) reads it: the first line of the whole file
-        that starts with `key:` (any case)."""
+        """A global option as Limine's config_get_value(NULL, 0, key) reads it: the first line starting with `key:`
+        (any case) above the first entry (init_config ends the global part there)."""
         at = self.value_line(key)
         return None if at is None else self.lines[at][len(key) + 1:].lstrip(" \t")
 
     def value_line(self, key: str) -> Optional[int]:
         k = key.lower() + ":"
-        for i, line in enumerate(self.lines):
+        end = self.first_entry_line or len(self.lines)  # no cut when the file starts with an entry
+        for i, line in enumerate(self.lines[:end]):
             if line[:len(k)].lower() == k:
                 return i
         return None
@@ -115,16 +120,15 @@ class Menu:
         return f"{base}-{dups + 1}" if dups else base
 
     def _bli_base(self, e: Entry) -> str:
-        out = "".join(c if re.fullmatch(r"[0-9A-Za-z+_.@-]", c) else "." if c == "/" else "-" for c in self.path(e))
+        """bli_entry_base_id: byte by byte over the UTF-8 path, at most 232 bytes."""
+        ok = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+_.@-"
+        out = "".join(chr(b) if b in ok else "." if b == 0x2F else "-" for b in self.path(e).encode("utf-8")[:232])
         return out if out not in ("", ".", "..") else out + "-"
 
     def by_path(self, path: str) -> Optional[Entry]:
         """find_entry_by_path: name components split at unescaped '/', with an optional #N for the Nth duplicate."""
         nodes, found = self.top, None
-        for comp in _split_path(path):
-            if comp is None:
-                return None
-            name, dup = comp
+        for name, dup in _split_path(path):
             found, seen = None, 0
             for e in nodes:
                 if e.skipped() or e.name != name:
@@ -169,8 +173,8 @@ class Menu:
         value = self.value("default_entry")
         if value is None:
             value = "1"  # LoaderEntryDefault is read only without the option; CachyOS always writes it
-        if re.fullmatch(r"[0-9]+", value):
-            e = self.by_index(max(int(value) - 1, 0)) or self.by_index(0)
+        if re.fullmatch(r"[0-9]*", value):
+            e = self.by_index(max(int(value or "0") - 1, 0))  # past the end: nothing (Limine stops at its menu)
         else:
             e = self.by_path(value)
         return e if e is not None and not e.is_dir else None
@@ -204,29 +208,55 @@ class Menu:
         """(entry, why) for the next power-on; entry None means Limine waits in its menu."""
         if oneshot:
             e = self.by_bli_id_or_path(oneshot)
-            if e is not None and not e.is_dir:
-                return e, "one-shot"
+            if e is not None:
+                return (None, "the one-shot entry is a directory") if e.is_dir else (e, "one-shot")
         if self.remembers() and last_booted:
             e = self.by_path(last_booted)
-            if e is not None and not e.is_dir:
-                return e, "remembered"
+            if e is not None:
+                return (None, "the remembered entry is a directory") if e.is_dir else (e, "remembered")
         e = self.default()
         if e is None:
             return None, "no valid default entry"
         return (e, "default") if self.autoboots() else (None, "timeout: no")
 
 
-def _split_path(path: str) -> list[Optional[tuple[str, int]]]:
-    comps: list[Optional[tuple[str, int]]] = []
-    for raw in re.split(r"(?<!\\)/", path):  # Limine reads a path component up to an unescaped '/'
-        m = re.fullmatch(r"(.*?)#([0-9]+)", raw)
-        name, dup = (m.group(1), int(m.group(2))) if m else (raw, 0)
-        comps.append((re.sub(r"\\(.)", r"\1", name), dup))
-    return comps
+def _split_path(path: str) -> list[tuple[str, int]]:
+    """parse_path_component over a whole path: a backslash takes the next character as it is, an unescaped '/'
+    ends a component, an unescaped '#' with digits up to the component's end is its duplicate number."""
+    comps: list[tuple[str, int]] = []
+    i, n = 0, len(path)
+    while True:
+        name: list[str] = []
+        dup = 0
+        while i < n and path[i] != "/":
+            c = path[i]
+            if c == "\\" and i + 1 < n:
+                name.append(path[i + 1])
+                i += 2
+                continue
+            if c == "#":
+                j = i + 1
+                while j < n and path[j] in "0123456789":
+                    j += 1
+                if j > i + 1 and (j == n or path[j] == "/"):
+                    dup, i = int(path[i + 1:j]), j
+                    break
+            name.append(c)
+            i += 1
+        comps.append(("".join(name), dup))
+        if i < n and path[i] == "/":
+            i += 1
+            continue
+        return comps
 
 
 def parse(text: str) -> Menu:
-    lines = [ln.replace("\r", "").strip(" \t") for ln in text.split("\n")]
+    if "\r" in text:
+        raise MenuError("it has Windows (CRLF) line endings, which Limine reads differently; `sudo limine-update` "
+                        "rewrites it")
+    if "${" in text:
+        raise MenuError("it uses macros (${...})")
+    lines = [ln.strip(" \t") for ln in text.split("\n")]
     top: list[Entry] = []
     stack: list[Entry] = []
     current: Optional[Entry] = None
@@ -252,21 +282,25 @@ def parse(text: str) -> Menu:
                 if m:
                     current.options.setdefault("kernel-id", m.group(1))
             current.options.setdefault(key, value.strip(" \t"))
+            if key in ("path", "kernel_path", "module_path"):
+                current.files.append(value.strip(" \t"))
     return Menu(text=text, lines=lines, top=top)
 
 
 def set_global(text: str, key: str, new_line: str, marker: Optional[str] = None) -> str:
-    """Replace the line Limine reads `key` from (it must be a global one, above the first entry) with
-    ``new_line``; ``marker`` goes on its own line above it (None removes a marker line found there)."""
+    """Replace the line Limine reads `key` from (a global one, above the first entry) with ``new_line``. ``marker``
+    goes on its own line above it, unless a marker is there already (the first one keeps the original); None
+    removes a marker found there."""
     menu = parse(text)
     at = menu.value_line(key)
     if at is None or at >= menu.first_entry_line:
         raise MenuError(f"limine.conf has no global {key} line")
     raw = text.split("\n")
     raw[at] = new_line
-    if marker is not None:
+    marked = at > 0 and raw[at - 1].strip().startswith(MARKER_PREFIX)
+    if marker is not None and not marked:
         raw.insert(at, marker)
-    elif at > 0 and raw[at - 1].strip().startswith(MARKER_PREFIX):
+    elif marker is None and marked:
         del raw[at - 1]
     return "\n".join(raw)
 
@@ -278,9 +312,9 @@ def marker_for(original: str) -> str:
     return f'{MARKER_PREFIX} was "{original}"; `sudo oxp3-tool kernel keep` puts it back'
 
 
-def marked_original(menu: Menu) -> Optional[str]:
-    """The remember_last_entry line `kernel try` replaced, from its marker above the current line."""
-    at = menu.value_line("remember_last_entry")
+def marked_original(menu: Menu, key: str = "remember_last_entry") -> Optional[str]:
+    """The global line `kernel try` replaced, from its marker above the current one."""
+    at = menu.value_line(key)
     if at is None or at == 0 or at >= menu.first_entry_line:
         return None
     m = re.fullmatch(re.escape(MARKER_PREFIX) + r' was "(.*)"; .*', menu.lines[at - 1])

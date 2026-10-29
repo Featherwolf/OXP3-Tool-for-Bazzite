@@ -42,6 +42,7 @@ VSWING=(
 SUFFIX=cachyos-deckify-vsw
 VERSION=7.2.11-1
 WORK="${WORK:-$HOME/kbuild}"
+RECIPE=linux-cachyos-vsw-recipe  # the script's own clone of CachyOS/linux-cachyos in $WORK
 
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo; echo "== $*"; }
@@ -59,6 +60,8 @@ case $fstype in
     ext4 | btrfs | xfs | f2fs) ;;
     *) die "$WORK is on ${fstype:-an unknown file system}; set WORK= to a folder on an ext4, btrfs, xfs or f2fs disk" ;;
 esac
+# A stopped or failed earlier build leaves its tree (makepkg --cleanbuild would delete it anyway).
+rm -rf "$WORK/build/linux-$SUFFIX"
 free_gb=$(df -Pk "$WORK" | awk 'NR==2 {print int($4 / 1048576)}')
 [ "$free_gb" -ge 30 ] || die "$WORK has ${free_gb} GB free; the build needs about 30 GB (set WORK= to another disk)"
 on_ac=no
@@ -72,10 +75,11 @@ sudo pacman -S --needed base-devel git
 
 step "CachyOS's recipe for linux-cachyos-deckify $VERSION"
 cd "$WORK"
-[ -d linux-cachyos/.git ] || git clone --filter=blob:none --no-checkout https://github.com/CachyOS/linux-cachyos.git
-git -C linux-cachyos cat-file -e "$LC_COMMIT^{commit}" 2>/dev/null || git -C linux-cachyos fetch origin
-git -C linux-cachyos checkout -q --force "$LC_COMMIT"
-cd linux-cachyos/linux-cachyos-deckify
+[ -d "$RECIPE/.git" ] ||
+    git clone --filter=blob:none --no-checkout https://github.com/CachyOS/linux-cachyos.git "$RECIPE"
+git -C "$RECIPE" cat-file -e "$LC_COMMIT^{commit}" 2>/dev/null || git -C "$RECIPE" fetch origin
+git -C "$RECIPE" checkout -q --force "$LC_COMMIT"
+cd "$RECIPE/linux-cachyos-deckify"
 if ! { grep -qx '_major=7.2' PKGBUILD && grep -qx '_minor=11' PKGBUILD && grep -qx 'pkgrel=1' PKGBUILD; }; then
     die "unexpected PKGBUILD (not $VERSION)"
 fi
@@ -123,9 +127,10 @@ find_packages() {
     shopt -u nullglob
 }
 mkdir -p "$WORK/pkg" "$WORK/logs"
-# The edited PKGBUILD pins every source by checksum: packages built from another one are built again.
+# The edited PKGBUILD pins every source by checksum, the patch series by its commits: packages built from
+# another recipe are built again. (The patches' own bytes change with kernel.org's cgit version.)
 stamp="$WORK/pkg/.linux-$SUFFIX.recipe"
-recipe="$(b2sum PKGBUILD | cut -d' ' -f1)"
+recipe="$({ grep -v '^b2sums+=' PKGBUILD; printf '%s\n' "${VSWING[@]}"; } | b2sum | cut -d' ' -f1)"
 find_packages
 if [ -z "${REBUILD:-}" ] && [ ${#kpkg[@]} -eq 1 ] && [ ${#hpkg[@]} -eq 1 ] &&
     [ "$(cat "$stamp" 2>/dev/null)" = "$recipe" ]; then
@@ -137,11 +142,15 @@ else
     "${inhibit[@]}" true 2>/dev/null || { inhibit=(); echo "note: could not keep the device awake; do not let it sleep"; }
     # makepkg stops with "A failure occurred in prepare()" if any patch, vswing-override.patch included, does
     # not apply, so a finished build always has the series.
-    "${inhibit[@]}" env BUILDDIR="$WORK/build" PKGDEST="$WORK/pkg" LOGDEST="$WORK/logs" PKGEXT=.pkg.tar.zst \
-        makepkg -s -f --cleanbuild --log ||
-        die "the build failed; the newest *.log in $WORK/logs has the error near its end. Nothing was installed."
+    if ! "${inhibit[@]}" env BUILDDIR="$WORK/build" PKGDEST="$WORK/pkg" LOGDEST="$WORK/logs" PKGEXT=.pkg.tar.zst \
+        makepkg -s -f --cleanbuild --log; then
+        rm -rf "$WORK/build/linux-$SUFFIX"
+        die "the build failed: makepkg's error is in the lines just above (the output of prepare(), build() and
+package() is also in $WORK/logs, if it got that far). Nothing was installed."
+    fi
     echo "$recipe" > "$stamp"
-    rm -rf "$WORK/build"
+    rm -rf "$WORK/build/linux-$SUFFIX"
+    rmdir "$WORK/build" 2>/dev/null || true
     find_packages
     [ ${#kpkg[@]} -eq 1 ] && [ ${#hpkg[@]} -eq 1 ] ||
         die "expected one kernel and one headers package in $WORK/pkg, found: ${kpkg[*]} ${hpkg[*]}"
@@ -160,6 +169,9 @@ Instead, with oxp3-tool 0.3.0 or later (update it with the get.sh line from its 
 If it hangs or the screen stays dark, hold the power button about 10 seconds until the device is
 off, then turn it on: Limine boots the stock kernel. On the new kernel, \`uname -r\` shows
 $VERSION-$SUFFIX; to keep booting it: sudo oxp3-tool kernel keep
-To remove it later: sudo oxp3-tool kernel try linux-cachyos-deckify, reboot, then
+If it did not come up and you are back on the stock kernel: sudo oxp3-tool kernel keep (on the
+stock kernel) puts Limine's settings back.
+To remove it later: on it, sudo oxp3-tool kernel try linux-cachyos-deckify and reboot; on the
+stock kernel, sudo oxp3-tool kernel keep, then
   sudo pacman -R linux-$SUFFIX linux-$SUFFIX-headers
 EOF
