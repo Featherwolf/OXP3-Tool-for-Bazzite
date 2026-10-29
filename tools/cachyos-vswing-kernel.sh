@@ -10,7 +10,8 @@
 # tools (rust, rust-src, rust-bindgen with clang, pahole, ...; about 1 GB, and they stay
 # installed), and gpg adds CachyOS's two signing keys to ~/.gnupg.
 #
-# Run it as your normal user (not with sudo), plugged in, from Desktop Mode:
+# Run it as your normal user (not with sudo), plugged in, from Desktop Mode, in Konsole:
+#   curl -fsSLO https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/tools/cachyos-vswing-kernel.sh
 #   bash cachyos-vswing-kernel.sh
 #   WORK=/path/on/disk bash cachyos-vswing-kernel.sh   # build somewhere else (default: ~/kbuild)
 #   REBUILD=1 bash cachyos-vswing-kernel.sh            # build again although the packages exist
@@ -62,8 +63,6 @@ case $fstype in
 esac
 # A stopped or failed earlier build leaves its tree (makepkg --cleanbuild would delete it anyway).
 rm -rf "$WORK/build/linux-$SUFFIX"
-free_gb=$(df -Pk "$WORK" | awk 'NR==2 {print int($4 / 1048576)}')
-[ "$free_gb" -ge 30 ] || die "$WORK has ${free_gb} GB free; the build needs about 30 GB (set WORK= to another disk)"
 on_ac=no
 for p in /sys/class/power_supply/*; do
     [ "$(cat "$p/type" 2>/dev/null)" = Mains ] && [ "$(cat "$p/online" 2>/dev/null)" = 1 ] && on_ac=yes
@@ -137,6 +136,8 @@ if [ -z "${REBUILD:-}" ] && [ ${#kpkg[@]} -eq 1 ] && [ ${#hpkg[@]} -eq 1 ] &&
     step "Already built from this recipe (REBUILD=1 bash $0 builds again)"
 else
     rm -f "${kpkg[@]}" "${hpkg[@]}" "$stamp"
+    free_gb=$(df -Pk "$WORK" | awk 'NR==2 {print int($4 / 1048576)}')
+    [ "$free_gb" -ge 30 ] || die "$WORK has ${free_gb} GB free; the build needs about 30 GB (set WORK= to another disk)"
     step "Building (1-2 hours; logs in $WORK/logs). Stay in Desktop Mode and keep this window open until it says Done"
     inhibit=(systemd-inhibit --what=sleep --who=cachyos-vswing-kernel --why="Building a kernel")
     "${inhibit[@]}" true 2>/dev/null || { inhibit=(); echo "note: could not keep the device awake; do not let it sleep"; }

@@ -177,9 +177,11 @@ class LimineKernels:
                                       "is done")
                 if self.sys.read_bytes(self.conf) != self.data:
                     raise KernelError(f"{self.conf} changed while this ran; run the command again")
+                if oneshot == "":  # keep: never remember_last_entry: yes on disk while a one-shot is pending
+                    self.set_oneshot("")
                 if new is not None and new != self.data:
                     self._replace(new, notes)
-                if oneshot is not None:
+                if oneshot:  # try: only once remember_last_entry: no is in place
                     self.set_oneshot(oneshot)
                 data = self.sys.read_bytes(self.conf) or b""
                 self.data, self.menu = data, lm.parse(data.decode("utf-8"))
@@ -197,11 +199,14 @@ class LimineKernels:
             problem = f"writing it failed ({e.strerror or e})"
         if problem is None:
             return
-        notes.append(f"error: {problem}; putting the previous {self.conf} back")
-        try:
-            self.sys.write_atomic(self.conf, old, mode=None)
-        except OSError as e:
-            raise KernelError(f"DO NOT REBOOT: {self.conf} could not be put back ({e.strerror or e})") from e
+        if self.sys.read_bytes(self.conf) == old:  # the write failed before its rename: nothing was replaced
+            notes.append(f"error: {problem}")
+        else:
+            notes.append(f"error: {problem}; putting the previous {self.conf} back")
+            try:
+                self.sys.write_atomic(self.conf, old, mode=None)
+            except OSError as e:
+                raise KernelError(f"DO NOT REBOOT: {self.conf} could not be put back ({e.strerror or e})") from e
         # A failed limine-enroll-config may have left the binary as it was (its checksum still fits the old file)
         # or put back the binary without any checksum; enroll again only when that is needed.
         hashes = lm.enrolled_hashes(self.sys, self.esp)
@@ -282,7 +287,11 @@ def _notes(lk: LimineKernels, kernels: list[Kernel]) -> list[str]:
         notes.append(f"Limine's default entry is {name} since `oxp3-tool kernel try` (a failed boot comes back to "
                      f"it). Do not remove {name} before `sudo oxp3-tool kernel keep` on the kernel to keep, or "
                      "Limine waits in its menu at power-on")
-    if lm.marked_original(menu) is not None:
+    if lm.marked_original(menu) is not None and menu.remembers():
+        notes.append("warning: limine.conf has remember_last_entry: yes again under `oxp3-tool kernel try`'s marker, "
+                     "so a failed boot no longer comes back to Limine's default entry; `sudo oxp3-tool kernel keep` "
+                     "clears the marker")
+    elif lm.marked_original(menu) is not None:
         notes.append(f"Limine boots its default entry, {lk.name(default, kernels)}, at every power-on "
                      "(`oxp3-tool kernel try` turned remember_last_entry off; `sudo oxp3-tool kernel keep`, on the "
                      "kernel to keep, puts it back)")
@@ -337,6 +346,11 @@ def cmd_kernel(ctx: Context, action: Optional[str], package: Optional[str], assu
     return _keep(lk, kernels, assume_yes, dry_run, out, confirm)
 
 
+def _oneshot_name(lk: LimineKernels, pending: str, kernels: list[Kernel]) -> str:
+    entry = lk.menu.by_bli_id_or_path(pending)
+    return lk.name(entry, kernels) if entry is not None else f"'{pending}' (no such entry now; Limine would ignore it)"
+
+
 def _global_line(lk: LimineKernels, key: str) -> str:
     menu = lk.menu
     at = menu.value_line(key)
@@ -360,9 +374,13 @@ def _try(lk: LimineKernels, kernels: list[Kernel], package: str, assume_yes: boo
         raise KernelError(f"{package} is the kernel running now" +
                           ("; `sudo oxp3-tool kernel keep` keeps it" if lm.marked_original(menu) is not None else ""))
     if running is None or running.entry is None or not lk.files_ok(running.entry):
-        raise KernelError(f"the kernel running now ({lk.ctx.kernel_release or '?'}) has no usable Limine entry of its "
-                          "own, so a failed boot could not come back to it; boot an installed kernel from its entry "
-                          "first")
+        nxt, why = menu.boots(lk.oneshot, lk.last_booted)
+        what = ("is no longer installed (pacman updated or removed it)" if running is None else
+                "has no usable Limine entry of its own")
+        raise KernelError(f"the kernel running now ({lk.ctx.kernel_release or '?'}) {what}, so a failed boot could "
+                          f"not come back to it. The next boot is {lk.name(nxt, kernels)}" +
+                          (", and then every power-on, because it booted last and remember_last_entry is yes"
+                           if why == "remembered" else ""))
     problem = lk.edit_problem()
     if problem:
         raise KernelError(problem)
@@ -432,7 +450,7 @@ def _keep(lk: LimineKernels, kernels: list[Kernel], assume_yes: bool, dry_run: b
     text = lk.data.decode("utf-8")
     plan = []
     if pending:
-        plan.append(f"cancel the one boot of {lk.name(menu.by_bli_id_or_path(pending), kernels)} asked for "
+        plan.append(f"cancel the one boot of {_oneshot_name(lk, pending, kernels)} asked for "
                     "(`bootctl set-oneshot ''`)")
     for key, original in originals.items():
         if original is not None:
@@ -475,7 +493,9 @@ def status_lines(ctx: Context) -> list[str]:
     menu = lk.menu
     out = []
     pending = lk.oneshot
-    if pending:
+    if pending and menu.by_bli_id_or_path(pending) is None:
+        out.append(f"a one-shot boot of '{pending}' is set but names no entry in limine.conf now; Limine ignores it")
+    elif pending:
         once, _ = menu.boots(pending, None)
         after, _ = menu.boots(None, menu.path(once) if once is not None and menu.remembers() else None)
         out.append(f"Limine boots {lk.name(once, kernels)} once at the next boot (`oxp3-tool kernel try`), then "

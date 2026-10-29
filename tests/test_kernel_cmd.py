@@ -231,6 +231,11 @@ class RefusalTest(Base):
     def test_running_kernel_without_its_own_entry(self):
         self.fake()
         self.f.write("/proc/sys/kernel/osrelease", "7.2.11-1-cachyos-deckify-snapshot\n")
+        self.assertIn("is no longer installed (pacman updated or removed it), so a failed boot could not come back to "
+                      "it. The next boot is linux-cachyos-deckify, and then every power-on, because it booted last",
+                      self.refused("try", VSW, "-y"))
+        self.f.write("/proc/sys/kernel/osrelease", KERNELS[STOCK] + "\n")
+        self.f.write(f"/boot/0123456789abcdef0123456789abcdef/{STOCK}/vmlinuz", "changed")
         self.assertIn("has no usable Limine entry of its own", self.refused("try", VSW, "-y"))
 
     def test_changed_kernel_files(self):
@@ -363,6 +368,54 @@ class ConcurrencyTest(Base):
         rc, out, _ = self.cli("kernel")
         self.assertIn("DO NOT REBOOT: limine.conf does not match the checksum enrolled", out)
         self.assertIn("DO NOT REBOOT", self.cli("status")[1])
+
+
+class LeftoverStateTest(Base):
+    def test_hand_edited_remember_line_under_the_marker(self):
+        self.fake()
+        self.cli("kernel", "try", VSW, "-y")
+        self.f.write(CONF, self.conf().replace("remember_last_entry: no", "remember_last_entry: yes"))
+        out = " ".join(self.cli("kernel")[1].split())
+        self.assertIn("warning: limine.conf has remember_last_entry: yes again under `oxp3-tool kernel try`'s marker", out)
+        self.assertNotIn("Limine boots its default entry", out)
+        self.assertEqual(self.cli("kernel", "keep", "-y")[0], 0)
+        self.assertNotIn("oxp3-tool", self.conf())
+
+    def test_tried_kernel_removed_before_the_reboot(self):
+        self.fake()
+        self.cli("kernel", "try", VSW, "-y")
+        self.remove_vsw()
+        out = " ".join(self.cli("status")[1].split())
+        self.assertIn("a one-shot boot of 'CachyOS.linux-cachyos-deckify-vsw' is set but names no entry", out)
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("'CachyOS.linux-cachyos-deckify-vsw' (no such entry now; Limine would ignore it)", out)
+        self.assertEqual(self.f.power_on(), STOCK)
+
+    def test_keep_cancels_before_it_remembers_again(self):
+        self.fake()
+        self.cli("kernel", "try", VSW, "-y")
+        self.f.runner.fail.add("bootctl set-oneshot ")  # the cancel fails
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("remember_last_entry: no", self.conf())  # so the trial still falls back
+        self.f.hangs.add(VSW)
+        self.assertEqual([self.f.power_on() for _ in range(3)], [VSW, STOCK, STOCK])
+
+    def test_failed_write_is_not_a_reason_to_panic(self):
+        import errno
+        from unittest import mock
+        from oxp3_tool.system import System
+        self.fake()
+        conf = self.conf()
+        with mock.patch.object(System, "write_atomic", side_effect=OSError(errno.EROFS, "Read-only file system")):
+            rc, out, err = self.cli("kernel", "try", VSW, "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("error: writing it failed (Read-only file system)", out)
+        self.assertNotIn("putting the previous", out)
+        self.assertNotIn("DO NOT REBOOT", err)
+        self.assertIn("/boot/limine.conf was not changed", err)
+        self.assertEqual(self.conf(), conf)
 
 
 class RootTest(Base):
