@@ -80,6 +80,7 @@ STEAM_CONFIG_VDF_MAX = 16 * 1024 * 1024
 _SCREEN_READER_RE = re.compile(rb'"ScreenReaderEnabled"\s+"1"')
 # gamescope DRM backend: "Got known display: <key> (<pretty name>)"
 _KNOWN_DISPLAY_RE = re.compile(r"Got known display: ([A-Za-z0-9_.-]+) \(")
+POWERBUTTOND = "/usr/lib/hwsupport/steamos-powerbuttond"  # passes power-button presses to Steam in Game Mode
 # Functions the 'Vswing / Pre-emphasis Override' series (Linux 7.4) adds to the display code (intel_bios.c).
 _VSPEO_SYMBOL_RE = re.compile(rb"\s(?:intel_bios_get_c10_vspeo|intel_bios_get_c20_vspeo|"
                               rb"intel_bios_encoder_requests_vspeo)\s")
@@ -576,6 +577,34 @@ class Context:
     @cached_property
     def gamescope_installed(self) -> bool:
         return self.sys.which("gamescope") is not None
+
+    @cached_property
+    def logind_power_key(self) -> Optional[str]:
+        """HandlePowerKey= as logind reads it: logind.conf, then the drop-ins in file-name order (a name in /etc
+        hides the same name in /run and /usr), the last setting winning."""
+        files = [p for p in ("/etc/systemd/logind.conf", "/usr/lib/systemd/logind.conf") if self.sys.exists(p)][:1]
+        dropins: dict[str, str] = {}
+        for d in ("/usr/lib/systemd/logind.conf.d", "/usr/local/lib/systemd/logind.conf.d", "/run/systemd/logind.conf.d",
+                  "/etc/systemd/logind.conf.d"):  # lowest priority first
+            for path in self.sys.glob(f"{d}/*.conf"):
+                dropins[path.rsplit("/", 1)[1]] = path
+        value = None
+        for path in files + [dropins[name] for name in sorted(dropins)]:
+            section = ""
+            for line in (self.sys.read_text(path) or "").splitlines():
+                line = line.strip()
+                if line.startswith("["):
+                    section = line
+                elif section == "[Login]" and line.startswith("HandlePowerKey="):
+                    value = line.split("=", 1)[1].strip()
+        return value
+
+    @property
+    def power_key_unhandled(self) -> bool:
+        """Game Mode on CachyOS: logind ignores the power key and nothing passes it to Steam (CachyOS's hardware
+        detection installs steamos-powerbuttond only on the handhelds it knows)."""
+        return (self.os_family == CACHYOS and self.has_game_mode and self.logind_power_key == "ignore"
+                and not self.sys.exists(POWERBUTTOND) and not self.hhd.running)
 
     @cached_property
     def has_game_mode(self) -> bool:

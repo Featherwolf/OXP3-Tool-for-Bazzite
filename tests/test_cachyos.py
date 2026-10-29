@@ -617,6 +617,23 @@ class LimineEdgeTest(Base):
         self.assertIn("entry editor is off", hint())
 
 
+class PowerButtonTest(Base):
+    def test_power_button_without_a_handler(self):
+        self.fake()
+        self.assertNotIn("power button does nothing", self.cli("status")[1])  # logind handles it by default
+        self.f.write("/etc/systemd/logind.conf", "[Login]\n#HandlePowerKey=poweroff\n")
+        self.f.write("/etc/systemd/logind.conf.d/steam-deckify.conf", "[Login]\nHandlePowerKey=ignore\n")
+        out = " ".join(self.cli("status")[1].split())
+        self.assertIn("warning: the power button does nothing in Game Mode: logind ignores it (HandlePowerKey=ignore) "
+                      "and steamos-powerbuttond, which passes it to Steam, is not installed", out)
+        self.assertIn("`sudo pacman -S steamos-powerbuttond`, then reboot", out)
+        self.f.write("/usr/lib/hwsupport/steamos-powerbuttond", "")
+        self.assertNotIn("power button does nothing", self.cli("status")[1])
+        (self.root / "usr/lib/hwsupport/steamos-powerbuttond").unlink()
+        self.f.write("/etc/systemd/logind.conf.d/zz-mine.conf", "[Login]\nHandlePowerKey=suspend\n")  # sorts later
+        self.assertNotIn("power button does nothing", self.cli("status")[1])
+
+
 class LimineRound3Test(Base):
     LTS_KEY = ('ESP_PATH="/boot"\nKERNEL_CMDLINE[default]+="quiet rw root=UUID=abcd"\n'
                'KERNEL_CMDLINE[linux-cachyos-lts]+="quiet rw root=UUID=abcd lts=1"\n')

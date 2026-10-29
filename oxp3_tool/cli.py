@@ -213,6 +213,11 @@ def status_text(ctx: Context, state: State) -> str:
         game += f" (CachyOS gamescope-session; Steam gets {pad})"
     if game:
         lines.append(f"Game Mode: {game}")
+    if ctx.power_key_unhandled:
+        lines.append(_wrap("warning: the power button does nothing in Game Mode: logind ignores it "
+                           "(HandlePowerKey=ignore) and steamos-powerbuttond, which passes it to Steam, is not "
+                           "installed (CachyOS installs it only on handhelds it knows). `sudo pacman -S "
+                           "steamos-powerbuttond`, then reboot", "          ", "          "))
 
     if state.load_error:
         lines.append("")
