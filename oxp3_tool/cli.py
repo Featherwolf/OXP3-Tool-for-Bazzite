@@ -15,7 +15,7 @@ from typing import Any, Optional, Sequence
 from . import PROJECT_URL, __version__, diagnose, kernel_cmd, steam_session, templates
 from .detect import CACHYOS, NATIVE_STEAM, OGUI, Context
 from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
-from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix
+from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix, restart_pending
 from .kargs import REBUILD_MARKER
 from .state import State, StateError
 from .system import SimulatedRunner, System
@@ -254,9 +254,9 @@ def _status(ctx: Context, state: State) -> tuple[list[str], list[str], list[str]
         for fix in ALL_FIXES:
             if fix.group != group:
                 continue
-            label, notes = _fix_state(ctx, state, fix)
+            label, fix_notes = _fix_state(ctx, state, fix)
             lines.append(f"  [{label:<12}] {fix.id:<21} {fix.summary}")
-            for note in notes:
+            for note in fix_notes:
                 lines.append(f"  {'':14} {'':21} {note}")
     advice = refresh.advice() if show_refresh else []
     if advice:
@@ -282,7 +282,8 @@ def status_data(ctx: Context, state: State) -> dict[str, Any]:
         entry = state.get(fix.id) or {}
         fixes.append({"id": fix.id, "group": fix.group, "level": fix.level, "title": fix.title,
                       "summary": fix.summary, "takes_effect": fix.takes_effect, "state": label, "notes": fix_notes,
-                      "applied_at": entry.get("applied_at"), "options": entry.get("options", {})})
+                      "applied_at": entry.get("applied_at"), "options": entry.get("options", {}),
+                      "pending": _pending(ctx, fix, entry, label)})
     refresh = ctx.refresh_state if ctx.show_refresh else None
     return {
         "device": {"vendor": dmi.get("sys_vendor"), "product": dmi.get("product_name"),
@@ -294,9 +295,25 @@ def status_data(ctx: Context, state: State) -> dict[str, Any]:
         "needs_root": ctx.sys.is_real_root and os.geteuid() != 0,
         "game_mode": ctx.has_game_mode, "game_mode_input": ctx.game_mode_input,
         "warnings": warnings, "notes": notes, "fixes": fixes,
+        "reboot_pending": any(f["pending"] == "reboot" for f in fixes),
+        "rebuild_unfinished": ctx.karg_backend.unfinished(),
         "refresh": {"summary": refresh.summary(), "advice": refresh.advice()} if refresh else None,
         "text": "\n".join(lines),
     }
+
+
+def _pending(ctx: Context, fix: Fix, entry: dict, label: str) -> Optional[str]:
+    """What a fix still waits for: "reboot" (a kernel argument added or removed for the next boot),
+    "inputplumber-restart" (deferred with --no-restart), or None."""
+    if label == "reverting":
+        return "reboot"
+    karg = getattr(fix, "karg", "")
+    if karg and entry and (karg in entry.get("kargs_pending_add", []) or
+                           (ctx.karg_pending(karg) and not ctx.karg_active(karg))):
+        return "reboot"
+    if entry and restart_pending(ctx, entry.get("notes", {})):
+        return "inputplumber-restart"
+    return None
 
 
 def catalog_data() -> dict[str, Any]:
@@ -304,9 +321,15 @@ def catalog_data() -> dict[str, Any]:
     return {"fixes": [{"id": f.id, "group": f.group, "level": f.level, "title": f.title, "summary": f.summary,
                        "details": f.details, "takes_effect": f.takes_effect} for f in ALL_FIXES],
             "button_actions": {name: desc for name, (_, _, desc) in templates.BUTTON_ACTIONS.items()},
+            "button_keys": {key: {"label": label, "default": templates.DEFAULT_BUTTON_ACTIONS[key],
+                                  "stock": templates.STOCK_BUTTON_ACTIONS[key],
+                                  "flag": {"onex": "--onex-key", "keyboard": "--keyboard-key", "home": "--home",
+                                           "xbox": "--xbox-key"}[key]}
+                            for key, label in templates.BUTTON_KEYS.items()},
             "fps_limit": {"min": steam_session.MIN_FPS_LIMIT, "max": steam_session.MAX_FPS_LIMIT,
                           "default": steam_session.DEFAULT_FPS_LIMIT},
-            "min_refresh": {"min": templates.PANEL_MIN_HZ, "max": templates.LEGIONGO2_MIN_HZ}}
+            "min_refresh": {"min": templates.PANEL_MIN_HZ, "max": templates.LEGIONGO2_MIN_HZ,
+                            "default": templates.LEGIONGO2_MIN_HZ}}
 
 
 def cmd_status(ctx: Context, state: State, args: argparse.Namespace) -> int:
@@ -523,8 +546,15 @@ def cmd_kernel(ctx: Context, state: State, args: argparse.Namespace) -> int:
     try:
         if action is None and getattr(args, "json", False):
             _RESULT["kernel"] = kernel_cmd.describe_data(ctx)
-        return kernel_cmd.cmd_kernel(ctx, action, getattr(args, "package", None), args.yes, args.dry_run, _out,
-                                     _confirm)
+        rc = kernel_cmd.cmd_kernel(ctx, action, getattr(args, "package", None), args.yes, args.dry_run, _out,
+                                   _confirm)
+        if action and getattr(args, "json", False):
+            _RESULT["action"] = action
+            try:
+                _RESULT["kernel"] = kernel_cmd.describe_data(ctx)  # after the change
+            except kernel_cmd.KernelError:
+                pass
+        return rc
     except kernel_cmd.KernelError as e:
         _err(f"error: {e}")
         return 1
@@ -533,8 +563,22 @@ def cmd_kernel(ctx: Context, state: State, args: argparse.Namespace) -> int:
 # -- main ----------------------------------------------------------------------------
 
 
+class _Parser(argparse.ArgumentParser):
+    """With --json anywhere in the arguments, a usage error is one JSON object too (exit 2)."""
+
+    def error(self, message: str) -> Any:
+        if "--json" in sys.argv[1:] or _JSON_ARGV:
+            print(json.dumps({"schema": 1, "version": __version__, "command": None, "rc": 2, "ok": False,
+                              "log": [{"stream": "err", "text": f"error: {message}"}]}), flush=True)
+            raise SystemExit(2)
+        super().error(message)
+
+
+_JSON_ARGV = False
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="oxp3-tool",
         description="Controller and wake-from-sleep fixes for the OneXPlayer 3 on Bazzite and CachyOS.",
         epilog=f"Fix ids: {', '.join(f.id for f in ALL_FIXES)}. Project: {PROJECT_URL}",
@@ -629,7 +673,8 @@ def acquire_lock(system: System) -> Optional[int]:
 
 
 def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) -> int:
-    global _LOG, _RESULT
+    global _LOG, _RESULT, _JSON_ARGV
+    _JSON_ARGV = argv is not None and "--json" in argv
     args = build_parser().parse_args(argv)
     if not getattr(args, "json", False):
         return _main(args, system)

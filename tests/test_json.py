@@ -63,6 +63,43 @@ class JsonTest(unittest.TestCase):
         data = self.run_json("revert", "volume-keys", "--yes", "--json")
         self.assertTrue(data["ok"] and data["outcome"]["changed"])
 
+    def test_pending_reboot_and_notes(self):
+        self.f = FakeCachyOS(self.root, kernels=dict(KERNELS))
+        self.f.power_on()
+        self.assertTrue(self.run_json("apply", "nvme-resume", "--yes", "--any-ssd", "--json")["outcome"]["reboot_needed"])
+        st = self.run_json("status", "--json")["status"]
+        nvme = next(f for f in st["fixes"] if f["id"] == "nvme-resume")
+        self.assertEqual((nvme["state"], nvme["pending"]), ("applied", "reboot"))
+        self.assertTrue(st["reboot_pending"])
+        self.assertIsNone(st["rebuild_unfinished"])
+        self.f.boot()
+        st = self.run_json("status", "--json")["status"]
+        self.assertFalse(st["reboot_pending"])
+        # status-level notes are the status's own, not the last fix's
+        self.run_json("kernel", "try", "linux-cachyos-deckify-vsw", "--yes", "--json")
+        st = self.run_json("status", "--json")["status"]
+        self.assertTrue(any("once at the next boot" in n for n in st["notes"]), st["notes"])
+        self.assertFalse(any("DSB" in n for n in st["notes"]))
+
+    def test_usage_error_is_json(self):
+        self.f = FakeOxp3(self.root)
+        self.f.build()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as e:
+            main(["apply", "buttons", "--home", "nope", "--json"], system=self.f.system())
+        self.assertEqual(e.exception.code, 2)
+        data = json.loads(out.getvalue())
+        self.assertEqual((data["rc"], data["ok"]), (2, False))
+        self.assertIn("invalid choice", data["log"][0]["text"])
+
+    def test_catalog_has_the_keys(self):
+        self.f = FakeOxp3(self.root)
+        self.f.build()
+        cat = self.run_json("list", "--json")["catalog"]
+        self.assertEqual(cat["button_keys"]["xbox"]["flag"], "--xbox-key")
+        self.assertEqual(cat["button_keys"]["home"]["default"], "guide")
+        self.assertEqual(cat["min_refresh"]["default"], 48)
+
     def test_errors_are_in_the_object(self):
         self.f = FakeOxp3(self.root)
         self.f.build()
