@@ -334,6 +334,34 @@ def _describe(lk: LimineKernels, kernels: list[Kernel], out: Out) -> None:
         out(f"note: Limine's default entry, '{menu.path(default)}', is no installed kernel's entry.")
 
 
+def describe_data(ctx: Context) -> dict:
+    """`kernel --json`: the installed kernels and what Limine boots next, as data."""
+    lk = LimineKernels(ctx)
+    kernels = lk.kernels()
+    menu = lk.menu
+    running = lk.running(kernels)
+    default = menu.default()
+    nxt, why = menu.boots(lk.oneshot, lk.last_booted)
+    after = None
+    if why == "one-shot" and nxt is not None:
+        after = lk.owner(menu.boots(None, menu.path(nxt) if menu.remembers() else None)[0], kernels)
+
+    def pkg(entry: Optional[lm.Entry]) -> Optional[str]:
+        k = lk.owner(entry, kernels)
+        return k.package if k else None
+    return {
+        "conf": lk.conf,
+        "kernels": [{"package": k.package, "release": k.release, "running": k is running,
+                     "entry": menu.path(k.entry) if k.entry is not None else None,
+                     "usable": k.entry is not None and lk.files_ok(k.entry),
+                     "default": k.entry is not None and k.entry is default} for k in kernels],
+        "next_boot": {"package": pkg(nxt), "why": why, "then": after.package if after else None},
+        "remember_last_entry": menu.remembers(),
+        "trying": lm.marked_original(menu) is not None or lm.marked_original(menu, "default_entry") is not None,
+        "notes": _notes(lk, kernels),
+    }
+
+
 def cmd_kernel(ctx: Context, action: Optional[str], package: Optional[str], assume_yes: bool,
                dry_run: bool, out: Out, confirm: Callable[[str, bool], bool]) -> int:
     lk = LimineKernels(ctx)

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import fcntl
+import json
 import os
 import sys
 import textwrap
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from . import PROJECT_URL, __version__, diagnose, kernel_cmd, steam_session, templates
 from .detect import CACHYOS, NATIVE_STEAM, OGUI, Context
@@ -19,11 +21,22 @@ from .state import State, StateError
 from .system import SimulatedRunner, System
 
 
+# With --json every line goes into the JSON result instead of the terminal (stdout carries one JSON object).
+_LOG: Optional[list[dict[str, str]]] = None
+_RESULT: dict[str, Any] = {}
+
+
 def _out(line: str = "") -> None:
+    if _LOG is not None:
+        _LOG.append({"stream": "out", "text": line})
+        return
     print(line, flush=True)
 
 
 def _err(line: str) -> None:
+    if _LOG is not None:
+        _LOG.append({"stream": "err", "text": line})
+        return
     print(line, file=sys.stderr, flush=True)
 
 
@@ -84,7 +97,18 @@ def _wrap(text: str, first: str, rest: str, width: int = 100) -> str:
 
 
 def status_text(ctx: Context, state: State) -> str:
+    return "\n".join(_status(ctx, state)[0])
+
+
+def _status(ctx: Context, state: State) -> tuple[list[str], list[str], list[str]]:
+    """(the status lines, the warnings among them, the notes among them) for text and --json."""
     lines = [f"oxp3-tool {__version__}"]
+    warnings: list[str] = []
+    notes: list[str] = []
+
+    def warn(text: str, wrapped: bool = False) -> None:
+        warnings.append(text)
+        lines.append(_wrap(f"warning: {text}", "          ", "          ") if wrapped else f"          warning: {text}")
     dmi = ctx.dmi
     device = f"{dmi.get('sys_vendor') or '?'} {dmi.get('product_name') or '?'}"
     bios = dmi.get("bios_version")
@@ -110,9 +134,9 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append(boot + (", Secure Boot on" if ctx.secure_boot else ""))
     finish = ctx.karg_backend.unfinished()
     if finish:
-        lines.append(f"          warning: oxp3-tool's last boot-entry rebuild did not finish (or is still running): "
-                     f"do not reboot before `sudo {finish}` has ended without errors (this note stays until the "
-                     "next boot, also after that command succeeds)")
+        warn(f"oxp3-tool's last boot-entry rebuild did not finish (or is still running): do not reboot before "
+             f"`sudo {finish}` has ended without errors (this note stays until the next boot, also after that command "
+             "succeeds)")
     backend = ctx.karg_backend
     taken = getattr(backend, "dropin_problem", lambda: None)()
     ids = [f.id for f in ALL_FIXES if (state.get(f.id) or {}).get("kargs") or
@@ -120,22 +144,22 @@ def status_text(ctx: Context, state: State) -> str:
     if taken and taken[0]:
         undo = (f"`sudo oxp3-tool revert {' '.join(ids)}` (it rebuilds the entries)" if ids else
                 f"`sudo rm {backend.dropin}` and `sudo limine-mkinitcpio`")
-        lines.append(f"          warning: {taken[1]}. Undo it now with {undo}, or put your own KERNEL_CMDLINE line "
-                     "back and run `sudo limine-mkinitcpio`, before rebooting or updating")
+        warn(f"{taken[1]}. Undo it now with {undo}, or put your own KERNEL_CMDLINE line back and run "
+             "`sudo limine-mkinitcpio`, before rebooting or updating")
     elif taken:
         owned = set(ctx.owned_kargs) if not ids else set()
         adopt = ids or [f.id for f in ALL_FIXES if getattr(f, "karg", "") in owned]
         again = (f"`sudo oxp3-tool apply {' '.join(adopt)}` rewrites it without those lines" if adopt else
                  f"delete those lines from {backend.dropin} (that kernel is not installed, so nothing needs "
                  "rebuilding)")
-        lines.append(f"          warning: {taken[1]}; {again}")
+        warn(f"{taken[1]}; {again}")
     rootless = getattr(backend, "entries_without_root", lambda: [])()
     if rootless:
-        lines.append(f"          warning: the boot entries of {', '.join(rootless)} have no root=, so booting them "
-                     "fails: do not reboot before " + ("undoing the drop-in above" if taken and taken[0] else
-                                                       "`sudo limine-mkinitcpio` has rebuilt them"))
+        warn(f"the boot entries of {', '.join(rootless)} have no root=, so booting them fails: do not reboot before "
+             + ("undoing the drop-in above" if taken and taken[0] else "`sudo limine-mkinitcpio` has rebuilt them"))
 
     for note in kernel_cmd.status_lines(ctx) if ctx.os_family == CACHYOS else []:
+        (warnings if note.startswith(("warning:", "DO NOT REBOOT")) else notes).append(note)
         lines.append(_wrap(note, "          ", "          "))
 
     ip = ctx.inputplumber
@@ -153,7 +177,7 @@ def status_text(ctx: Context, state: State) -> str:
         what = ", ".join(hhd.active_units) if hhd.running else "installed, not running"
         lines.append(f"          Handheld Daemon: {what}")
     for problem in ip.problems:
-        lines.append(f"          warning: {problem}")
+        warn(problem)
     if ctx.hid_oxp_devices:
         lines.append(f"          hid-oxp bound to {len(ctx.hid_oxp_devices)} MCU interface(s)")
 
@@ -214,12 +238,12 @@ def status_text(ctx: Context, state: State) -> str:
     if game:
         lines.append(f"Game Mode: {game}")
     if ctx.power_key_unhandled:
-        lines.append(_wrap("warning: the power button does nothing in Game Mode: logind ignores it "
-                           "(HandlePowerKey=ignore) and steamos-powerbuttond, which passes it to Steam, is not "
-                           "installed (CachyOS installs it only on handhelds it knows). `sudo pacman -S "
-                           "steamos-powerbuttond`, then reboot", "          ", "          "))
+        warn("the power button does nothing in Game Mode: logind ignores it (HandlePowerKey=ignore) and "
+             "steamos-powerbuttond, which passes it to Steam, is not installed (CachyOS installs it only on handhelds "
+             "it knows). `sudo pacman -S steamos-powerbuttond`, then reboot", wrapped=True)
 
     if state.load_error:
+        warnings.append(state.load_error)
         lines.append("")
         lines.append(f"warning: {state.load_error}")
         lines.append("Which fixes are applied is unknown until that file is fixed or moved aside.")
@@ -245,15 +269,58 @@ def status_text(ctx: Context, state: State) -> str:
         lines.append("This tool only changes anything on a ONEXPLAYER 3 running Bazzite or CachyOS.")
     else:
         lines.append("`sudo oxp3-tool apply` applies the recommended fixes; `oxp3-tool list` explains each one.")
-    return "\n".join(lines)
+    return lines, warnings, notes
+
+
+def status_data(ctx: Context, state: State) -> dict[str, Any]:
+    """`status --json`: what status shows, as data."""
+    lines, warnings, notes = _status(ctx, state)
+    dmi = ctx.dmi
+    fixes = []
+    for fix in ALL_FIXES:
+        label, fix_notes = _fix_state(ctx, state, fix)
+        entry = state.get(fix.id) or {}
+        fixes.append({"id": fix.id, "group": fix.group, "level": fix.level, "title": fix.title,
+                      "summary": fix.summary, "takes_effect": fix.takes_effect, "state": label, "notes": fix_notes,
+                      "applied_at": entry.get("applied_at"), "options": entry.get("options", {})})
+    refresh = ctx.refresh_state if ctx.show_refresh else None
+    return {
+        "device": {"vendor": dmi.get("sys_vendor"), "product": dmi.get("product_name"),
+                   "bios": dmi.get("bios_version"), "supported": ctx.is_oxp3},
+        "os": {"name": ctx.os_release.get("PRETTY_NAME") or ctx.os_release.get("NAME"), "platform": ctx.platform,
+               "handheld": ctx.cachyos_handheld, "image": ctx.image_name, "kernel": ctx.kernel_release},
+        "boot": ctx.karg_backend.name, "secure_boot": ctx.secure_boot,
+        "can_change": ctx.device_ok and ctx.os_ok,
+        "needs_root": ctx.sys.is_real_root and os.geteuid() != 0,
+        "game_mode": ctx.has_game_mode, "game_mode_input": ctx.game_mode_input,
+        "warnings": warnings, "notes": notes, "fixes": fixes,
+        "refresh": {"summary": refresh.summary(), "advice": refresh.advice()} if refresh else None,
+        "text": "\n".join(lines),
+    }
+
+
+def catalog_data() -> dict[str, Any]:
+    """`list --json`: every fix and the button actions."""
+    return {"fixes": [{"id": f.id, "group": f.group, "level": f.level, "title": f.title, "summary": f.summary,
+                       "details": f.details, "takes_effect": f.takes_effect} for f in ALL_FIXES],
+            "button_actions": {name: desc for name, (_, _, desc) in templates.BUTTON_ACTIONS.items()},
+            "fps_limit": {"min": steam_session.MIN_FPS_LIMIT, "max": steam_session.MAX_FPS_LIMIT,
+                          "default": steam_session.DEFAULT_FPS_LIMIT},
+            "min_refresh": {"min": templates.PANEL_MIN_HZ, "max": templates.LEGIONGO2_MIN_HZ}}
 
 
 def cmd_status(ctx: Context, state: State, args: argparse.Namespace) -> int:
+    if getattr(args, "json", False):
+        _RESULT["status"] = status_data(ctx, state)
+        return 0
     _out(status_text(ctx, state))
     return 0
 
 
 def cmd_list(ctx: Context, state: State, args: argparse.Namespace) -> int:
+    if getattr(args, "json", False):
+        _RESULT["catalog"] = catalog_data()
+        return 0
     for fix in ALL_FIXES:
         _out(f"{fix.id}  [{fix.group}, {fix.level}]")
         _out(f"  {fix.title}")
@@ -273,7 +340,7 @@ def cmd_list(ctx: Context, state: State, args: argparse.Namespace) -> int:
 def _confirm(prompt: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
-    if not sys.stdin.isatty():
+    if _LOG is not None or not sys.stdin.isatty():
         _err("Not asking for confirmation on a non-interactive input; pass --yes to proceed.")
         return False
     try:
@@ -291,6 +358,7 @@ def _need_root(system: System) -> Optional[int]:
 
 
 def _report(outcome: Outcome) -> int:
+    _RESULT["outcome"] = dataclasses.asdict(outcome)
     for msg in outcome.messages:
         _out(f"note: {msg}")
     for err in outcome.errors:
@@ -335,8 +403,9 @@ def cmd_apply(ctx: Context, state: State, args: argparse.Namespace) -> int:
     }
     engine = Engine(ctx, state, out=_out)
     plans = engine.plan(fixes, opts)
+    _RESULT["plan"] = engine.describe(plans)
     _out("Planned changes:")
-    for line in engine.describe(plans):
+    for line in _RESULT["plan"]:
         _out(f"  {line}")
     if args.dry_run:
         _out("(dry run: nothing changed)")
@@ -437,6 +506,7 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
         _err(f"error: cannot write {path}: {e.strerror or e}")
         return 1
     _out(f"Wrote {path}")
+    _RESULT["diagnose"] = {"path": os.path.abspath(path), "findings": findings}
     if findings:
         _out("Known problem patterns in the kernel logs (this boot and the previous one):")
         for line in findings:
@@ -451,6 +521,8 @@ def cmd_diagnose(ctx: Context, state: State, args: argparse.Namespace) -> int:
 def cmd_kernel(ctx: Context, state: State, args: argparse.Namespace) -> int:
     action = args.kernel_action
     try:
+        if action is None and getattr(args, "json", False):
+            _RESULT["kernel"] = kernel_cmd.describe_data(ctx)
         return kernel_cmd.cmd_kernel(ctx, action, getattr(args, "package", None), args.yes, args.dry_run, _out,
                                      _confirm)
     except kernel_cmd.KernelError as e:
@@ -472,11 +544,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the ONEXPLAYER 3 / operating system checks (development only)")
     p.add_argument("--root", default="/", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="command")
+    jp = argparse.ArgumentParser(add_help=False)
+    jp.add_argument("--json", action="store_true",
+                    help="print one JSON object (the result, and every line it would print) instead of text")
 
-    sub.add_parser("status", help="show the device, the software stack and each fix's state (default)")
-    sub.add_parser("list", help="explain every fix")
+    sub.add_parser("status", parents=[jp], help="show the device, the software stack and each fix's state (default)")
+    sub.add_parser("list", parents=[jp], help="explain every fix")
 
-    a = sub.add_parser("apply", help="apply the recommended fixes, or the ones named")
+    a = sub.add_parser("apply", parents=[jp], help="apply the recommended fixes, or the ones named")
     a.add_argument("fixes", nargs="*", metavar="FIX")
     a.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
     a.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
@@ -498,24 +573,24 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--defaults", action="store_true",
                    help="ignore the options remembered from the last apply (button actions, --min-refresh)")
 
-    r = sub.add_parser("revert", help="undo fixes applied by this tool")
+    r = sub.add_parser("revert", parents=[jp], help="undo fixes applied by this tool")
     r.add_argument("fixes", nargs="*", metavar="FIX")
     r.add_argument("--all", action="store_true", help="revert everything this tool applied")
     r.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
     r.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
 
-    d = sub.add_parser("diagnose", help="write a diagnostic archive for bug reports")
+    d = sub.add_parser("diagnose", parents=[jp], help="write a diagnostic archive for bug reports")
     d.add_argument("-o", "--output", help="archive path (default: oxp3-diagnose-<time>.tar.gz)")
 
-    k = sub.add_parser("kernel", help="CachyOS with Limine: list the kernels, boot another one once safely, keep it",
+    k = sub.add_parser("kernel", parents=[jp], help="CachyOS with Limine: list the kernels, boot another one once safely, keep it",
                        description="Without an action: the installed kernels and what Limine boots next. `try "
                                    "PACKAGE` boots PACKAGE once; a power-on after that (also after a hang) boots "
                                    "Limine's default entry. `keep` keeps booting the kernel running now.")
     k.set_defaults(kernel_action=None, dry_run=False, yes=False)
     kinds = k.add_subparsers(dest="kernel_action")
-    t = kinds.add_parser("try", help="boot an installed kernel once (no keyboard needed to get back)")
+    t = kinds.add_parser("try", parents=[jp], help="boot an installed kernel once (no keyboard needed to get back)")
     t.add_argument("package", help="the kernel's package, e.g. linux-cachyos-deckify-vsw")
-    keep = kinds.add_parser("keep", help="keep booting the kernel running now (undoes what try changed)")
+    keep = kinds.add_parser("keep", parents=[jp], help="keep booting the kernel running now (undoes what try changed)")
     for kp in (t, keep):
         kp.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
         kp.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
@@ -554,7 +629,26 @@ def acquire_lock(system: System) -> Optional[int]:
 
 
 def main(argv: Optional[Sequence[str]] = None, system: Optional[System] = None) -> int:
+    global _LOG, _RESULT
     args = build_parser().parse_args(argv)
+    if not getattr(args, "json", False):
+        return _main(args, system)
+    _LOG, _RESULT = [], {}
+    rc: Optional[int] = None
+    try:
+        rc = _main(args, system)
+    except Exception as e:  # still one JSON object for the caller
+        _err(f"error: oxp3-tool crashed: {type(e).__name__}: {e}")
+        rc = 1
+    finally:
+        log, result = _LOG, _RESULT
+        _LOG, _RESULT = None, {}
+        print(json.dumps({"schema": 1, "version": __version__, "command": args.command or "status", "rc": rc,
+                          "ok": rc == 0, **result, "log": log}, indent=None), flush=True)
+    return rc if rc is not None else 1
+
+
+def _main(args: argparse.Namespace, system: Optional[System]) -> int:
     if system is None:
         # Simulate commands only for a fake root; any spelling of / is the real system.
         if Path(args.root).resolve() == Path("/"):
