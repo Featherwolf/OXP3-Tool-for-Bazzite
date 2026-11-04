@@ -16,6 +16,7 @@ import { useRunningApp } from "../steam";
 import { syncJob, useCurrentJob, useResource } from "../store";
 import type { Overview, Oxp3Install, Oxp3Status, StatusRes, XessStateRes, XessSummary, XessUpdateCheck } from "../types";
 import { atLeast, cmpVersion, listText, platformName } from "../util";
+import { checkText, offerLabel, repairText, xessOffer } from "../xessoffer";
 
 /** oxp3-tool is there and new enough for --json; otherwise nothing but the install button works. */
 export const oxp3Usable = (i: Oxp3Install | null | undefined) =>
@@ -64,6 +65,7 @@ const StatusSection: FC<{ o: Overview | null; err: string | null; st: Oxp3Status
 
 const Oxp3Section: FC<{ o: Overview; st: StatusRes | undefined; loading: boolean }> = ({ o, st, loading }) => {
   const act = useAction();
+  const inst = useAction();     // its own, so its error shows under it also while oxp3-tool is missing (FE-2)
   const job = useCurrentJob();
   const running = job?.state === "running";
   const i = o.oxp3;
@@ -82,13 +84,14 @@ const Oxp3Section: FC<{ o: Overview; st: StatusRes | undefined; loading: boolean
             : !usable ? `OXP3 Deck needs ${i.min_version} or newer.`
             : status ? `${applied} fix${applied === 1 ? "" : "es"} applied${status.can_change ? "" : " · this system is not supported, so nothing can be changed"}` : loading ? "Reading its status…" : undefined} />
         {offer && (
-          <ButtonItem layout="below" disabled={!!act.busy || running}
-            onClick={() => act.run("oxp3-tool", async () => blockedBy() ?? installOxp3(offer.source, offer.version, offer.update))}
+          <ButtonItem layout="below" disabled={!!inst.busy || !!act.busy || running}
+            onClick={() => inst.run("oxp3-tool", async () => blockedBy() ?? installOxp3(offer.source, offer.version, offer.update))}
             description={explain(`${offer.update ? "Updates" : "Installs"} /usr/local/bin/oxp3-tool${offer.version ? ` to ${offer.version}` : ""} ${offer.source === "bundled" ? "from the copy in this plugin" : "from GitHub"}.`,
               "Takes a few seconds; asks first.")}>
-            {act.busy === "oxp3-tool" ? "Working…" : `${offer.update ? "Update" : "Install"} oxp3-tool`}
+            {inst.busy ? "Working…" : `${offer.update ? "Update" : "Install"} oxp3-tool`}
           </ButtonItem>
         )}
+        <Problem what={offer?.update ? "Update oxp3-tool" : "Install oxp3-tool"} error={inst.busy ? null : inst.error} />
         {usable && st && !st.ok && <Problem what="oxp3-tool status" error={st.error} />}
       </PanelSectionRow>
       {usable && status && (
@@ -99,7 +102,7 @@ const Oxp3Section: FC<{ o: Overview; st: StatusRes | undefined; loading: boolean
               description={explain(f.summary, `Takes effect ${f.takes_effect}.`)} />
           ))}
           {recommended.length > 0 && status.can_change && (
-            <ButtonItem layout="below" disabled={!!act.busy || running}
+            <ButtonItem layout="below" disabled={!!act.busy || !!inst.busy || running}
               onClick={() => act.run("apply", async () => blockedBy() ?? applyFixes(recommended, {}, "Apply the recommended fixes"))}
               description={explain(`Applies ${recommended.length === 1 ? "this fix" : `these ${recommended.length} fixes`}. You see oxp3-tool's plan first.`,
                 recommended.some((f) => /reboot/i.test(f.takes_effect)) ? "Some take effect after a reboot." : undefined)}>
@@ -127,25 +130,27 @@ const XessSection: FC<{ o: Overview }> = ({ o }) => {
   const chk = useResource<XessUpdateCheck>("manual:xess-check", xess_check_update, { skip: true });
   const line = xessLine(o.xess);
   const x = xs.data?.xess ?? null;
-  const latest = chk.data?.ok ? chk.data.latest : x?.latest ?? null;
-  const update = !!o.xess.installed && !!latest && latest !== o.xess.version && (chk.data?.ok ? chk.data.update_available : true);
+  // the button and its confirmation both go by the overview's summary (FE-4); only a newer tag is an update (FE-1)
+  const offer = xessOffer(o.xess.installed, o.xess.version, x, chk.data);
   const busy = !!act.busy || job?.state === "running";
   return (
     <PanelSection title="XeSS XMX">
       <PanelSectionRow>
         <Status ok={line.ok} label={line.label} detail={line.detail} />
-        {!o.xess.installed || update ? (
+        {offer.kind ? (
           <ButtonItem layout="below" disabled={busy}
-            onClick={() => act.run("xess", async () => blockedBy() ?? installXess(x, o.user, latest))}
-            description={explain(o.xess.installed ? `Updates xess-xmx-linux ${o.xess.version ?? ""} to ${latest}.` : "Installs xess-xmx-linux (XeSS super resolution and frame generation on the XMX cores) from GitHub.",
-              "Then log out and back in; asks first.")}>
-            {act.busy === "xess" ? "Working…" : o.xess.installed ? `Update to ${latest}` : "Install XeSS XMX"}
+            onClick={() => act.run("xess", async () => blockedBy() ?? installXess(offer, x, o.user))}
+            description={explain(offer.kind === "update" ? `Updates xess-xmx-linux ${o.xess.version ?? ""} to ${offer.latest}.`
+              : offer.kind === "repair" ? repairText(offer)
+              : "Installs xess-xmx-linux (XeSS super resolution and frame generation on the XMX cores) from GitHub.",
+              offer.kind === "repair" ? "Asks first." : "Then log out and back in; asks first.")}>
+            {act.busy === "xess" ? "Working…" : offerLabel(offer)}
           </ButtonItem>
         ) : (
           <ButtonItem layout="below" disabled={busy || chk.loading}
             onClick={() => act.run("check", async () => { const r = await chk.reload(); return r && !r.ok ? r.error : null; })}
             description={explain("Asks GitHub for the newest xess-xmx-linux release. Changes nothing.",
-              chk.data?.ok ? (chk.data.update_available ? `${chk.data.latest} is available.` : `${chk.data.installed ?? o.xess.version} is the newest.`) : undefined)}>
+              chk.data?.ok ? `${checkText(chk.data, o.xess.installed, o.xess.version)}.` : undefined)}>
             {chk.loading ? "Checking…" : "Check for an update"}
           </ButtonItem>
         )}

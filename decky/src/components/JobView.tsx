@@ -6,6 +6,7 @@ import { FC, useEffect, useRef } from "react";
 import { isClaimed, noteJob, useClaim, useCurrentJob, useJobEnded, useJobPolling } from "../store";
 import type { Job } from "../types";
 import { when } from "../util";
+import { jobNext } from "../xessoffer";
 import { Code, Note, Problem, Status } from "./Hint";
 
 // @decky/api has it only with loader API 2 (Decky 3.3); older loaders get @decky/ui's copy. Chosen once, so the
@@ -61,8 +62,8 @@ export const JobView: FC<{ job?: Job | null; quick?: boolean; lines?: number; on
     const keep = maxLines ?? (quick ? 6 : 0);
     const tail = keep ? lines.slice(-keep) : lines;
     const extra = shown.state === "running" ? [] : resultLines(shown);
-    const reboot = shown.state === "done" && shown.result?.outcome?.reboot_needed;
-    const next = shown.state === "done" && typeof shown.result?.next === "string" ? shown.result.next as string : null;
+    const reboot = shown.state === "done" && (shown.result?.outcome?.reboot_needed || shown.result?.reboot_needed === true);
+    const next = shown.state === "done" ? jobNext(shown.kind, shown.result) : null;
     const path = shown.state === "done" && typeof shown.result?.path === "string" ? shown.result.path as string : null;
     const time = shown.state === "running" ? `since ${when(shown.started)}` : when(shown.ended ?? shown.started);
     return (

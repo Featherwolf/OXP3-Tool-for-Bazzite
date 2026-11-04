@@ -13,7 +13,9 @@ from __future__ import annotations
 import errno
 import os
 import re
+import secrets
 import stat
+import time
 
 from . import sysexec
 
@@ -28,9 +30,17 @@ def user_env(ctx) -> list[str]:
             f"XDG_RUNTIME_DIR={rt}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={rt}/bus"]
 
 
-def run(ctx, argv, *, timeout=None, on_line=None, env_extra=None, cwd=None) -> sysexec.Result:
+def run(ctx, argv, *, timeout=None, on_line=None, env_extra=None, cwd=None, detach=False,
+        on_start=None) -> sysexec.Result:
     """Run argv as the desktop user: runuser -u USER -- /usr/bin/env -i <user_env> [extra] argv. The working
-    folder defaults to the user's home. Refuses to run as root."""
+    folder defaults to the user's home. Refuses to run as root.
+
+    runuser runs the program in a child; both get their own session, so a timeout kills the whole group, not only
+    runuser (the program would carry on, orphaned, after the step was reported failed).
+    detach: stdout and stderr go to a new root-only file in sysexec.run_dir (user-<time>-<hex>.log), followed
+    while the program runs and removed when it ends, so the program outlives the plugin process (a Decky update or
+    plugin reload mid-install): it never writes to a pipe nobody reads, and its EXIT trap runs. Result.out then
+    holds both streams. on_start(pid): called with runuser's pid once it has started."""
     if ctx.uid == 0 or ctx.user in ("", "root"):
         return sysexec.Result(-1, "", f"userexec: the desktop user is {ctx.user or 'unknown'}; not running as root")
     argv = [str(a) for a in argv]
@@ -41,9 +51,17 @@ def run(ctx, argv, *, timeout=None, on_line=None, env_extra=None, cwd=None) -> s
         if not _VAR.match(str(k)):
             return sysexec.Result(-1, "", f"userexec: bad variable name {k!r}")
         extra.append(f"{k}={v}")
+    output_file = None
+    if detach:
+        try:
+            output_file = os.path.join(sysexec.run_dir(ctx),
+                                       f"user-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.log")
+        except OSError as e:
+            return sysexec.Result(-1, "", f"userexec: cannot use {ctx.sys_path(sysexec.RUN_DIR)}: {e.strerror or e}")
     runuser = sysexec.which("runuser") or "runuser"
     full = [runuser, "-u", ctx.user, "--", "/usr/bin/env", "-i", *user_env(ctx), *extra, *argv]
-    return sysexec.run(full, timeout=timeout, on_line=on_line, cwd=cwd or ctx.home)
+    return sysexec.run(full, timeout=timeout, on_line=on_line, cwd=cwd or ctx.home, start_new_session=True,
+                       output_file=output_file, on_start=on_start)
 
 
 def open_dir(path: str) -> int:

@@ -51,7 +51,7 @@ def fixture(name):
         return f.read()
 
 
-def fake_tool(version="0.4.0"):
+def fake_tool(version="0.4.1"):
     return FAKE_TOOL.replace("@VERSION@", version if " " in version or not version[:1].isdigit()
                              else "oxp3-tool " + version).encode()
 
@@ -86,7 +86,7 @@ class Base(unittest.TestCase):
         self.answers = {"list": {"stdout": fixture("list.json")}}
         self.install_tool()
 
-    def install_tool(self, version="0.4.0", path=None):
+    def install_tool(self, version="0.4.1", path=None):
         path = path or os.path.join(self.bindir, "oxp3-tool")
         with open(path, "wb") as f:
             f.write(fake_tool(version))
@@ -116,8 +116,8 @@ class Base(unittest.TestCase):
 class FindAndVersionTest(Base):
     def test_installed(self):
         inst = oxp3tool.installed(self.ctx)
-        self.assertEqual(inst, {"installed": True, "path": os.path.join(self.bindir, "oxp3-tool"), "version": "0.4.0",
-                                "json_ok": True, "min_version": "0.4.0", "bundled_version": None})
+        self.assertEqual(inst, {"installed": True, "path": os.path.join(self.bindir, "oxp3-tool"), "version": "0.4.1",
+                                "json_ok": True, "min_version": "0.4.1", "bundled_version": None})
 
     def test_version_is_cached_until_the_file_changes(self):
         real = sysexec.run
@@ -144,8 +144,33 @@ class FindAndVersionTest(Base):
         self.assertEqual((inst["version"], inst["json_ok"], inst["bundled_version"]), ("0.3.9", False, "0.4.1"))
         r = self.run_cmd(oxp3tool.status)
         self.assertFalse(r["ok"])
-        self.assertIn("needs 0.4.0 or newer", r["error"])
+        self.assertIn("needs 0.4.1 or newer", r["error"])
         self.assertEqual(self.calls(), [])
+
+    def test_the_early_040_build_is_too_old_and_the_bundled_copy_is_offered(self):
+        # OXP-1: commit 7fbcb93's 0.4.0 has --json but none of button_keys, min_refresh.default, fix pending,
+        # reboot_pending; the plugin must not run it, and must offer its own copy although the online check (in that
+        # window) also said 0.4.0.
+        self.install_tool("0.4.0")
+        bundled = os.path.join(self.ctx.plugin_dir, "bin", "oxp3-tool")
+        os.makedirs(os.path.dirname(bundled))
+        self.install_tool("0.4.1", bundled)
+        inst = oxp3tool.installed(self.ctx)
+        self.assertEqual((inst["version"], inst["json_ok"], inst["min_version"], inst["bundled_version"]),
+                         ("0.4.0", False, "0.4.1", "0.4.1"))
+        for fn in (oxp3tool.status, oxp3tool.catalog):
+            r = self.run_cmd(fn)
+            self.assertFalse(r["ok"])
+            self.assertIn("version 0.4.0 is installed; OXP3 Deck needs 0.4.1 or newer", r["error"])
+        self.assertEqual(self.calls(), [])
+
+        def get_text(url, timeout=30, max_bytes=2_000_000):
+            return json.dumps([{"sha": "c" * 40}]) if url == oxp3tool.COMMITS_API else '__version__ = "0.4.0"\n'
+
+        with mock.patch.object(downloads, "get_text", get_text):
+            r = oxp3tool.update_check(self.ctx, self.settings)
+        self.assertEqual((r["ok"], r["installed"], r["bundled"], r["online"], r["update"]),
+                         (True, "0.4.0", "0.4.1", "0.4.0", "bundled"))
 
     def test_find_order_and_trust(self):
         local = os.path.join(self.bindir, "oxp3-tool")
@@ -405,6 +430,7 @@ class InstallTest(Base):
     def setUp(self):
         super().setUp()
         self.dest = os.path.join(self.bindir, "oxp3-tool")
+        self.install_tool("0.4.0")   # the early 0.4.0 build (too old, OXP-1) that the bundled 0.4.1 replaces
         self.bundled = os.path.join(self.ctx.plugin_dir, "bin", "oxp3-tool")
         os.makedirs(os.path.dirname(self.bundled))
         self.put_bundled("0.4.1")
@@ -458,12 +484,14 @@ class InstallTest(Base):
         self.assertEqual(self.read_dest(), fake_tool("0.4.0"))
 
     def test_version_gate(self):
-        for version, why in (("0.3.9", "it is oxp3-tool 0.3.9; OXP3 Deck needs 0.4.0 or newer"),
+        self.install_tool("0.3.0")   # differs from every refused copy below, so a write would show
+        for version, why in (("0.3.9", "it is oxp3-tool 0.3.9; OXP3 Deck needs 0.4.1 or newer"),
+                             ("0.4.0", "it is oxp3-tool 0.4.0; OXP3 Deck needs 0.4.1 or newer"),   # OXP-1
                              ("hello world", "the file is not oxp3-tool: hello world")):
             self.put_bundled(version)
             r, _ = self.install()
             self.assertEqual(r["error"], "install: " + why)
-            self.assertEqual(self.read_dest(), fake_tool("0.4.0"))
+            self.assertEqual(self.read_dest(), fake_tool("0.3.0"))
         r, _ = self.install("elsewhere")
         self.assertIn("source must be 'bundled' or 'online'", r["error"])
 
@@ -546,7 +574,7 @@ class InstallTest(Base):
 class UpdateCheckTest(Base):
     def check(self, installed, bundled, online="0.4.0", fail=False):
         inst = {"installed": installed is not None, "path": None, "version": installed, "json_ok": True,
-                "min_version": "0.4.0", "bundled_version": bundled}
+                "min_version": "0.4.1", "bundled_version": bundled}
         fetched = []
 
         def get_text(url, timeout=30, max_bytes=2_000_000):
@@ -609,6 +637,26 @@ class MarkerTest(Base):
         os.makedirs(os.path.dirname(sd), exist_ok=True)
         open(sd, "w").close()
         self.assertEqual(oxp3tool.rebuild_unfinished(self.ctx), "sdboot-manage gen")
+
+    def test_tool_running(self):
+        """RT-2: oxp3-tool's own lock (cli.py acquire_lock: LOCK_EX for the whole run) says whether it runs."""
+        import fcntl
+        lock = self.ctx.sys_path(oxp3tool.TOOL_LOCK)
+        self.assertFalse(oxp3tool.tool_running(self.ctx))           # no lock file: nothing ever ran
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        self.addCleanup(os.close, fd)
+        self.assertFalse(oxp3tool.tool_running(self.ctx))
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)               # a run holds it
+        self.assertTrue(oxp3tool.tool_running(self.ctx))
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.assertFalse(oxp3tool.tool_running(self.ctx))
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)               # the probe left no lock behind
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.rename(lock, lock + ".real")
+        os.symlink(lock + ".real", lock)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertFalse(oxp3tool.tool_running(self.ctx))           # not through a link
 
 
 if __name__ == "__main__":

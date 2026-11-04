@@ -73,10 +73,10 @@ const FixRow: FC<{ f: Oxp3Fix; c: Oxp3CatalogFix | undefined; cat: Oxp3Catalog |
             detail={`${STATE_TEXT[f.state] ?? f.state}${f.applied_at ? ` (${f.applied_at})` : ""}. ${f.pending ? PENDING_TEXT[f.pending] + " " : ""}${f.summary}.`} />
           {!!f.notes.length && <Note>{f.notes.map((n, i) => <div key={i}>{n}</div>)}</Note>}
           {f.id === "oled-profile" && cat && canApply && (
-            <SliderField label="Lowest refresh rate" value={minRefresh ?? Number(f.options?.min_refresh ?? cat.min_refresh.default)}
+            <SliderField label="Lowest refresh rate" value={minRefresh ?? Number(f.options?.min_refresh ?? cat.min_refresh.default ?? cat.min_refresh.max)}
               min={cat.min_refresh.min} max={cat.min_refresh.max} step={1} showValue valueSuffix=" Hz" disabled={disabled}
               onChange={setMinRefresh}
-              description={explain(`The lowest refresh rate the display profile offers Game Mode (default ${cat.min_refresh.default} Hz; below that is untested).`,
+              description={explain(`The lowest refresh rate the display profile offers Game Mode (default ${cat.min_refresh.default ?? cat.min_refresh.max} Hz; below that is untested).`,
                 "Used when you tap Apply below; takes effect the next time Game Mode starts.")} />
           )}
           {f.id === "nvme-resume" && canApply && !appliedLike && f.state !== "recommended" && (

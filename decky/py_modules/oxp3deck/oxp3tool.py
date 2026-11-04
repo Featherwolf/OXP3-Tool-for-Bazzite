@@ -9,6 +9,7 @@ Everything here returns {ok, error, ...} and does not raise for expected failure
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -25,7 +26,9 @@ from . import context, downloads, sysexec, userexec
 
 log = logging.getLogger("oxp3deck")
 
-MIN_VERSION = (0, 4, 0)
+# 0.4.1: an early 0.4.0 build (commit 7fbcb93, served by get.sh for a while) has --json but no button_keys,
+# min_refresh.default, fix pending, status reboot_pending / rebuild_unfinished; it must read as too old.
+MIN_VERSION = (0, 4, 1)
 MIN_VERSION_TEXT = ".".join(map(str, MIN_VERSION))
 LOCK = threading.Lock()          # held by every oxp3-tool run and by install
 
@@ -34,7 +37,7 @@ SHELL = "/bin/sh"
 INSTALL_PATH = "/usr/local/bin/oxp3-tool"
 SYSTEM_PATHS = (INSTALL_PATH, "/usr/bin/oxp3-tool")
 OLD_LIB_DIR = "/usr/local/lib/oxp3-tool"            # where an older install.sh put it (get.sh removes it)
-RUN_DIR = "/run/oxp3deck"                             # oxp3-tool's output files; root only
+RUN_DIR = sysexec.RUN_DIR                             # /run/oxp3deck: oxp3-tool's output files; root only
 REBUILD_MARKER = "/run/oxp3-tool-boot-entries-unfinished"   # oxp3_tool/kargs.py REBUILD_MARKER
 # What kargs.py names when the marker is empty (its backends' finish_command), by the tool that is installed.
 FINISH_COMMANDS = (("/usr/bin/limine-mkinitcpio", "limine-update"), ("/usr/bin/sdboot-manage", "sdboot-manage gen"),
@@ -144,27 +147,9 @@ def installed(ctx) -> dict:
 
 
 def _run_dir(ctx) -> str:
-    """ctx.sys_path(RUN_DIR), created 0700. Refused when it is a symlink or someone else's folder (the owner check is
-    against our own uid, which is root in the plugin). Raises OSError."""
-    path = ctx.sys_path(RUN_DIR)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    try:
-        os.mkdir(path, 0o700)
-    except FileExistsError:
-        pass
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError as e:
-        raise OSError(f"{path} is not a folder (a symlink?): {e.strerror or e}") from e
-    try:
-        st = os.fstat(fd)
-        if st.st_uid != os.geteuid():
-            raise OSError(f"{path} belongs to uid {st.st_uid}, not to root")
-        if stat.S_IMODE(st.st_mode) != 0o700:
-            os.fchmod(fd, 0o700)
-    finally:
-        os.close(fd)
-    return path
+    """ctx.sys_path(RUN_DIR), created 0700 (sysexec.run_dir, the same folder: the xess scripts' output files go there
+    too). Refused when it is a symlink or someone else's folder. Raises OSError."""
+    return sysexec.run_dir(ctx)
 
 
 def _new_file(path: str) -> None:
@@ -554,6 +539,28 @@ def rebuild_unfinished(ctx) -> str | None:
     return "limine-update"
 
 
+TOOL_LOCK = "/run/oxp3-tool.lock"   # oxp3_tool/cli.py LOCK_FILE: every root run holds it (LOCK_EX) while it runs
+
+
+def tool_running(ctx) -> bool:
+    """Whether a root oxp3-tool run holds its lock now: one a job started before the plugin restarted (it runs in
+    its own session and outlives the plugin), or one from a terminal. The probe takes a shared lock for an instant
+    and drops it; no lock file means nothing runs. Never raises."""
+    try:
+        fd = os.open(ctx.sys_path(TOOL_LOCK), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)   # drops the shared lock
+
+
 # ---- updates ------------------------------------------------------------------------------------------------------
 
 
@@ -693,7 +700,7 @@ def _put_binary(ctx, data: bytes) -> str:
 
 def install(ctx, settings, job, source) -> dict:
     """Install or update /usr/local/bin/oxp3-tool from the plugin's copy ("bundled") or from GitHub ("online"),
-    the way get.sh does: checked sha256, `python3 -I FILE --version` must say oxp3-tool 0.4.0 or newer, then an
+    the way get.sh does: checked sha256, `python3 -I FILE --version` must say oxp3-tool 0.4.1 or newer, then an
     atomic replace, the old /usr/local/lib/oxp3-tool removed, restorecon. {ok, error, version, path, source}."""
     if source not in ("bundled", "online"):
         return _fail(f"install: source must be 'bundled' or 'online', not {source!r}")

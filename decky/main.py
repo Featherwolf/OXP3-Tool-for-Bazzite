@@ -55,8 +55,14 @@ UI_KEY = re.compile(r"^ui_[A-Za-z0-9_]{1,60}$")
 MAX_SETTING_BYTES = 4096
 MAX_UI_KEYS = 64
 REBOOT_KEY = "oxp3_reboot_pending"   # settings.json: {boot_id, value} from the last oxp3-tool status
-NO_OXP3 = {"installed": False, "path": None, "version": None, "json_ok": False, "min_version": "0.4.0",
-           "bundled_version": None}
+OXP3_STILL_RUNNING = ("the plugin restarted while oxp3-tool was running; it may still be running: read the status "
+                      "when it has ended")
+# oxp3tool.py's files in /run/oxp3deck: <cmd>-<date>-<time>-<hex>.out/.err of a run, oxp3-diagnose-...tar.gz
+OXP3_OUTPUT = re.compile(r"[a-z][a-z0-9-]*-\d{8}-\d{6}-[0-9a-f]{6}\.(?:out|err|tar\.gz)")
+# userexec.run(detach=True)'s output file of an xess-xmx-linux script there: user-<date>-<time>-<hex>.log
+SCRIPT_OUTPUT = re.compile(r"user-\d{8}-\d{6}-[0-9a-f]{6}\.log")
+NO_OXP3 = {"installed": False, "path": None, "version": None, "json_ok": False, "min_version": "0.4.1",
+           "bundled_version": None}   # min_version: oxp3tool.MIN_VERSION_TEXT (a test keeps them equal)
 
 
 class Unavailable(Exception):
@@ -70,10 +76,17 @@ def _mod(name: str):
     return mod
 
 
+def _sendable(value):
+    """value as Decky can send it: JSON types only (anything else as its str), and text that encodes as UTF-8. A
+    lone surrogate (a file name that is not UTF-8, as os.scandir gives it) becomes "?": Decky's own encode would
+    fail, no answer would be written and the frontend's call would never settle."""
+    return json.loads(json.dumps(value, default=str, ensure_ascii=False).encode("utf-8", "replace"))
+
+
 def _answer(name: str, res) -> dict:
     if not isinstance(res, dict):
         return {"ok": False, "error": f"{name}: returned {type(res).__name__}, not a dict"}
-    res = json.loads(json.dumps(res, default=str))   # what Decky can send
+    res = _sendable(res)
     res["ok"] = bool(res.get("ok"))
     res.setdefault("error", None)
     return res
@@ -135,6 +148,30 @@ class Plugin:
         except Exception as e:
             self._broken = f"{type(e).__name__}: {e}"
             log.error("OXP3Deck cannot start:\n%s", traceback.format_exc())
+            return
+        self._after_restart()
+
+    def _after_restart(self) -> None:
+        """What an earlier plugin process left (here, before Decky serves any call, so no new oxp3-tool run can
+        start in between). Its oxp3-tool run has its own session and output files, so it outlives the plugin: while
+        oxp3-tool's lock is held, an interrupted oxp3-tool job says it may still be running; once nothing holds it,
+        the run's leftover output files in /run/oxp3deck go. The same for a detached xess-xmx-linux script's output
+        file once that script has ended (xess.script_running): nobody follows it any more."""
+        try:
+            tool = _mod("oxp3tool")
+            if tool.tool_running(self.ctx):
+                for job in self.jobs.interrupted:
+                    if job.kind.startswith("oxp3-") and job.kind != "oxp3-install":   # install runs no oxp3-tool
+                        self.jobs.set_error(job, OXP3_STILL_RUNNING)
+            else:
+                sysexec.remove_files(self.ctx, OXP3_OUTPUT)
+        except Exception:
+            log.error("start-up tidy-up failed (carrying on):\n%s", traceback.format_exc())
+        try:
+            if _mod("xess").script_running(self.ctx) is None:
+                sysexec.remove_files(self.ctx, SCRIPT_OUTPUT)
+        except Exception:
+            log.error("start-up tidy-up of script output failed (carrying on):\n%s", traceback.format_exc())
 
     # ---- plumbing ------------------------------------------------------------------------------------------------
 
@@ -149,10 +186,10 @@ class Plugin:
             res = await asyncio.get_running_loop().run_in_executor(None, functools.partial(fn, *args))
             return _answer(name, res)
         except Unavailable as e:
-            return {"ok": False, "error": f"{name}: {e}"}
+            return _answer(name, {"ok": False, "error": f"{name}: {e}"})   # the text can hold a path
         except Exception as e:
             log.error("%s failed:\n%s", name, traceback.format_exc())
-            return {"ok": False, "error": f"{name}: {type(e).__name__}: {e}"}
+            return _answer(name, {"ok": False, "error": f"{name}: {type(e).__name__}: {e}"})
 
     async def _start(self, name: str, kind: str, title: str, work, precheck=None) -> dict:
         """Start work(job) as a job: {ok, error, job}. precheck() -> why not (or None) runs first, so a bad
@@ -209,7 +246,11 @@ class Plugin:
         log.info("system Protons lost the shim: %s", f"job {job.id}" if job else why)
 
     async def _unload(self):
-        # Decky kills the process 5 s after asking it to stop; a running job's program keeps running.
+        # Decky kills the process 5 s after asking it to stop, and a running job's own steps end with it. The
+        # programs it started do not: oxp3-tool and the xess-xmx-linux scripts (userexec detach) have their own
+        # session and write to files in /run/oxp3deck, so they run to their end, EXIT traps included. A short
+        # helper (cp, rm, the unpacker) keeps running too but loses its output pipe. The job shows as interrupted
+        # at the next start (_after_restart).
         log.info("OXP3Deck unloading")
 
     async def _uninstall(self):
@@ -369,6 +410,14 @@ class Plugin:
         running = self.jobs.running()
         if running is not None:
             return {"ok": False, "error": f"reboot: {running.title} is running; reboot when it has ended"}
+        if _mod("oxp3tool").tool_running(self.ctx):   # e.g. an apply that outlived a plugin restart
+            return {"ok": False, "error": "reboot: oxp3-tool is still running; reboot when it has ended"}
+        # RS-3: an install.sh (uninstall.sh, switch-driver.sh) from before a plugin restart: no job of ours follows it,
+        # and a reboot would cut it off half done
+        what = _mod("xess").script_running(self.ctx) if xess is not None else None   # not loaded: nothing to ask
+        if what:
+            return {"ok": False, "error": f"reboot: an xess-xmx-linux script is still running ({what}); reboot when "
+                                          "it has ended"}
         finish = _mod("oxp3tool").rebuild_unfinished(self.ctx)
         if finish:
             return {"ok": False, "error": f"reboot: do not reboot: oxp3-tool's boot-entry rebuild did not finish; "
@@ -385,7 +434,7 @@ class Plugin:
         try:
             if self._broken or _setting_key_error(key):
                 return None
-            return self.settings.get(key)
+            return _sendable(self.settings.get(key))   # settings.json is the user's file: "\udc93" is valid JSON
         except Exception:
             log.error("get_setting failed:\n%s", traceback.format_exc())
             return None

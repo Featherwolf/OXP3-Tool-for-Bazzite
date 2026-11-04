@@ -141,17 +141,23 @@ class World:
 class FakeUser:
     """Stands in for userexec.run. Records every call; runs mkdir, rm, mv, cp and the python3 unpack for real (on
     the test's temporary folders); answers systemctl from `session_env` / `units`, and `bash SCRIPT` from
-    `scripts` (full path or basename -> fn(argv, cwd) -> Result)."""
+    `scripts` (full path or basename -> fn(argv, cwd) -> Result), other systemctl verbs from `systemctl`
+    (verb -> fn(argv) -> Result, else rc 0). `spawn`: fn(argv) -> (pid, end) of a fake process for a script run with
+    on_start; on_start gets the pid before the script's fn runs, and end() is called after it."""
 
     def __init__(self):
         self.calls = []
         self.scripts = {}
+        self.systemctl = {}
+        self.spawn = None
         self.session_env = None     # text of show-environment, or None for "no bus"
         self.units = None           # text of `systemctl --user show ...`
 
-    def __call__(self, ctx, argv, *, timeout=None, on_line=None, env_extra=None, cwd=None):
+    def __call__(self, ctx, argv, *, timeout=None, on_line=None, env_extra=None, cwd=None, detach=False,
+                 on_start=None):
         argv = [str(a) for a in argv]
-        self.calls.append({"argv": argv, "cwd": cwd, "timeout": timeout, "streamed": on_line is not None})
+        self.calls.append({"argv": argv, "cwd": cwd, "timeout": timeout, "streamed": on_line is not None,
+                           "detach": detach})
         prog = argv[0]
         if prog in ("mkdir", "rm", "mv", "cp"):
             r = subprocess.run(argv, capture_output=True, text=True, cwd=cwd or ctx.home, stdin=subprocess.DEVNULL)
@@ -167,10 +173,20 @@ class FakeUser:
                     sysexec.Result(1, "", "Failed to connect to bus")
             if verb == "show":
                 return sysexec.Result(0, self.units, "") if self.units is not None else sysexec.Result(1, "", "no")
+            if verb in self.systemctl:
+                return self.systemctl[verb](argv)
             return sysexec.Result(0, "", "")
         if prog == "bash":
             fn = self.scripts.get(argv[1]) or self.scripts.get(os.path.basename(argv[1]))
-            r = fn(argv, cwd) if fn else sysexec.Result(0, f"ran {argv[1]}\n", "")
+            end = None
+            if on_start is not None and self.spawn is not None:
+                pid, end = self.spawn(argv)
+                on_start(pid)
+            try:
+                r = fn(argv, cwd) if fn else sysexec.Result(0, f"ran {argv[1]}\n", "")
+            finally:
+                if end is not None:
+                    end()
             if on_line:
                 for line in r.out.splitlines():
                     on_line(line)

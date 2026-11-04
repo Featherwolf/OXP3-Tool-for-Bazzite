@@ -43,7 +43,7 @@ folder.
 ## First steps
 
 1. Open **OXP3 Deck** in Quick Access. **Status** shows the device and the system.
-2. If oxp3-tool is missing or too old (the plugin needs 0.4.0 or later), tap **Install** or **Update**. It puts
+2. If oxp3-tool is missing or too old (the plugin needs 0.4.1 or later), tap **Install** or **Update**. It puts
    oxp3-tool at `/usr/local/bin/oxp3-tool`, where `get.sh` puts it, so `sudo oxp3-tool` keeps working in Konsole.
 3. Tap **Apply** under the recommended fixes. It shows the plan and asks first. If a fix needs a reboot, a
    **Reboot** button appears.
@@ -62,7 +62,7 @@ folder.
 - **Status:** the device and OS. A red **Do not reboot** line when oxp3-tool could not finish rebuilding the boot
   entries. **Reboot to finish** when a change waits for a reboot. The running task and its last log line.
 - **oxp3-tool:** Install or Update when it is missing or old. The recommended fixes not applied yet, with Apply.
-- **XeSS:** the driver status (is the patched driver in use, is a re-login needed) and Install or Update.
+- **XeSS:** the driver status (is the patched driver in use, is a re-login needed) and Install, Update or Repair.
 - **This game** (only while a game runs): the XeSS launch options as dropdowns, and advice for that game.
 - **More:** the full page, with these tabs.
 
@@ -73,8 +73,8 @@ show the plan first.
 That applies the `buttons` fix, and `xbox-key` too when your Xbox key needs its helper.
 
 **XeSS:** the installed version and folder, the driver check, the default Mesa driver for all games, Install,
-Update and Uninstall. Also the system Protons and whether they have the shim, missing tools, and old package folders
-you can remove.
+Update, Repair and Uninstall. Also the system Protons and whether they have the shim, missing tools, downloads
+`install.sh` could not fetch, and old package folders you can remove.
 
 **Games:** the running game, or the last one. The same options as the quick panel, plus the full advice: the XeSS
 version in the game's folder, which Proton it uses, and what its last run logged (XMX, a fallback to DP4a, a kernel
@@ -103,13 +103,20 @@ tasks with their logs.
 - **Each release gets its own folder** in `~/.local/share/oxp3deck/xess/`, such as `xess-xmx-linux-20261104`.
   Unpacking over the old folder would break the driver that Steam and games have loaded.
 - **An update** runs the old folder's `uninstall.sh`, then the new folder's `install.sh`, both as your user. Then
-  log out and back in.
+  log out and back in. The compiler and the SDKs are copied from the old folder when the new release downloads the
+  same versions (from 20261031 to 20261104 that saves the compiler's 95 MB).
 - **The old folder stays** until after that re-login, because Steam still uses its driver until then. The XeSS page
-  lists it under old package folders, with a button to remove it.
+  lists it under old package folders, with a button to remove it; not while it has the only compiler (the new
+  folder's download failed). A git checkout, or a folder not named `xess-xmx-linux-<tag>` that the plugin did not
+  install, is yours to delete.
 - **A hand install** such as `~/Documents/xess-xmx-linux-20261031` is adopted: the plugin shows it, and updates it
   the same way. Its folder is kept like any old folder.
-- **Your default Mesa driver is kept.** Each release brings its own default. The plugin remembers your choice and
-  sets it again after an update.
+- **Update** is offered only for a release newer than the installed one. **Repair** runs `install.sh` of the
+  installed release again in its folder, with nothing uninstalled, when the plugin finds it unfinished (for
+  example the compiler download failed); the button says why.
+- **Your default Mesa driver is kept** when you chose it on the XeSS page. Each release brings its own default. The
+  plugin remembers your choice and sets it again after an update. A driver switched by hand with
+  `tools/switch-driver.sh` is not carried over: pick it on the XeSS page once.
 - **System Protons** such as CachyOS's `proton-cachyos-native` and `proton-cachyos-slr` live in
   `/usr/share/steam/compatibilitytools.d`, where `install.sh` cannot write. Games on them would stay on DP4a. The
   plugin adds the shim to them as root at the end of Install and Update, and when you tap the button on the XeSS
@@ -141,7 +148,8 @@ next start. No re-login is needed.
 - Keep a frame limit on with frame generation, or the generated frames reach the screen unevenly.
 - Everything else in the launch options stays as you wrote it: wrappers such as `gamemoderun`, other variables, and
   the game's own arguments. Options without `%command%` are game arguments, so the plugin writes
-  `VARIABLES %command% ARGUMENTS`. A `%command` without its closing `%` is shown as a warning.
+  `VARIABLES %command% ARGUMENTS`, with each argument in quotes where the shell would read it otherwise
+  (`-name (Player One)` becomes `-name '(Player' 'One)'`). A `%command` without its closing `%` is shown as a warning.
 
 ## What it never does
 
@@ -163,10 +171,17 @@ next start. No re-login is needed.
   `~/oxp3-diagnose-<time>.tar.gz`. Attach it to an issue.
 - **Do not reboot** (red): a boot-entry rebuild did not finish. Reboot only after the command the warning names has
   run without errors. See [CachyOS](https://github.com/Featherwolf/OXP3-Tool-for-Bazzite#cachyos).
+- **A task shows "interrupted"** after Decky or the plugin restarted or was updated: the plugin stopped following
+  it, but what it started (oxp3-tool, install.sh, uninstall.sh) runs to its end. Open the page again when it has
+  ended to see the result. The plugin does not reboot while oxp3-tool still runs, and the XeSS buttons wait while
+  such an xess-xmx-linux script still runs (the XeSS page says so).
 - **Re-login needed:** XeSS was installed or updated, but Steam still runs with the old driver settings. Log out and
   back in, or reboot.
 - **XeSS driver check failed:** the XeSS page shows the line from `~/.cache/xess-xmx/driver-status`.
-  `journalctl --user -u xess-xmx-check` has the details.
+  `journalctl --user -u xess-xmx-check` has the details. When the new driver fails that check at the end of an
+  install or update, the plugin runs the check again at once: it switches to the package's other driver, or to the
+  system's stock driver (XeSS on DP4a). When an install or update ends with "Reboot (not just log out)", that did not
+  work: reboot, because the check runs again at boot, and after only a log-out Game Mode may not start.
 - **Steam from Flathub** (Flatpak) is not supported by xess-xmx-linux. The XeSS page says so.
 - **The panel shows an error or does not load:** restart Decky with `sudo systemctl restart plugin_loader`, or
   reboot.
@@ -191,7 +206,7 @@ Tests:
 
 ```bash
 python3 -m unittest discover -s tests -t . -v
-node --experimental-strip-types --test tests/js/*.test.mjs   # launch options (Node 22.6 or later)
+node --experimental-strip-types --test tests/js/*.test.mjs   # launch options, xess offers (Node 22.6+, python3, sh)
 pnpm typecheck
 ```
 

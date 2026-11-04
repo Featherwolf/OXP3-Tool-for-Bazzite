@@ -89,6 +89,7 @@ class Jobs:
         self._jobs: dict[str, Job] = {}
         self._running: Job | None = None
         self._saved_at: dict[str, float] = {}
+        self.interrupted: list[Job] = []   # the jobs _load found running: a plugin restart cut them short
         try:
             # Decky made RUNTIME_DIR and gives it to the user: no link the user planted above it is followed
             fd = userexec.open_dir(runtime_dir)
@@ -103,16 +104,25 @@ class Jobs:
         self._load()
 
     def _load(self) -> None:
-        if os.path.islink(self.dir):     # the user owns RUNTIME_DIR: do not list another folder as root
-            log.warning("jobs: %s is a symlink; old jobs are not shown", self.dir)
+        # The user owns RUNTIME_DIR: the folder is opened without following a link they planted (above it or at
+        # jobs/ itself), and it is listed and its files read through that descriptor, never by path again.
+        try:
+            dfd = context._open_folder(self.dir)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            log.warning("jobs: cannot open %s (a symlink?): %s; old jobs are not shown", self.dir, e)
             return
         try:
-            names = [n for n in os.listdir(self.dir) if n.endswith(".json") and not n.startswith(".")]
+            names = [n for n in os.listdir(dfd) if n.endswith(".json") and not n.startswith(".")]
+            raws = {n: context.read_small(n, 4_000_000, dir_fd=dfd) for n in names}
         except OSError:
             return
+        finally:
+            os.close(dfd)
         loaded = []
         for n in names:
-            raw = context.read_small(os.path.join(self.dir, n), 4_000_000)
+            raw = raws[n]
             try:
                 d = json.loads(raw.decode("utf-8")) if raw is not None else None
             except ValueError:
@@ -125,6 +135,7 @@ class Jobs:
                 job.error = INTERRUPTED
                 job.ended = job.ended or time.time()
                 self._save(job)
+                self.interrupted.append(job)
             loaded.append(job)
         loaded.sort(key=lambda j: j.started)
         for job in loaded[-KEEP_JOBS:]:
@@ -145,10 +156,24 @@ class Jobs:
             self._save(job)
 
     def _remove_file(self, job_id: str) -> None:
+        # Relative to a folder opened without following a link: a jobs/ the user swapped for a symlink since the
+        # load must not make root delete <id>.json somewhere else.
         try:
-            os.unlink(os.path.join(self.dir, job_id + ".json"))
+            dfd = context._open_folder(self.dir)
+        except OSError:
+            return
+        try:
+            os.unlink(job_id + ".json", dir_fd=dfd)
         except OSError:
             pass
+        finally:
+            os.close(dfd)
+
+    def set_error(self, job: Job, error: str) -> None:
+        """Change an ended job's error text (and save it): main.py words an interrupted oxp3-tool job."""
+        with job._lock:
+            job.error = error
+        self._save(job)
 
     def start(self, kind: str, title: str, fn) -> tuple[Job | None, str | None]:
         """Run fn(job) -> dict in a thread. Returns (job, None), or (None, why) when another job is running."""

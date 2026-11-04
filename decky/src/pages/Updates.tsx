@@ -9,6 +9,7 @@ import { JobView, TaskSection } from "../components/JobView";
 import { useCurrentJob, useResource } from "../store";
 import type { Job, JobListRes, Overview, Oxp3UpdateCheck, XessStateRes, XessUpdateCheck } from "../types";
 import { when } from "../util";
+import { checkText, offerLabel, repairText, xessOffer } from "../xessoffer";
 import { oxp3Offer, oxp3Usable } from "./Quick";
 
 const JobRow: FC<{ j: Job }> = ({ j }) => {
@@ -57,8 +58,10 @@ export const UpdatesTab: FC = () => {
   const offline = oxp3Offer(i);
   const offer = check?.update ? { source: check.update, version: check.update === "online" ? check.online : check.bundled, update: !!i?.installed }
     : offline && (!oxp3Usable(i) || !check) ? offline : null;
-  const xLatest = xc.data?.ok ? xc.data.latest : x?.latest ?? null;
-  const xUpdate = !!x?.installed && !!xLatest && xLatest !== x.version && (xc.data?.ok ? xc.data.update_available : true);
+  // without xess_state the overview's summary says what is installed (FE-4); only a newer tag is an update (FE-1)
+  const xInstalled = x ? x.installed : !!o?.xess.installed;
+  const xVersion = x ? x.version : o?.xess.version ?? null;
+  const xOffer = xessOffer(xInstalled, xVersion, x, xc.data);
 
   return (
     <>
@@ -96,14 +99,16 @@ export const UpdatesTab: FC = () => {
           <ButtonItem layout="below" disabled={xc.loading || running}
             onClick={() => xes.run("check", async () => { const r = await xc.reload(); return r && !r.ok ? r.error : null; })}
             description={explain("Asks GitHub for the newest release. Changes nothing.",
-              xc.data?.ok ? `${xc.data.update_available ? `${xc.data.latest} is available` : "Up to date"} (checked ${when(xc.data.checked_at)}).${xc.data.note ? ` ${xc.data.note}` : ""}` : undefined)}>
+              xc.data?.ok ? `${checkText(xc.data, xInstalled, xVersion)} (checked ${when(xc.data.checked_at)}).${xc.data.note ? ` ${xc.data.note}` : ""}` : undefined)}>
             {xc.loading ? "Checking…" : "Check for an update"}
           </ButtonItem>
-          {(xUpdate || (x && !x.installed)) && (
+          {xOffer.kind && (x || o) && (
             <ButtonItem layout="below" disabled={running || !!xes.busy}
-              onClick={() => xes.run("install", async () => blockedBy() ?? installXess(x, o?.user ?? null, xLatest))}
-              description={explain(x?.installed ? `Updates ${x.version ?? ""} to ${xLatest}.` : "Installs the newest release.", "Then log out and back in; asks first.")}>
-              {xes.busy === "install" ? "Working…" : x?.installed ? `Update to ${xLatest}` : "Install XeSS XMX"}
+              onClick={() => xes.run("install", async () => blockedBy() ?? installXess(xOffer, x, o?.user ?? null))}
+              description={explain(xOffer.kind === "update" ? `Updates ${xVersion ?? ""} to ${xOffer.latest}.`
+                : xOffer.kind === "repair" ? repairText(xOffer) : "Installs the newest release.",
+                xOffer.kind === "repair" ? "Asks first." : "Then log out and back in; asks first.")}>
+              {xes.busy === "install" ? "Working…" : offerLabel(xOffer)}
             </ButtonItem>
           )}
           <Problem what="xess-xmx-linux" error={xes.error} />

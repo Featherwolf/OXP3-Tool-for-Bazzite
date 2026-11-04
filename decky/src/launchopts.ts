@@ -90,7 +90,34 @@ export const unquote = (w: string): string => {
 };
 
 /** A value as a shell word: plain when it is safe, else in single quotes. */
-const quote = (v: string): string => (/^[A-Za-z0-9._:,+/@%-]+$/.test(v) ? v : `'${v.replace(/'/g, "'\\''")}'`);
+const quote = (v: string): string => (/^[A-Za-z0-9._:,+/@%=-]+$/.test(v) ? v : `'${v.replace(/'/g, "'\\''")}'`);
+
+/** Every quote in the word is closed (tokenize runs an unclosed one to the end of the text). */
+const closed = (w: string): boolean => {
+  for (let i = 0; i < w.length; i++) {
+    if (w[i] === "'") {
+      i = w.indexOf("'", i + 1);
+      if (i < 0) return false;
+    } else if (w[i] === "\"") {
+      i++;
+      while (i < w.length && w[i] !== "\"") i += w[i] === "\\" ? 2 : 1;
+      if (i >= w.length) return false;
+    } else if (w[i] === "\\") {
+      i++;
+    }
+  }
+  return true;
+};
+
+/**
+ * Game arguments written without %command% (Steam passed them to the game as they are), as literal shell words to
+ * put behind %command%: with %command% Steam runs the line through a shell, where ( ) $ & ; * and quotes are syntax.
+ * Quotes group words as before ("Player One" stays one argument); with an unclosed quote every word is taken as it is.
+ */
+const literalArgs = (s: string): string => {
+  const words = tokenize(s).map((t) => t.raw);
+  return (words.every(closed) ? words.map(unquote) : s.split(/\s+/).filter(Boolean)).map(quote).join(" ");
+};
 
 export const parse = (str: string): Parsed => {
   const s = str ?? "";
@@ -121,7 +148,8 @@ export const managed = (p: Parsed): Partial<Record<ManagedKey, string>> => {
 
 /**
  * Set (a string) or remove (null or "") managed variables; every other token keeps its place and quoting. Text
- * without %command% is the game's arguments, so the result is "VARS %command% ARGS". Nothing left but %command%
+ * without %command% is the game's arguments, so the result is "VARS %command% ARGS", each argument quoted as a
+ * literal word (literalArgs). Nothing left but %command%
  * gives "". A "%command" typo is left alone (the string comes back unchanged): fixTypo() is the user's choice.
  */
 export const setManaged = (str: string, changes: Partial<Record<ManagedKey, string | null>>): string => {
@@ -130,7 +158,7 @@ export const setManaged = (str: string, changes: Partial<Record<ManagedKey, stri
   if (p.typo && !p.hasCommand) return s;
   let tokens = p.tokens.slice();
   const command = p.hasCommand ? p.command : COMMAND;
-  const after = p.after;
+  const after = p.hasCommand ? p.after : literalArgs(p.after);
   let changed = false;
   for (const [key, value] of Object.entries(changes) as [ManagedKey, string | null | undefined][]) {
     if (value === undefined) continue;

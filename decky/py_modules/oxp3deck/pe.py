@@ -3,11 +3,11 @@
 Same rule as xess-xmx-linux's tools/proton-hook.py version(), which decides what XESS=latest swaps: the signature
 0xFEEF04BD, then dwStrucVersion, dwFileVersionMS and dwFileVersionLS. A hit whose dwStrucVersion is 0x00010000 is
 preferred, so a stray copy of the four bytes earlier in the file is skipped. Game DLLs reach 50 MB and more, so the
-file is mapped (or read in chunks), never loaded whole.
+file is read in 4 MB chunks, never loaded whole. It is not mapped: a page that cannot be read (a worn microSD card,
+a card pulled out, a file that shrinks) would kill the whole root backend with SIGBUS, where read() gives OSError.
 """
 from __future__ import annotations
 
-import mmap
 import os
 import stat
 
@@ -32,19 +32,6 @@ def _pick(hits: list[tuple[int, int, int]]) -> str | None:
     return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
 
 
-def _scan_mapped(m) -> list[tuple[int, int, int]]:
-    hits = []
-    i = m.find(SIGNATURE)
-    while i >= 0 and len(hits) < MAX_HITS:
-        f = _fields(m, i)
-        if f is not None:
-            hits.append(f)
-            if f[0] == STRUC_VERSION:
-                break
-        i = m.find(SIGNATURE, i + 1)
-    return hits
-
-
 def _scan_chunks(fd: int) -> list[tuple[int, int, int]]:
     hits = []
     tail = b""
@@ -60,7 +47,7 @@ def _scan_chunks(fd: int) -> list[tuple[int, int, int]]:
             if f is None:
                 break        # the fields continue in the next chunk: keep this hit in the tail
             hits.append(f)
-            if f[0] == STRUC_VERSION:
+            if f[0] == STRUC_VERSION or len(hits) >= MAX_HITS:   # one chunk can hold a million copies
                 return hits
             last = i
             i = buf.find(SIGNATURE, i + 1)
@@ -79,12 +66,7 @@ def file_version(path: str) -> str | None:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size < 16:
             return None
-        try:
-            with mmap.mmap(fd, 0, access=mmap.ACCESS_READ) as m:
-                return _pick(_scan_mapped(m))
-        except (OSError, ValueError, OverflowError):
-            os.lseek(fd, 0, os.SEEK_SET)
-            return _pick(_scan_chunks(fd))
+        return _pick(_scan_chunks(fd))
     except (OSError, ValueError, OverflowError):
         return None
     finally:

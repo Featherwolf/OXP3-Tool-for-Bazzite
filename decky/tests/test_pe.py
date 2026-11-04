@@ -67,8 +67,8 @@ class FileVersionTest(unittest.TestCase):
             f.write(fixed_info(2, 0, 2, 68))
         self.assertEqual(pe.file_version(p), "2.0.2.68")
 
-    def test_chunked_fallback_across_boundaries(self):
-        with mock.patch.object(mmap, "mmap", side_effect=OSError("no mmap here")):
+    def test_chunks_across_boundaries(self):
+        with mock.patch.object(mmap, "mmap", side_effect=AssertionError("mapped")):   # never mapped (SIGBUS)
             for chunk in (16, 17, 23, 64, 4096):
                 for offset in range(0, 40, 3):
                     with self.subTest(chunk=chunk, offset=offset), mock.patch.object(pe, "CHUNK", chunk):
@@ -77,6 +77,32 @@ class FileVersionTest(unittest.TestCase):
                             f.write(b"\xbd" * offset + struct.pack("<IIII", 0xFEEF04BD, 7, 0x00010001, 0x00010001)
                                     + b"x" * offset + fixed_info(1, 3, 2, 10) + b"\0" * 5)
                         self.assertEqual(pe.file_version(p), "1.3.2.10")
+
+    def test_a_file_full_of_signatures_stops_at_max_hits(self):
+        """RS-2: MAX_HITS bounds the hits of one chunk too (a 4 MB chunk of signatures held ~1M of them)."""
+        p = os.path.join(self.d, "full.dll")
+        with open(p, "wb") as f:
+            f.write(fixed_info(9, 8, 7, 6, struc=7)[:16] * (1 << 16) + fixed_info(1, 2, 3, 4))   # 1 MB, then a good one
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            self.assertEqual(len(pe._scan_chunks(fd)), pe.MAX_HITS)
+        finally:
+            os.close(fd)
+        self.assertEqual(pe.file_version(p), "9.8.7.6")     # the first hit, as before (proton-hook.py's rule)
+
+    def test_read_error_is_no_version(self):
+        """An unreadable sector (EIO) answers None; a mapped file would have killed the backend with SIGBUS."""
+        p = fake_dll(os.path.join(self.d, "libxess.dll"))
+        real = os.read
+
+        def failing(fd, n):
+            if n == pe.CHUNK:
+                raise OSError(5, "Input/output error")
+            return real(fd, n)
+
+        with mock.patch.object(os, "read", failing):
+            self.assertIsNone(pe.file_version(p))
+        self.assertEqual(pe.file_version(p), "2.0.1.41")
 
 
 if __name__ == "__main__":

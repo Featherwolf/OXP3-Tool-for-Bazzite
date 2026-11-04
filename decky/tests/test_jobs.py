@@ -138,6 +138,44 @@ class JobsTest(unittest.TestCase):
         self.assertIsNone(again.running())
         self.assertEqual(again.get(None), j)
         self.assertEqual([x.id for x in again.recent()], [cut["id"], job.id])
+        self.assertEqual(again.interrupted, [j])
+        again.set_error(j, "worded again")
+        self.assertEqual((j.error, self.saved(j)["error"]), ("worded again", "worded again"))
+        self.assertEqual(Jobs(self.tmp.name).interrupted, [])      # saved as failed: not cut short twice
+
+    def test_linked_job_file_not_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            outside = os.path.join(d, "x.json")
+            with open(outside, "w") as f:
+                json.dump({"id": "x", "kind": "k", "title": "secret", "state": "done", "started": 1}, f)
+            os.symlink(outside, os.path.join(self.tmp.name, "jobs", "x.json"))
+            self.assertIsNone(Jobs(self.tmp.name).get("x"))
+
+    def test_deletes_do_not_follow_a_swapped_jobs_folder(self):
+        """SEC-1: the user swaps jobs/ for a symlink after the load; pruning the oldest job must not make root
+        delete <id>.json in the folder the link points at."""
+        folder = os.path.join(self.tmp.name, "jobs")
+        for i in range(jobs.KEEP_JOBS):
+            jid = "intel_icd.x86_64" if i == 0 else f"planted-{i}"
+            with open(os.path.join(folder, jid + ".json"), "w") as f:
+                json.dump({"id": jid, "kind": "k", "title": "t", "state": "done", "started": i + 1}, f)
+        js = Jobs(self.tmp.name)
+        self.assertIsNotNone(js.get("intel_icd.x86_64"))
+        victim = os.path.join(self.tmp.name, "icd.d")
+        os.mkdir(victim)
+        open(os.path.join(victim, "intel_icd.x86_64.json"), "w").close()
+        os.rename(folder, folder + ".moved")
+        os.symlink(victim, folder)
+        with self.assertLogs("oxp3deck", "WARNING"):      # the saves are refused too
+            js.start("k", "t", lambda job: {"ok": True})
+            wait_idle(js)
+        self.assertIsNone(js.get("intel_icd.x86_64"))     # dropped from memory
+        self.assertEqual(os.listdir(victim), ["intel_icd.x86_64.json"])
+        os.unlink(folder)
+        os.rename(folder + ".moved", folder)
+        js.start("k", "t", lambda job: {"ok": True})        # the real folder: pruned as before
+        wait_idle(js)
+        self.assertNotIn("planted-1.json", os.listdir(folder))
 
     def test_linked_jobs_folder_not_read(self):
         with tempfile.TemporaryDirectory() as d:

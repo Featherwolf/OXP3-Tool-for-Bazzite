@@ -225,6 +225,14 @@ class RealBuildTest(unittest.TestCase):
         self.assertEqual(self.zf.read("OXP3Deck/bin/oxp3-tool.sha256").decode().split(),
                          [hashlib.sha256(tool).hexdigest(), "oxp3-tool"])
 
+    def test_bundled_tool_is_new_enough(self):
+        """OXP-1: the plugin offers its own copy when the installed one is older than MIN_VERSION; a copy below it
+        would be offered and then refused by the install's own version gate."""
+        from oxp3deck import oxp3tool
+        version = load_builder()._tool_version(self.zf.read("OXP3Deck/bin/oxp3-tool"))
+        self.assertGreaterEqual(oxp3tool.parse_version(version), oxp3tool.MIN_VERSION, version)
+        self.assertIn(f"with oxp3-tool {version}", self.stdout[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 // Tests for src/launchopts.ts. Run from decky/: node --experimental-strip-types --test tests/js/*.test.mjs
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 
 import { driverPrefix, fixTypo, fsrSupported, managed, parse, setManaged } from "../../src/launchopts.ts";
@@ -29,6 +30,41 @@ test("empty and plain options", () => {
 test("text without %command% is game arguments", () => {
   assert.equal(setManaged("-dx11 -novid", { XESS: "dp4a" }), "XESS=dp4a %command% -dx11 -novid");
   assert.equal(setManaged("-dx11", { XESS: null }), "-dx11");
+  assert.equal(setManaged("  -width 1280 +exec x.cfg -screen-height=720 ", { XESS_FG: "3" }),
+    "XESS_FG=3 %command% -width 1280 +exec x.cfg -screen-height=720");
+});
+
+// FE-3: once %command% is in the line Steam runs it through a shell, so the old arguments must stay literal words
+test("game arguments moved behind %command% stay literal", () => {
+  // [the old text, the new line, the words the game gets]
+  const cases = [
+    ["-name (Player One)", "XESS_FG=3 %command% -name '(Player' 'One)'", ["-name", "(Player", "One)"]],
+    ["-password $ecret", "XESS_FG=3 %command% -password '$ecret'", ["-password", "$ecret"]],
+    ["-connect host&port", "XESS_FG=3 %command% -connect 'host&port'", ["-connect", "host&port"]],
+    ["-a;reboot", "XESS_FG=3 %command% '-a;reboot'", ["-a;reboot"]],
+    ["-mods=* -x <in >out |cat `id` $(id)", "XESS_FG=3 %command% '-mods=*' -x '<in' '>out' '|cat' '`id`' '$(id)'",
+      ["-mods=*", "-x", "<in", ">out", "|cat", "`id`", "$(id)"]],
+    ["-name \"Player One\" 'two words'", "XESS_FG=3 %command% -name 'Player One' 'two words'", ["-name", "Player One", "two words"]],
+    ["-name Jörg -城市 ~ #x !y", "XESS_FG=3 %command% -name 'Jörg' '-城市' '~' '#x' '!y'", ["-name", "Jörg", "-城市", "~", "#x", "!y"]],
+    ["-say it's", "XESS_FG=3 %command% -say 'it'\\''s'", ["-say", "it's"]],        // unclosed quote: every word as it is
+    ["-x \"a b", "XESS_FG=3 %command% -x '\"a' b", ["-x", "\"a", "b"]],
+    ["-empty \"\"", "XESS_FG=3 %command% -empty ''", ["-empty", ""]],
+  ];
+  for (const [before, line, words] of cases) {
+    assert.equal(setManaged(before, { XESS_FG: "3" }), line, before);
+    assert.equal(parse(line).hasCommand, true, line);
+    // what a shell makes of the arguments behind %command%: exactly these words, nothing run, nothing expanded
+    const args = line.slice(line.indexOf("%command%") + "%command%".length);
+    const out = execFileSync("/bin/sh", ["-c", `printf '%s\\0' ${args}`], { encoding: "utf8", cwd: "/" });
+    assert.deepEqual(out.split("\0").slice(0, -1), words, line);
+  }
+});
+
+test("arguments after an existing %command% are never requoted", () => {
+  const s = "%command% -name (Player One) $X \"a b\"";
+  assert.equal(setManaged(s, { XESS: "latest" }), "XESS=latest %command% -name (Player One) $X \"a b\"");
+  assert.equal(setManaged("XESS=dp4a gamemoderun %command% -a;b", { XESS: "latest" }), "XESS=latest gamemoderun %command% -a;b");
+  assert.equal(setManaged("XESS=dp4a %command% it's", { XESS: null }), "%command% it's");
 });
 
 test("removing the last managed variable leaves nothing", () => {

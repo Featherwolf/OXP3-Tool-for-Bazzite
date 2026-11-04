@@ -12,13 +12,16 @@ from it (credited in CREDITS.md). It runs on CachyOS (Handheld Edition and deskt
 ## Rules
 
 - **The plugin adds no logic of its own to what oxp3-tool does.** Every fix, state and check comes from
-  `oxp3-tool <command> --json` (oxp3-tool 0.4.0 or later), run as root by the backend. The plugin is a front end.
+  `oxp3-tool <command> --json` (oxp3-tool 0.4.1 or later; an early 0.4.0 build lacks fields the plugin reads),
+  run as root by the backend. The plugin is a front end.
 - **xess-xmx-linux scripts run as the desktop user**, never as root (`runuser -u <user>`), with a minimal
   environment (`env -i` + HOME, USER, LOGNAME, PATH, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS): its 20261031
   install.sh runs `systemctl --user import-environment` with no names, which would copy Decky's variables into the
   user's session.
 - **Every backend call returns a dict** `{ok: bool, error: str|null, ...}` and never raises: Decky loses the message
-  of a Python exception on its way to the frontend.
+  of a Python exception on its way to the frontend. Answers (and get_setting's value) pass through main.py's
+  `_sendable`: JSON types only, and text that is not UTF-8 (a lone surrogate from a file name) becomes "?", since
+  Decky drops an answer it cannot encode and the frontend's call then never settles.
 - **Nothing blocks the asyncio loop**: subprocesses and downloads run in an executor thread.
 - **Long work is a job** (see Jobs): oxp3-tool apply/revert (a Limine rebuild can take minutes), xess install,
   update, uninstall, oxp3-tool update, diagnose, kernel try/keep. One job at a time; oxp3-tool also allows only one
@@ -29,7 +32,8 @@ from it (credited in CREDITS.md). It runs on CachyOS (Handheld Edition and deskt
 - **Root never writes through a link the user planted.** Decky gives the settings, data and log folders (and the
   home) to the user at every load. settings.json and the job files are written with `context.write_atomic`, which
   walks the folders above with `userexec.open_dir` (a symlink is followed only when root owns it and the folder it
-  sits in, like `/home -> var/home` on Bazzite) and opens the last one with O_NOFOLLOW; files in the home are
+  sits in, like `/home -> var/home` on Bazzite) and opens the last one with O_NOFOLLOW (old job files are listed,
+  read and removed through that same kind of folder descriptor, never by path again); files in the home are
   created by `userexec.write_new` (O_EXCL, O_NOFOLLOW, owned by the user) or by the user (`userexec.run`,
   `user_mkdirs`); downloads go into a root-only `mkdtemp`.
 - **`_uninstall` undoes nothing**: Decky runs it on every update of the plugin too. Uninstalling oxp3-tool or
@@ -46,7 +50,8 @@ main.py                class Plugin: one async method per frontend call, thin
 py_modules/oxp3deck/
   env.py               clean_env(), restore of Decky's *_ORIG variables
   context.py           Ctx (the desktop user, Decky's folders, a fake root for tests), settings.json
-  sysexec.py           run a program with clean_env(), stdin /dev/null, output streamed line by line
+  sysexec.py           run a program with clean_env(), stdin /dev/null, output streamed line by line (from pipes,
+                       or from a root-only file it writes to); /proc start times of a pid
   tls.py               SSL context with the system CA bundle (adapted from ClawDeck)
   userexec.py          run as the desktop user with a minimal environment (adapted from ClawDeck)
   downloads.py         GitHub release lookup, download, safe extract (adapted from ClawDeck)
@@ -62,20 +67,24 @@ src/                   frontend (TypeScript, @decky/ui)
   store.ts             cached answers per key, the current job and its polling
   actions.tsx          the confirm-then-start flows (apply, revert, installs, reboot)
   launchopts.ts        parse and change the managed launch-option variables (pure, tested under node)
+  xessoffer.ts         what the xess install button offers (install / update / repair; release tags ordered as
+                       xess.tag_key) and what its confirmation says (pure, tested under node)
   steam.ts             the running game, launch options through SteamClient
   pages/, components/  the quick panel, the full page's tabs, shared rows (Hint, JobView, GameControls, ...)
 tests/                 unittest, with a stub `decky` module and fake roots; fixtures/oxp3: real oxp3-tool --json
                        output (tests/make_fixtures.py regenerates it from the repository's CLI); js/: node tests
-                       of launchopts.ts; test_main.py also checks that api.ts and main.py name the same methods and
-                       that main.py calls the real modules' functions with arguments they take
+                       of launchopts.ts and xessoffer.ts; test_main.py also checks that api.ts and main.py name the
+                       same methods and that main.py calls the real modules' functions with arguments they take
 tools/build_zip.py     assembles OXP3Deck.zip from dist/ and the backend files
 ```
 
 State the plugin keeps: `DECKY_PLUGIN_SETTINGS_DIR/settings.json` (the xess keys listed under the install job,
 `oxp3_online` {version, commit, checked_at} of the last online check, `oxp3_reboot_pending` {boot_id, value} from
 the last status or change, and the frontend's `ui_*` keys), `DECKY_PLUGIN_RUNTIME_DIR/jobs/<id>.json` (job state
-and logs, the newest 30). oxp3-tool's output files and the diagnose archive pass through `/run/oxp3deck` (0700,
-root's). Nothing inside the plugin folder (an update deletes it).
+and logs, the newest 30). oxp3-tool's output files, the xess-xmx-linux scripts' output (`user-*.log`) and the
+diagnose archive pass through `/run/oxp3deck` (0700, root's); oxp3-tool's that a plugin stop left behind are removed
+at the next start once oxp3-tool's lock is free, a script's `user-*.log` once no xess-xmx-linux script from before the
+restart runs (`xess-script.json`). Nothing inside the plugin folder (an update deletes it).
 
 ## Backend API (main.py)
 
@@ -98,7 +107,7 @@ get_overview(): {
   do_not_reboot: string | null,                 // oxp3-tool's unfinished boot-entry rebuild (/run marker)
 }
 type Oxp3Install = { installed: boolean, path: string|null, version: string|null, json_ok: boolean,
-                     min_version: "0.4.0", bundled_version: string|null }
+                     min_version: "0.4.1", bundled_version: string|null }
 type XessSummary = { installed: boolean, version: string|null, status: "ok"|"failed"|"unknown", line: string|null,
                      live: boolean, relogin_needed: boolean }
 ```
@@ -168,14 +177,17 @@ type Oxp3Kernel = { conf: string, kernels: {package, release, running, entry, us
 xess_state(): { ok, error, xess: XessState }
 xess_check_update(): { ok, error, installed: string|null, latest: string|null, update_available: boolean,
                        checked_at: number, note: string|null }    // note: e.g. "version unknown"
-xess_install(): JobStart              // install, or update to the newest release (new folder; old one uninstalled)
+xess_install(): JobStart              // install, or update to the newest release (new folder; old one uninstalled),
+                                      // or repair (install.sh again in the installed folder); never a downgrade
 xess_uninstall(): JobStart            // uninstall.sh of the installed package (keeps the folder)
 xess_set_driver(prefix: string): { ok, error, drivers: XessDriver[], output?: string[] }
                                       // tools/switch-driver.sh PREFIX
 xess_shim_system_protons(): { ok, error, done: string[], failed: string[], already: string[], notes: string[] }
                                       // root: proton-cachyos-* shim
 xess_remove_folder(path: string): { ok, error, removed?: string }   // an old package folder (listed in
-                                      // old_folders, in the home), only when nothing uses it any more
+                                      // old_folders, in the home, named xess-xmx-linux-<tag> or the plugin's own,
+                                      // not a git checkout), only when nothing uses it any more and it does not
+                                      // hold the only compiler (igc/)
 
 type XessDriver = { version: string, default: boolean }
 type XessState = {
@@ -197,25 +209,44 @@ type XessState = {
   system_protons_need_shim: boolean,    // shimmed before (xess_shim_system), and a package update undid it
   user_protons: { name: string, path: string, shimmed: boolean, hook: boolean }[],
   missing_tools: string[],              // curl, ar, tar, zstd, sha256sum, cmp, python3; "vulkaninfo (optional)"
-  old_folders: string[],                // earlier package folders that can be removed after a re-login
+  old_folders: string[],                // earlier package folders that can be removed after a re-login; one with a
+                                        // compiler is left out while the installed package has none
   flatpak_steam: boolean,
-  latest: string|null, checked_at: number|null,   // from the last update check
+  latest: string|null, checked_at: number|null,   // from the last update check; latest only when it is newer
+                                        // than the installed release (xess.newer; any other tag when either cannot
+                                        // be ordered), or when nothing is installed
+  update_available: boolean,            // latest is set and something is installed
+  missing_downloads: string[],          // "igc", "xess", "ffx": the package has tools/get-<piece>.sh, not its files
+                                        // (install.sh only prints a line when a download fails, and exits 0)
+  repair: string|null,                  // no newer release, a known version, but install.sh should run again in
+                                        // this folder, and why: a missing download, the environment file names
+                                        // another folder, the driver check line is missing or for another folder
+                                        // (a run cut short), the check unit is missing, the driver check failed
+  script_running: string|null,          // a package script an earlier plugin process started and that still runs
   features: { fsr: boolean, alt_driver_store: boolean },   // FSR=xess (tools/fsr-fg.sh), INTC_ALT_... (20261104+)
 }
 ```
 
-The install job's result: `{ ok, error, tag, package_dir, previous, relogin_needed, next, warnings: string[],
-notes: string[], status }`, or `{ ok: true, up_to_date: true, ... }`; on an install.sh failure `rolled_back`. The
-uninstall job's: `{ ok, error, package_dir, restored: string[] (system Protons given their stock file back),
-warnings, relogin_needed: true, next }`. `next` is the re-login line the frontend shows under the finished job.
-At start-up (`_main`) a job `xess-reshim` shims the system Protons again when `system_protons_need_shim`. Its
-steps (xess.py): refuse while a game runs, with only Flatpak Steam, or without the tools; the newest tag (same tag
-with an ok driver check: up to date; same tag otherwise: install.sh again in that folder, nothing downloaded);
+The install job's result: `{ ok, error, tag, package_dir, previous, relogin_needed, reboot_needed, next, warnings:
+string[], notes: string[], status }`, or `{ ok: true, up_to_date: true, ... }`; on an install.sh failure
+`rolled_back`. The uninstall job's: `{ ok, error, package_dir, restored: string[] (system Protons given their stock
+file back), warnings, relogin_needed: true, next }`. `next` is the re-login line the frontend shows under the
+finished job (a reboot line, with `reboot_needed: true`, when the new driver failed its check and the fallback is
+not in place). At start-up (`_main`) a job `xess-reshim` shims the system Protons again when
+`system_protons_need_shim`. Its steps (xess.py): refuse while a game runs, with only Flatpak Steam, or without the
+tools; the newest tag (the installed tag, or a newer installed one: up to date when `repair` has nothing to say,
+else install.sh again in that folder after copying a missing `igc/` / `xess/` / `ffx/` from an old folder as below,
+nothing downloaded; an installed release newer than the newest with nothing to repair is refused, nothing changed);
 download into a root-only `mkdtemp` (no checksum is published); unpack as the user into
 `~/.local/share/oxp3deck/xess/xess-xmx-linux-<tag>` (exec bits from the archive); copy `igc/`, `xess/`, `ffx/` from
-the old package when the new release's `get-igc.sh` / `get-xess.sh` / `get-ffx.sh` is byte-identical; stop the shim
-watcher; the old `uninstall.sh`; the new `install.sh` (rolled back with the old `install.sh` on failure); the stored
-driver (`switch-driver.sh`); the system Protons as root; settings. Settings it keeps: `xess_package`, `xess_tag`,
+the old package when the new release's `get-igc.sh` / `get-xess.sh` / `get-ffx.sh` is byte-identical or pins the
+same downloads (IGC_TAG and NEO_TAG, the same in 20261031 and 20261104; XESS_TAG, XESS_SHA256 and LIBS; FFX_TAG and
+each file's checksum); stop the shim watcher; the old `uninstall.sh`; the new `install.sh` (rolled back with the old
+`install.sh` on failure); a warning per piece install.sh could not download; the stored driver
+(`switch-driver.sh`); the system Protons as root; settings; when the driver check failed, `systemctl --user restart
+xess-xmx-check.service` (the unit is active since boot, so a log-out would not run it again): session-check.sh then
+switches to the package's other driver or points the user manager at the stock drivers, and `next` asks for a
+reboot only when neither happened. Settings it keeps: `xess_package`, `xess_tag`,
 `xess_old_folders`, `xess_installed_at`, `xess_uninstalled_at`, `xess_driver`, `xess_shim_system`, `xess_latest`,
 `xess_checked_at`.
 
@@ -261,7 +292,9 @@ Launch options are read and written by the **frontend** (`SteamClient.Apps.Regis
 The frontend offers `FSR` / `FSR_FG` only when the installed package is 20261104 or newer (its tag, or
 `features.fsr`), or when they are set already.
 
-Options without `%command%` are game arguments: the plugin writes `VARS %command% ARGS`. A `%command` without the
+Options without `%command%` are game arguments: the plugin writes `VARS %command% ARGS`, each argument as a literal
+shell word (`-name (Player One)` becomes `-name '(Player' 'One)'`), since Steam runs a line with `%command%` through a
+shell. Quotes group words as before; with an unclosed quote every word is taken as it is. A `%command` without the
 closing `%` is shown as a warning.
 
 ### Jobs and misc
@@ -278,14 +311,34 @@ get_setting(key: string): any; set_setting(key: string, value: any): { ok, error
 
 Settings the frontend may read and write: `xess_driver` (a Mesa prefix such as "26.3", or null),
 `xess_shim_system` (boolean) and `ui_*` keys (at most 64, each a JSON value of up to 4 KB); any other key reads as
-null and is refused. `reboot()` is refused while a job runs or a boot-entry rebuild is unfinished. xess_set_driver,
+null and is refused. `reboot()` is refused while a job runs, an oxp3-tool run holds `/run/oxp3-tool.lock` (one that
+outlived a plugin restart, or one from a terminal), an xess-xmx-linux script from before a plugin restart still runs
+(`xess.script_running`) or a boot-entry rebuild is unfinished. xess_set_driver,
 xess_shim_system_protons and xess_remove_folder are refused while an xess job runs.
 
 Jobs run in an executor thread, one at a time (a second start returns `ok: false`, "another task is running").
 Their log is the job's own lines plus, for xess-xmx-linux scripts, the script's output as it arrives. A job's state
 is written to `RUNTIME_DIR/jobs/<id>.json` when it starts, every few seconds while it logs, and when it ends; one
-that was running when the plugin stopped is shown as failed ("interrupted") at the next start. oxp3-tool and xess
-scripts started by a job are never killed.
+that was running when the plugin stopped is shown as failed ("interrupted (the plugin restarted)") at the next start,
+an oxp3-tool job whose run still holds oxp3-tool's lock as "the plugin restarted while oxp3-tool was running; it may
+still be running: read the status when it has ended".
+
+A plugin stop (Decky kills the process 5 s after asking) ends the job's own steps, not the programs it started:
+oxp3-tool and the xess-xmx-linux scripts (install.sh, uninstall.sh, switch-driver.sh: `userexec.run(...,
+detach=True)`) run in their own session with stdout and stderr going to a new root-only file in `/run/oxp3deck`
+instead of a pipe, so they never die of SIGPIPE and run to their end, EXIT traps included; the plugin follows that
+file while it lives and removes it when the program ends. A file is not slowed down by its reader like a pipe: it
+is emptied when a read reaches its end past 8 MB, and emptied unread at 16 MB (a program that writes faster than
+its lines are logged; one line says output was skipped). Short helpers (cp, rm, mv, the unpacker, systemctl) keep
+their pipes. Every program run as the user gets its own session, so a timeout kills runuser's child too, not only
+runuser. While an xess-xmx-linux script runs, `/run/oxp3deck/xess-script.json` (root's, 0600, written through the
+folder's descriptor) names it with runuser's pid, its /proc start time and the plugin process; it is removed when the
+script ends. After a plugin restart, while that process still runs (same pid and start time), xess_install,
+xess_uninstall, xess_set_driver, xess_shim_system_protons and xess_remove_folder answer `ok: false` ("an
+xess-xmx-linux script from before the plugin restarted is still running (...); try again when it has ended"),
+`reboot()` too, `xess_state.script_running` names it, and the start-up re-shim does not run. The record is read,
+checked and removed under one lock, and removed only while it is still the one read (or written), so a thread that
+finds an old record ended cannot remove the live one a job has written since.
 
 ## Frontend
 
@@ -294,7 +347,9 @@ scripts started by a job are never killed.
     button when a change waits for a reboot; the running job with its last log line.
   - oxp3-tool: install/update button when missing or outdated; recommended fixes not applied yet, with "Apply
     recommended" (confirm first).
-  - XeSS: status line (driver, live, re-login needed), Install / Update button.
+  - XeSS: status line (driver, live, re-login needed), Install / Update / Repair button (xessoffer.ts: Update only
+    to a release tag newer than the installed one, from the overview's summary or a check tapped in this session;
+    Repair, install.sh again for the same release, when `xess_state` says `repair`, with its reason).
   - This game (only while a game runs): XeSS options as dropdowns writing the launch options, the advice lines.
   - "More" button → full page.
 - **Full page** (`/oxp3deck/<tab>`, SidebarNavigation): Fixes, Buttons, XeSS, Games, Kernel (CachyOS + Limine
@@ -303,16 +358,20 @@ scripts started by a job are never killed.
     shows the dry-run plan.
   - Buttons: one dropdown per key (actions from the catalog), the frame-limit value, "Apply layout" (applies
     `buttons`, and `xbox-key` when the Xbox key needs its helper).
-  - XeSS: version, driver status, default Mesa driver dropdown, Install / Update / Uninstall, system Protons,
-    missing tools, old folders.
+  - XeSS: version, driver status, a package script from before a plugin restart that still runs (`script_running`:
+    the xess buttons wait for it), default Mesa driver dropdown, Install / Update / Repair / Uninstall, system
+    Protons, missing tools, downloads install.sh could not fetch (`missing_downloads`), old folders. The install
+    confirmation says what the job will do: an update uninstalls the old package first; the default Mesa driver is
+    promised back only when one was chosen in OXP3 Deck (`preferred_driver`); the system Protons get the shim as root.
   - Games: the running game, or the last one; same controls as the quick panel plus the full advice and last-run
     details.
   - Kernel: installed kernels, next boot, Try (boot once) / Keep.
   - Updates & logs: oxp3-tool and xess versions with update checks, diagnose archive, the last jobs and their logs.
 - **Jobs on screen** (components/JobView.tsx): the job a control started shows under that control, any other one at
   the top of the tab; once it ends, its result's lines follow the log (oxp3-tool's outcome errors and messages, the
-  xess jobs' `warnings` and `notes`, diagnose's `findings`), then `next`, "Reboot to finish" for an outcome that
-  needs one, and the diagnose archive's path.
+  xess jobs' `warnings` and `notes`, diagnose's `findings`), then `next` (after an xess install whose new driver
+  failed its check, a reboot instead of the log-out line, unless the result says `reboot_needed: false`), "Reboot to
+  finish" for an outcome or a result with `reboot_needed`, and the diagnose archive's path.
 - **A game's Proton** (components/GameControls.tsx) is described from `compat_tool_shimmed` (the shim: XeSS on the
   XMX cores) and `compat_tool_hook` (the hook: XESS=latest/dp4a, XESS_LOG, FSR); FSR choices show when the package
   is 20261104 or newer by its tag or `features.fsr`, or when they are set already.

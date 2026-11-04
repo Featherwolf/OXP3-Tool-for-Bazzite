@@ -12,6 +12,7 @@ import { driverPrefix } from "../launchopts";
 import { invalidate, useCurrentJob, useResource } from "../store";
 import type { Overview, XessDriver, XessStateRes, XessUpdateCheck } from "../types";
 import { listText, toast, when } from "../util";
+import { checkText, offerLabel, pieceText, repairText, xessOffer } from "../xessoffer";
 import { xessLine } from "./Quick";
 
 /** What switch-driver.sh is given: the major.minor prefix when it names one driver, else the full version. */
@@ -56,8 +57,11 @@ export const XessTab: FC = () => {
   const drivers = x?.drivers ?? [];
   const current = drivers.find((d) => d.default) ?? null;
   const driverOpts = useMemo(() => drivers.map((d) => ({ data: d.version, label: `Mesa ${d.version}` })), [drivers.map((d) => d.version).join(",")]);
-  const latest = chk.data?.ok ? chk.data.latest : x?.latest ?? null;
-  const update = !!x?.installed && !!latest && latest !== x.version && (chk.data?.ok ? chk.data.update_available : true);
+  // without xess_state the overview's summary says what is installed (FE-4); only a newer tag is an update (FE-1)
+  const sum = ov.data?.ok ? ov.data.xess : null;
+  const installed = x ? x.installed : !!sum?.installed;
+  const version = x ? x.version : sum?.version ?? null;
+  const offer = xessOffer(installed, version, x, chk.data);
   const user = ov.data?.ok ? ov.data.user : null;
   // the state read for this tab is newer than the overview's summary
   const line = xessLine(x ? { installed: x.installed, version: x.version, status: x.status.state, line: x.status.line,
@@ -73,6 +77,12 @@ export const XessTab: FC = () => {
           {!xs.data && <Status ok={null} label="Reading…" />}
           <Problem what="XeSS state" error={xs.data && !xs.data.ok ? xs.data.error : null} />
           <Status ok={line.ok} label={line.label} detail={line.detail} />
+          {x?.script_running && (
+            <Status ok={null} label="A package script is still running"
+              detail={<><Code>{x.script_running}</Code><div>It started before the plugin restarted (a Decky or plugin
+                update) and runs to its end. Install, Uninstall, the driver switch, the shim and removing old folders wait
+                until it has ended; open this page again then.</div></>} />
+          )}
           {x && !x.installed && x.package_dir && (
             <Note label="Not set up">{`${x.package_dir} is the package OXP3 Deck installed last, but its install.sh files are gone (uninstalled). Install sets it up again.`}</Note>
           )}
@@ -99,20 +109,27 @@ export const XessTab: FC = () => {
             <Status ok={false} label={`Missing: ${listText(x.missing_tools)}`}
               detail="install.sh needs these programs; install them with the system's package manager first." />
           )}
+          {x?.installed && !!x.missing_downloads?.length && (
+            <Status ok={false} label={`Not downloaded: ${listText(x.missing_downloads.map((p) => `${p}/`))}`}
+              detail={<>{x.missing_downloads.map((p) => <div key={p}>{pieceText(p)}</div>)}
+                <div>{x.repair ? "Repair (below) runs install.sh again, which downloads them." : "install.sh downloads them when it runs again (the next update)."}</div></>} />
+          )}
         </PanelSectionRow>
         <PanelSectionRow>
-          {(!x?.installed || update) && (
-            <ButtonItem layout="below" disabled={busy || !xs.data}
-              onClick={() => inst.run("install", async () => blockedBy() ?? installXess(x, user, latest))}
-              description={explain(x?.installed ? `Updates ${x.version ?? ""} to ${latest} in a new folder; the old one is uninstalled first.`
-                : "Downloads the newest release and runs its install.sh as your user.", "Then log out and back in; asks first.")}>
-              {inst.busy === "install" ? "Working…" : x?.installed ? `Update to ${latest}` : "Install XeSS XMX"}
+          {offer.kind && (
+            <ButtonItem layout="below" disabled={busy || !xs.data || (!x && !sum)}
+              onClick={() => inst.run("install", async () => blockedBy() ?? installXess(offer, x, user))}
+              description={explain(offer.kind === "update" ? `Updates ${version ?? ""} to ${offer.latest} in a new folder; the old one is uninstalled first.`
+                : offer.kind === "repair" ? repairText(offer)
+                : "Downloads the newest release and runs its install.sh as your user.",
+                offer.kind === "repair" ? "Asks first." : "Then log out and back in; asks first.")}>
+              {inst.busy === "install" ? "Working…" : offerLabel(offer)}
             </ButtonItem>
           )}
           <ButtonItem layout="below" disabled={busy || chk.loading}
             onClick={() => inst.run("check", async () => { const r = await chk.reload(); return r && !r.ok ? r.error : null; })}
             description={explain("Asks GitHub for the newest xess-xmx-linux release. Changes nothing.",
-              chk.data?.ok ? `${chk.data.update_available ? `${chk.data.latest} is available` : `${chk.data.installed ?? x?.version ?? "?"} is the newest`} (checked ${when(chk.data.checked_at)}).${chk.data.note ? ` ${chk.data.note}` : ""}` : undefined)}>
+              chk.data?.ok ? `${checkText(chk.data, installed, version)} (checked ${when(chk.data.checked_at)}).${chk.data.note ? ` ${chk.data.note}` : ""}` : undefined)}>
             {chk.loading ? "Checking…" : "Check for an update"}
           </ButtonItem>
           {x?.installed && (
@@ -190,10 +207,14 @@ export const XessTab: FC = () => {
           </PanelSectionRow>
         </PanelSection>
       )}
-      {!!x?.old_folders?.length && (
+      {x && (x.old_folders.length > 0 || (x.old_folders_kept ?? []).length > 0) && (
         <PanelSection title="Old package folders">
           <PanelSectionRow>
-            {x.relogin_needed && <Note>Log out and back in first: Steam still runs with the old folder's driver.</Note>}
+            {x.relogin_needed && x.old_folders.length > 0 && <Note>Log out and back in first: Steam still runs with the old folder's driver.</Note>}
+            {/* RC-2: the ones xess_remove_folder always refuses get no Remove button */}
+            {(x.old_folders_kept ?? []).map((k) => (
+              <Note key={k.path} label="Left to you"><Code>{k.path}</Code> {k.why}.</Note>
+            ))}
           </PanelSectionRow>
           {x.old_folders.map((p) => <PanelSectionRow key={p}><OldFolder path={p} disabled={running || x.relogin_needed} /></PanelSectionRow>)}
         </PanelSection>

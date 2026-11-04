@@ -35,8 +35,9 @@ export const ButtonsTab: FC = () => {
   const xboxFix = status?.fixes.find((f) => f.id === "xbox-key");
   const applied = buttons?.state === "applied" || buttons?.state === "damaged";
   const saved: Record<string, string> = (applied && buttons?.options?.actions) || {};
-  const keys = (catalog ? Object.keys(catalog.button_keys) : []) as ButtonKey[];
-  const value = (k: ButtonKey) => pick[k] ?? saved[k] ?? catalog?.button_keys[k]?.default ?? "guide";
+  // `?? {}` / `?.[k]`: a catalog from an older oxp3-tool may have no button_keys (value("xbox") is read below anyway).
+  const keys = (catalog ? Object.keys(catalog.button_keys ?? {}) : []) as ButtonKey[];
+  const value = (k: ButtonKey) => pick[k] ?? saved[k] ?? catalog?.button_keys?.[k]?.default ?? "guide";
   const options = useMemo(() => Object.keys(catalog?.button_actions ?? {}).map((a) => ({ data: a, label: actionLabel(a) })), [catalog]);
   const usesFps = keys.some((k) => value(k) === "fps-limit");
   const savedFps = Number(buttons?.options?.fps_limit ?? catalog?.fps_limit.default ?? 72);

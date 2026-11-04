@@ -8,6 +8,7 @@ import { confirm } from "./components/confirm";
 import { currentJob, noteJob } from "./store";
 import type { ApplyOpts, Job, JobStart, XessState } from "./types";
 import { toast } from "./util";
+import { installLines, installTitle, XessOffer } from "./xessoffer";
 
 /** One control's busy state ("which action runs"), the last error, and the job its last action started. */
 export const useAction = () => {
@@ -110,23 +111,15 @@ export const installOxp3 = async (source: "bundled" | "online", version: string 
   return started(await oxp3_install(source));
 };
 
-export const installXess = async (x: XessState | null, user: string | null, latest: string | null): Promise<string | null> => {
-  const update = !!x?.installed;
+/**
+ * Install, update or repair xess-xmx-linux. `offer` is what the button showed (xessOffer, from the overview in the
+ * quick panel), so the confirmation says the same even when xess_state is missing (FE-4); `x` adds the details.
+ */
+export const installXess = async (offer: XessOffer, x: XessState | null, user: string | null): Promise<string | null> => {
   const ok = await confirm({
-    title: update ? "Update xess-xmx-linux?" : "Install xess-xmx-linux?", ok: update ? "Update" : "Install",
-    text: (
-      <>
-        <div>Downloads xess-xmx-linux {latest ?? "(the newest release)"} from GitHub into a new folder and runs its install.sh
-          as {user ?? "your user"} (it also fetches Intel's XeSS SDK and compiler: a few hundred MB).</div>
-        {update && (
-          <div style={{ marginTop: 8 }}>First the installed {x?.version ?? ""} is uninstalled with its own uninstall.sh
-            {x && !x.managed && x.package_dir ? `; its folder ${x.package_dir} stays, for you to remove after the re-login (XeSS tab)` : ""}.
-            Your default Mesa driver is set again afterwards.</div>
-        )}
-        <div style={{ marginTop: 8 }}>Close running games first. Afterwards log out and back in (or reboot) so Steam starts with the new
-          driver. Each game's first start then compiles XeSS's kernels for a minute or two, once.</div>
-      </>
-    ),
+    title: installTitle(offer),
+    ok: offer.kind === "update" ? "Update" : offer.kind === "repair" ? "Repair" : "Install",
+    text: <>{installLines(offer, x, user).map((l, i) => <div key={i} style={i ? { marginTop: 8 } : undefined}>{l}</div>)}</>,
   });
   if (!ok) return null;
   return started(await xess_install());

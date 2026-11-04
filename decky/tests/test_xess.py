@@ -2,18 +2,42 @@
 for real in the temporary folders, and fakes systemctl and the package's bash scripts)."""
 import hashlib
 import io
+import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from unittest import mock
 
 from oxp3deck import context, downloads, jobs, sysexec, xess
 from tests.test_steamlib import World, fixture, patch_user, write
+
+TYPES_TS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "types.ts")
+
+
+def ts_fields(name: str) -> set:
+    """The top-level field names of `export type NAME = [Res &] { ... }` in src/types.ts (Res adds ok and error):
+    what the frontend expects of an answer."""
+    with open(TYPES_TS) as f:
+        text = re.sub(r"//[^\n]*", "", f.read())
+    m = re.search(rf"export type {name} = (Res & )?\{{", text)
+    assert m, f"types.ts has no type {name}"
+    flat, depth = [], 1
+    for ch in text[m.end():]:
+        depth += (ch == "{") - (ch == "}")
+        if depth == 0:
+            break
+        flat.append(ch if depth == 1 else " ")      # nested objects' fields are not this type's
+    fields = set(re.findall(r"\b([A-Za-z_]\w*)\??\s*:", "".join(flat)))
+    return fields | {"ok", "error"} if m.group(1) else fields
+
 
 TAG_OLD, TAG_NEW = "20261031", "20261104"
 SHIM_OLD = b"MZ shim build one IGDEXT_TRACE IGDEXT_FORCE_FALLBACK"
@@ -83,6 +107,22 @@ def env_text(pkg, alt=False) -> str:
 
 def ok_line(pkg, v="26.3.0-rc2"):
     return f"ok 2026-11-01 09:26:46 {pkg}/lib/mesa-{v}/libvulkan_intel.so Mesa {v} (git-4930fa53e8)\n"
+
+
+def failed_line(pkg, v="26.3.0-rc3", why="libSPIRV-Tools.so: cannot open shared object file"):
+    return f"FAILED 2026-11-04 10:00:00 {pkg}/lib/mesa-{v}/libvulkan_intel.so: {why}\n"
+
+
+def fetch_piece(pkg, sub):
+    """What get-igc.sh / get-xess.sh / get-ffx.sh leave in the package."""
+    if sub == "igc":
+        write(os.path.join(pkg, "igc", "neo", "bin", "ocloc-25.18.1"), b"ocloc", 0o755)
+        write(os.path.join(pkg, "igc", "igc", "local", "lib", "libigc.so.2"), b"igc")
+    elif sub == "xess":
+        write(os.path.join(pkg, "xess", "libxess.dll"), b"sdk libxess (downloaded)")
+    else:
+        for f in ("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll"):
+            write(os.path.join(pkg, "ffx", f), b"ffx")
 
 
 UNITS_ON = ("LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n\n"
@@ -176,13 +216,20 @@ class XessCase(unittest.TestCase):
             return sysexec.Result(rc, out, "")
         self.u.scripts[path] = fn
 
-    def fake_install_of(self, pkg, v="26.3.0-rc3"):
+    def fake_install_of(self, pkg, v="26.3.0-rc3", fail=(), status=None):
+        """install.sh: downloads each missing piece its get script fetches (except those in `fail`: install.sh only
+        prints a line then), the environment file, the check unit, the check line (`status`, else ok)."""
         def effect(argv, cwd):
             self.assertEqual(cwd, pkg)
+            self.fetched = []
+            for sub, script, present, _pins in xess.PIECES:
+                if os.path.isfile(os.path.join(pkg, script)) and not present(pkg) and sub not in fail:
+                    fetch_piece(pkg, sub)
+                    self.fetched.append(sub)
             write(os.path.join(self.home, xess.ENV_FILE), env_text(pkg, alt=True))
             write(os.path.join(self.home, xess.UNIT_DIR, xess.CHECK_UNIT),
                   f'ExecStart=/bin/bash "{pkg}/tools/session-check.sh"\n')
-            write(os.path.join(self.home, xess.STATUS_FILE), ok_line(pkg, v))
+            write(os.path.join(self.home, xess.STATUS_FILE), status or ok_line(pkg, v))
         return effect
 
     def fake_uninstall(self, argv, cwd):
@@ -354,7 +401,10 @@ class StateTest(XessCase):
         self.assertEqual((names["Proton - Experimental"]["shimmed"], names["Proton - Experimental"]["hook"]),
                          (False, False))
         self.assertEqual(x["missing_tools"], ["vulkaninfo (optional)"])
-        self.assertEqual(x["old_folders"], [os.path.join(self.home, "elsewhere")])
+        self.assertEqual(x["old_folders"], [])        # /gone is gone, the package in use is not old
+        self.assertEqual(x["old_folders_kept"], [{"path": os.path.join(self.home, "elsewhere"), "why": (
+            "does not look like an xess-xmx-linux folder (no install.sh, uninstall.sh, tools/session-check.sh)")}])
+        self.assertIsNone(x["package_dir_kept"])     # ~/Documents/xess-xmx-linux-20261031 can go once it is old
         self.assertFalse(x["flatpak_steam"])
         self.assertEqual((x["latest"], x["checked_at"]), (TAG_NEW, 5.0))
         self.assertEqual(x["features"], {"fsr": False, "alt_driver_store": False})
@@ -401,6 +451,18 @@ class StateTest(XessCase):
         x = xess.state(self.ctx, self.settings)["xess"]
         self.assertTrue(x["flatpak_steam"])
         self.assertTrue(any("not this package" in n for n in x["status"]["notes"]))
+
+    def test_types_ts_names_the_same_fields(self):
+        """src/types.ts against the answers (missing_downloads, repair, update_available, script_running...): a field
+        the backend adds or drops has to be added or dropped there too."""
+        self.owner()
+        self.u.units = UNITS_ON
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual(set(x), ts_fields("XessState"))
+        self.assertEqual(set(x["status"]), ts_fields("XessStatus"))
+        self.assertEqual(set(xess.summary(self.ctx, self.settings)), ts_fields("XessSummary"))
+        self.assertEqual(set(xess.check_update(self.ctx, self.settings)), ts_fields("XessUpdateCheck"))
+        self.assertEqual(set(xess.parse_status(None)), ts_fields("XessStatus"))
 
 
 class CheckUpdateTest(XessCase):
@@ -458,20 +520,26 @@ class InstallTest(XessCase):
         self.assert_in_order([
             f"mkdir {self.xroot}", f"mkdir {self.incoming}", "python3 unpack",
             f"mv {self.incoming}/xess-xmx-linux-{TAG_NEW} {self.new}", f"rm {self.incoming}",
-            f"cp {self.old}/xess {new}/xess",
+            f"cp {self.old}/igc {new}/igc", f"cp {self.old}/xess {new}/xess",
             "systemctl stop", f"bash {self.old}/uninstall.sh", f"bash {new}/install.sh",
             f"bash {new}/tools/switch-driver.sh 26.1",
         ])
         cmds = self.u.commands()
-        self.assertFalse([c for c in cmds if c.startswith("cp ") and c.endswith("/igc")])   # get-igc.sh changed
+        # XESS-1: 20261104 rewrote get-igc.sh but pins the same IGC and ocloc, so the 95 MB are not fetched again
+        self.assertIn(f"Copying igc/ from {self.old} (tools/get-igc.sh pins the same downloads)", self.job.log)
+        self.assertIn(f"Copying xess/ from {self.old} (tools/get-xess.sh is unchanged)", self.job.log)
+        self.assertEqual(self.fetched, ["ffx"])                     # only what 20261031 never had
         self.assertNotIn(f"bash {self.old}/install.sh", cmds)                                # no rollback
         stop = next(c for c in self.u.calls if c["argv"][:3] == ["systemctl", "--user", "stop"])
         self.assertEqual(stop["argv"][3:], ["xess-xmx-shim.path", "xess-xmx-shim.service"])
         for c in self.u.calls:
+            if c["argv"][0] == "bash":
+                self.assertTrue(c["detach"], c)          # RT-1: survives a plugin restart
+                self.assertEqual(c["cwd"], os.path.dirname(c["argv"][1]).removesuffix("/tools"))
             if c["argv"][0] == "bash" and c["argv"][1].endswith(("install.sh", "uninstall.sh")):
-                self.assertEqual(c["cwd"], os.path.dirname(c["argv"][1]))
                 self.assertIsNone(c["timeout"])         # downloads hundreds of MB: never killed
                 self.assertTrue(c["streamed"])
+        self.assertFalse(os.path.exists(self.w.sys(f"/run/oxp3deck/{xess.SCRIPT_RECORD}")))
         # the download: one URL, a 0700 folder of root's, 200 MB at most; then cleaned up
         self.assertEqual([d["url"] for d in self.downloads], [self.url(TAG_NEW)])
         self.assertEqual(self.downloads[0]["parent_mode"], 0o700)
@@ -480,14 +548,14 @@ class InstallTest(XessCase):
         self.assertEqual(os.listdir(self.tmp_parent), [])
         self.assertFalse(os.path.lexists(self.incoming))
         self.assertTrue(any("no checksum" in line for line in self.job.log))
-        # the unpacked tree: exec bits back, the reused SDK, no igc (install.sh downloads it)
+        # the unpacked tree: exec bits back, the reused SDK and compiler
         self.assertTrue(os.stat(os.path.join(new, "xmx-launch.sh")).st_mode & 0o111)
         self.assertTrue(os.stat(os.path.join(new, "tools", "get-igc.sh")).st_mode & 0o111)
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(new, "README.md")).st_mode) & 0o111, 0)
         self.assertTrue(os.path.isdir(os.path.join(new, "kernels")))
         with open(os.path.join(new, "xess", "libxess.dll"), "rb") as f:
             self.assertEqual(f.read(), b"sdk libxess")
-        self.assertFalse(os.path.exists(os.path.join(new, "igc")))
+        self.assertTrue(os.access(os.path.join(new, "igc", "neo", "bin", "ocloc-25.18.1"), os.X_OK))
         self.assertEqual(xess.drivers(new)[0], {"version": "26.1.2", "default": True})     # the choice re-applied
         # the system Proton, as root: shim in, stock kept
         with open(self.slr_dll, "rb") as f:
@@ -507,6 +575,10 @@ class InstallTest(XessCase):
         self.assertEqual((x["package_dir"], x["version"], x["managed"]), (new, TAG_NEW, True))
         self.assertEqual(x["old_folders"], [os.path.realpath(self.old)])
         self.assertTrue(x["features"]["fsr"])
+        self.assertEqual((x["missing_downloads"], x["repair"], x["latest"], x["update_available"]),
+                         ([], None, None, False))
+        self.assertIsNone(x["script_running"])
+        self.assertIs(r["reboot_needed"], False)
 
     def test_install_failure_rolls_back(self):
         self.owner()
@@ -520,6 +592,7 @@ class InstallTest(XessCase):
         self.assertIn("missing x", r["error"])
         self.assertTrue(r["rolled_back"])
         self.assert_in_order([f"bash {self.old}/uninstall.sh", f"bash {new}/install.sh", f"bash {self.old}/install.sh"])
+        self.assertTrue(all(c["detach"] for c in self.u.calls if c["argv"][0] == "bash"))     # the rollback too
         self.assertNotIn(f"bash {new}/tools/switch-driver.sh 26.1", self.u.commands())
         self.assertIsNone(self.settings.get("xess_package"))
         self.assertEqual(self.settings.get("xess_old_folders"), [new])       # can be removed from the page
@@ -574,9 +647,10 @@ class InstallTest(XessCase):
     def test_up_to_date(self):
         self.owner()
         self.latest = TAG_OLD
+        self.u.units = UNITS_ON
         r = xess.install(self.ctx, self.settings, self.job)
         self.assertEqual((r["ok"], r["up_to_date"], r["package_dir"]), (True, True, os.path.realpath(self.old)))
-        self.assertEqual((self.u.calls, self.downloads), ([], []))
+        self.assertEqual((self.u.commands(), self.downloads), (["systemctl show"], []))   # the units asked only
 
     def test_same_release_with_a_failed_check_runs_install_again(self):
         self.owner()
@@ -745,6 +819,7 @@ class UninstallTest(XessCase):
         r = xess.uninstall(self.ctx, self.settings, self.job)
         self.assertTrue(r["ok"], r)
         self.assert_in_order(["systemctl stop", f"bash {self.old}/uninstall.sh"])
+        self.assertTrue(next(c for c in self.u.calls if c["argv"][0] == "bash")["detach"])
         self.assertEqual(r["restored"], [self.slr_dll])
         with open(self.slr_dll, "rb") as f:
             self.assertEqual(f.read(), STOCK)
@@ -937,6 +1012,455 @@ class RemoveFolderTest(XessCase):
         self.assertFalse(os.path.exists(self.older))
         self.assertEqual(self.u.calls[-1]["argv"], ["rm", "-rf", "--", os.path.realpath(self.older)])
         self.assertEqual(self.settings.get("xess_old_folders"), [self.old, "/etc", self.home])
+
+    def test_own_work_is_left_to_the_user(self):
+        # XESS-6: a clone of the repository (docs/building.md) has install.sh, uninstall.sh and session-check.sh too
+        clone = make_package(os.path.join(self.home, "src", "xess-xmx-linux"), TAG_OLD)
+        os.makedirs(os.path.join(clone, ".git"))
+        named_clone = make_package(os.path.join(self.home, "Documents", "xess-xmx-linux-20261020"), TAG_OLD)
+        write(os.path.join(named_clone, ".git"), "gitdir: /elsewhere\n")         # a worktree: .git is a file
+        build = make_package(os.path.join(self.home, "xess-build"), TAG_OLD)
+        renamed = make_package(os.path.join(self.xroot, "my-xess"), TAG_OLD)   # the plugin's own folder
+        self.settings.set("xess_old_folders", [clone, named_clone, build, renamed])
+        for folder, why in ((clone, "is a git checkout"), (named_clone, "is a git checkout"),
+                            (build, "is not named xess-xmx-linux-<tag>")):
+            with self.subTest(folder):
+                r = xess.remove_folder(self.ctx, self.settings, folder)
+                self.assertFalse(r["ok"])
+                self.assertIn(why, r["error"])
+                self.assertIn("delete it yourself", r["error"])
+                self.assertTrue(os.path.isfile(os.path.join(folder, "install.sh")))
+        self.assertFalse([x for x in self.u.commands() if x.startswith("rm")])
+        # RC-2: the XeSS tab offers Remove only where it can work; the others are listed as the user's to delete
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual(x["old_folders"], [renamed])
+        self.assertEqual([(k["path"], k["why"].split(";")[0]) for k in x["old_folders_kept"]],
+                         [(clone, "is a git checkout, not just an unpacked release"),
+                          (named_clone, "is a git checkout, not just an unpacked release"),
+                          (build, "is not named xess-xmx-linux-<tag> like an unpacked release and was not installed "
+                                  "by OXP3 Deck")])
+        self.assertTrue(xess.remove_folder(self.ctx, self.settings, renamed)["ok"])
+
+    def test_an_update_from_a_checkout_leaves_it_to_the_user(self):
+        """RC-2: after an update from a hand install in a git checkout, the checkout was listed with a Remove button
+        that failed every time."""
+        clone = make_package(os.path.join(self.home, "src", "xess-xmx-linux"), TAG_OLD)
+        os.makedirs(os.path.join(clone, ".git"))
+        write(os.path.join(self.home, xess.ENV_FILE), env_text(clone))
+        write(os.path.join(self.home, xess.UNIT_DIR, xess.CHECK_UNIT),
+              f'[Unit]\n[Service]\nExecStart=/bin/bash "{clone}/tools/session-check.sh"\n')
+        write(os.path.join(self.home, xess.STATUS_FILE), ok_line(clone))
+        self.settings.set("xess_old_folders", [])
+        before = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual(before["package_dir"], clone)
+        self.assertIn("is a git checkout", before["package_dir_kept"])     # the update dialog says so
+        new_real = os.path.realpath(self.new)
+        self.script(os.path.join(clone, "uninstall.sh"), effect=self.fake_uninstall)
+        self.script(os.path.join(new_real, "install.sh"), effect=self.fake_install_of(new_real))
+        self.assertTrue(xess.install(self.ctx, self.settings, self.job)["ok"])
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual(x["old_folders"], [])
+        self.assertEqual([k["path"] for k in x["old_folders_kept"]], [clone])
+        self.assertIsNone(x["package_dir_kept"])             # the plugin's own folder can go once it is old
+        self.assertIn("is a git checkout", xess.remove_folder(self.ctx, self.settings, clone)["error"])
+
+    def test_not_the_only_compiler(self):
+        # XESS-1: the installed package has no igc/ (its download failed), this folder has one
+        write(os.path.join(self.older, "igc", "neo", "bin", "ocloc-25.18.1"), b"ocloc", 0o755)
+        newer_pkg = make_package(self.new, TAG_NEW, shim=SHIM_NEW)
+        fetch_piece(newer_pkg, "xess")
+        fetch_piece(newer_pkg, "ffx")
+        write(os.path.join(self.home, xess.ENV_FILE), env_text(newer_pkg))
+        write(os.path.join(self.home, xess.STATUS_FILE), ok_line(newer_pkg))
+        r = xess.remove_folder(self.ctx, self.settings, self.older)
+        self.assertIn("has the only compiler (igc/)", r["error"])
+        self.assertNotIn(self.older, xess.state(self.ctx, self.settings)["xess"]["old_folders"])
+        fetch_piece(newer_pkg, "igc")
+        self.assertIn(self.older, xess.state(self.ctx, self.settings)["xess"]["old_folders"])
+        self.assertTrue(xess.remove_folder(self.ctx, self.settings, self.older)["ok"])
+
+
+class DownloadsTest(XessCase):
+    """XESS-1: install.sh exits 0 when a download fails; the plugin reuses what it can and says what is missing."""
+
+    def setUp(self):
+        super().setUp()
+        self.owner()
+        self.new_real = os.path.realpath(self.new)
+        self.script(os.path.join(self.old, "uninstall.sh"), effect=self.fake_uninstall)
+
+    def test_same_downloads_of_the_real_scripts(self):
+        old_igc, new_igc = fixture(TAG_OLD, "tools", "get-igc.sh"), fixture(TAG_NEW, "tools", "get-igc.sh")
+        pins = {sub: p for sub, _s, _f, p in xess.PIECES}
+        self.assertNotEqual(old_igc, new_igc)
+        self.assertEqual(xess._same_downloads("get-igc.sh", pins["igc"], old_igc, new_igc),
+                         "get-igc.sh pins the same downloads")
+        self.assertIsNone(xess._same_downloads("get-igc.sh", pins["igc"], old_igc,
+                                               new_igc.replace(b"25.18.33578.6", b"25.40.1")))
+        x = fixture(TAG_OLD, "tools", "get-xess.sh")
+
+        def same_xess(b):
+            return xess._same_downloads("get-xess.sh", pins["xess"], x, b)
+        self.assertEqual(same_xess(fixture(TAG_NEW, "tools", "get-xess.sh")), "get-xess.sh is unchanged")
+        self.assertEqual(same_xess(x.replace(b"# Needs curl", b"# Uses curl")), "get-xess.sh pins the same downloads")
+        self.assertIsNone(same_xess(x.replace(b"libxell.dll", b"libxell2.dll")))     # another library taken
+        f = fixture(TAG_NEW, "tools", "get-ffx.sh")
+        self.assertEqual(len(pins["ffx"].findall(f)), 5)                # FFX_TAG and the four files with checksums
+        self.assertIsNone(xess._same_downloads("get-ffx.sh", pins["ffx"], f, f.replace(b"e2191d3c", b"00000000")))
+        self.assertIsNone(xess._same_downloads("get-ffx.sh", pins["ffx"], None, f))
+
+    def test_compiler_download_failed(self):
+        # another IGC pinned: nothing to reuse, and get-igc.sh hits GitHub's rate limit
+        p = os.path.join(self.old, "tools", "get-igc.sh")
+        write(p, fixture(TAG_OLD, "tools", "get-igc.sh").replace(b"25.18.33578.6", b"25.13.1"), 0o755)
+        self.script(os.path.join(self.new_real, "install.sh"), out="compiler download failed - the run-time kernel "
+                    "path will be unavailable\n", effect=self.fake_install_of(self.new_real, fail=("igc",)))
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertNotIn(f"cp {self.old}/igc {self.new_real}/igc", self.u.commands())
+        self.assertIn("igc/: tools/get-igc.sh differs in this release, so install.sh downloads it again", self.job.log)
+        self.assertEqual(len(r["warnings"]), 1)
+        self.assertIn("the compiler (igc/) was not downloaded", r["warnings"][0])
+        self.assertIn(f"{os.path.realpath(self.old)} keeps its compiler until then", r["warnings"][0])
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual(x["missing_downloads"], ["igc"])
+        self.assertEqual(x["repair"], "the compiler (igc/) was not downloaded")
+        self.assertEqual(x["old_folders"], [])                          # the only compiler stays out of reach
+        self.assertEqual(self.settings.get("xess_old_folders"), [os.path.realpath(self.old)])
+        # Repair: the same release, install.sh again in its folder; this time the download works
+        self.u.calls.clear()
+        self.script(os.path.join(self.new_real, "install.sh"), effect=self.fake_install_of(self.new_real))
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(len(self.downloads), 1)                        # no second release download
+        self.assertEqual([c for c in self.u.commands() if c.startswith("bash")], [f"bash {self.new_real}/install.sh"])
+        self.assertEqual(self.fetched, ["igc"])
+        self.assertEqual((r["warnings"], r["previous"]), ([], None))
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual((x["missing_downloads"], x["repair"]), ([], None))
+        self.assertEqual(x["old_folders"], [os.path.realpath(self.old)])
+
+    def test_repair_copies_the_compiler_from_an_old_folder(self):
+        self.script(os.path.join(self.new_real, "install.sh"), effect=self.fake_install_of(self.new_real))
+        self.assertTrue(xess.install(self.ctx, self.settings, self.job)["ok"])
+        shutil.rmtree(os.path.join(self.new_real, "igc"))           # as if the copy and the download had failed
+        self.assertEqual(xess.state(self.ctx, self.settings)["xess"]["missing_downloads"], ["igc"])
+        self.u.calls.clear()
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assert_in_order([f"cp {self.old}/igc {self.new_real}/igc", f"bash {self.new_real}/install.sh"])
+        self.assertEqual(self.fetched, [])
+
+
+class RepairTest(XessCase):
+    """XESS-2: up to date only when install.sh got to its end for this package."""
+
+    def setUp(self):
+        super().setUp()
+        self.owner()
+        self.pkg = os.path.realpath(make_package(self.new, TAG_NEW, shim=SHIM_NEW))
+        for sub in ("igc", "xess", "ffx"):
+            fetch_piece(self.pkg, sub)
+        # install.sh of 20261104 cut short after its environment file: the check line is still the old package's
+        write(os.path.join(self.home, xess.ENV_FILE), env_text(self.pkg, alt=True))
+        os.unlink(os.path.join(self.home, xess.UNIT_DIR, xess.CHECK_UNIT))
+        self.u.units = UNITS_GONE
+        self.latest = TAG_NEW
+
+    def reason(self):
+        det = xess.detect(self.ctx, self.settings)
+        return xess._repair_reason(det, xess.read_status(self.ctx), xess._units(self.ctx),
+                                   xess._missing_downloads(det["path"]))
+
+    def test_reasons(self):
+        self.assertEqual(self.reason(), "the driver check belongs to another folder")
+        write(os.path.join(self.home, xess.STATUS_FILE), ok_line(self.pkg))
+        self.assertEqual(self.reason(), "the login check unit is missing")
+        self.u.units = UNITS_ON
+        self.assertIsNone(self.reason())
+        write(os.path.join(self.home, xess.STATUS_FILE), failed_line(self.pkg))
+        self.assertEqual(self.reason(), "the driver check failed")
+        os.unlink(os.path.join(self.home, xess.STATUS_FILE))
+        self.assertEqual(self.reason(), "the driver check has not run for this package")
+        shutil.rmtree(os.path.join(self.pkg, "xess"))
+        shutil.rmtree(os.path.join(self.pkg, "ffx"))
+        self.assertEqual(self.reason(), "Intel's XeSS SDK (xess/) and AMD's FidelityFX SDK (ffx/) were not downloaded")
+        # found by the check unit only: the environment file names a folder that is gone
+        for sub in ("xess", "ffx"):
+            fetch_piece(self.pkg, sub)
+        write(os.path.join(self.home, xess.STATUS_FILE), ok_line(self.pkg))
+        write(os.path.join(self.home, xess.ENV_FILE), env_text("/gone/xess-xmx-linux-1"))
+        write(os.path.join(self.home, xess.UNIT_DIR, xess.CHECK_UNIT),
+              f'ExecStart=/bin/bash "{self.pkg}/tools/session-check.sh"\n')
+        self.assertEqual(self.reason(), f"{xess.ENV_FILE} does not name this package")
+
+    def test_interrupted_update_is_repaired_in_place(self):
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual((x["installed"], x["version"]), (True, TAG_NEW))
+        self.assertEqual(x["repair"], "the driver check belongs to another folder")
+        self.script(os.path.join(self.pkg, "install.sh"), effect=self.fake_install_of(self.pkg))
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertNotIn("up_to_date", r)
+        self.assertEqual(self.downloads, [])
+        self.assertEqual([c for c in self.u.commands() if c.startswith("bash")], [f"bash {self.pkg}/install.sh"])
+        self.assertIn(f"{TAG_NEW} in {self.pkg}: the driver check belongs to another folder; running its install.sh "
+                      "again (nothing else is downloaded)", self.job.log)
+        self.u.units = UNITS_ON
+        self.assertIsNone(xess.state(self.ctx, self.settings)["xess"]["repair"])
+        self.assertTrue(xess.install(self.ctx, self.settings, self.job)["up_to_date"])
+
+    def test_no_repair_offered_while_an_update_is(self):
+        self.settings.set("xess_latest", "20261110")
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual((x["latest"], x["update_available"], x["repair"]), ("20261110", True, None))
+
+
+class LatestTest(XessCase):
+    """FE-1, XESS-7: the stored tag is an update only when it is newer; install never downgrades."""
+
+    def test_state_latest_only_when_newer(self):
+        self.owner()
+        for stored, latest, update in (("20261029", None, False), (TAG_OLD, None, False), (TAG_NEW, TAG_NEW, True),
+                                       (None, None, False), ("my-build", "my-build", True)):
+            with self.subTest(stored):
+                self.settings.set("xess_latest", stored)
+                x = xess.state(self.ctx, self.settings)["xess"]
+                self.assertEqual((x["latest"], x["update_available"]), (latest, update))
+        # nothing installed: the newest release is shown, there is nothing to update
+        os.unlink(os.path.join(self.home, xess.ENV_FILE))
+        os.unlink(os.path.join(self.home, xess.UNIT_DIR, xess.CHECK_UNIT))
+        self.settings.set("xess_latest", "20261029")
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual((x["installed"], x["latest"], x["update_available"]), (False, "20261029", False))
+
+    def test_unknown_version_is_offered_the_update(self):
+        self.w.make_steam()
+        pkg = make_package(os.path.join(self.home, "xess"), TAG_OLD)
+        write(os.path.join(self.home, xess.ENV_FILE), env_text(pkg))
+        self.settings.set("xess_latest", TAG_NEW)
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual((x["version"], x["latest"], x["update_available"]), (None, TAG_NEW, True))
+        # never checked: no Repair either (it would promise install.sh in place; install updates such a package)
+        self.settings.set("xess_latest", None)
+        x = xess.state(self.ctx, self.settings)["xess"]
+        self.assertEqual((x["version"], x["update_available"], x["repair"]), (None, False, None))
+        self.assertIsNotNone(xess._repair_reason(xess.detect(self.ctx, self.settings), xess.read_status(self.ctx),
+                                                 xess._units(self.ctx), []))   # there would be a reason
+
+    def test_install_refuses_a_downgrade(self):
+        self.owner()
+        self.u.units = UNITS_ON
+        self.latest = "20261029"           # GitHub's newest went backwards (a release pulled)
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "xess install: the installed 20261031 is newer than the newest release 20261029; "
+                                     "nothing was changed")
+        self.assertEqual(self.downloads, [])
+        self.assertFalse([c for c in self.u.commands() if c != "systemctl show"])
+        self.assertEqual(xess.detect(self.ctx, self.settings)["path"], os.path.realpath(self.old))
+
+    def test_newer_installed_package_can_still_be_repaired(self):
+        self.owner()
+        self.u.units = UNITS_ON
+        self.latest = "20261029"
+        write(os.path.join(self.home, xess.STATUS_FILE), failed_line(self.old, "26.3.0-rc2"))
+        self.script(os.path.join(self.old, "install.sh"), effect=self.fake_install_of(self.old, "26.3.0-rc2"))
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["tag"], self.downloads), (TAG_OLD, []))
+        self.assertEqual([c for c in self.u.commands() if c.startswith("bash")], [f"bash {self.old}/install.sh"])
+
+
+class FailedCheckTest(XessCase):
+    """XESS-4: after install.sh's dry run failed, the session check runs for real right away."""
+
+    def setUp(self):
+        super().setUp()
+        self.owner()
+        self.new_real = os.path.realpath(self.new)
+        self.script(os.path.join(self.old, "uninstall.sh"), effect=self.fake_uninstall)
+        self.script(os.path.join(self.new_real, "install.sh"),
+                    effect=self.fake_install_of(self.new_real, status=failed_line(self.new_real)))
+        self.restarts = []
+
+    def check_unit(self, rc=0, line=None):
+        def fn(argv):
+            self.restarts.append(argv)
+            if line:
+                write(os.path.join(self.home, xess.STATUS_FILE), line)
+            return sysexec.Result(rc, "", "Job for xess-xmx-check.service failed." if rc else "")
+        self.u.systemctl["restart"] = fn
+
+    def test_switched_to_the_other_driver(self):
+        self.check_unit(line=ok_line(self.new_real, "26.1.2").strip() + " (the previous driver failed: libSPIRV-Tools"
+                             ".so: cannot open shared object file; switched to Mesa 26.1.2)\n")
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.restarts, [["systemctl", "--user", "restart", "xess-xmx-check.service"]])
+        restart = next(c for c in self.u.calls if c["argv"][:3] == ["systemctl", "--user", "restart"])
+        self.assertEqual(restart["timeout"], 120)
+        self.assertEqual(r["status"]["state"], "ok")
+        self.assertIn("made the package's Mesa 26.1.2 driver the default instead", r["warnings"][-1])
+        self.assertEqual((r["next"], r["reboot_needed"]), (xess.NEXT_INSTALL, False))
+
+    def test_stock_drivers_for_the_next_session(self):
+        self.check_unit(line=failed_line(self.new_real, "26.1.2"))
+        self.u.session_env = "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.x86_64.json\n"
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["status"]["state"], "failed")
+        self.assertIn("set the system's stock Intel driver for the next session", r["warnings"][-1])
+        self.assertEqual((r["next"], r["reboot_needed"]), (xess.NEXT_STOCK, False))
+
+    def test_reboot_when_the_check_cannot_run_or_did_not_fall_back(self):
+        self.check_unit(rc=1)
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertIn("the session check could not run again (Job for xess-xmx-check.service failed.)",
+                      r["warnings"][-1])
+        self.assertEqual((r["next"], r["reboot_needed"]), (xess.NEXT_REBOOT, True))
+        self.assertTrue(r["next"].startswith("Reboot (not just log out)"))
+        # it ran, but the user manager still has the failing driver
+        self.check_unit()
+        self.u.session_env = f"VK_DRIVER_FILES={self.new_real}/run/intel_icd.json\n"
+        write(os.path.join(self.home, xess.STATUS_FILE), failed_line(self.new_real))
+        self.u.calls.clear()
+        r = xess.install(self.ctx, self.settings, self.job)      # same release: install.sh again (the check failed)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["next"], r["reboot_needed"]), (xess.NEXT_REBOOT, True))
+        self.assertIn("did not switch this session to another driver", r["warnings"][-1])
+
+
+class DetachedScriptTest(XessCase):
+    """RT-1: package scripts run detached and are recorded while they run; after a plugin restart nothing touches
+    the package until the one the earlier process started has ended."""
+
+    def setUp(self):
+        super().setUp()
+        self.owner()
+        self.record = self.w.sys(f"/run/oxp3deck/{xess.SCRIPT_RECORD}")
+
+        def spawn(argv):
+            pid = self.w.proc(["runuser", "-u", "jordan", "--", *argv], comm="runuser")
+            return pid, lambda: shutil.rmtree(os.path.join(self.w.sys("/proc"), str(pid)))
+        self.u.spawn = spawn
+
+    def earlier_process(self, start=None):
+        """A record written by an earlier plugin process, of a runuser that still runs."""
+        pid = self.w.proc(["runuser", "-u", "jordan", "--", "bash", f"{self.old}/install.sh"], comm="runuser")
+        os.makedirs(os.path.dirname(self.record), mode=0o700, exist_ok=True)
+        write(self.record, json.dumps({"pid": pid, "starttime": pid if start is None else start,
+                                       "what": f"{self.old}/install.sh", "plugin": os.getpid() + 1}))
+        return pid
+
+    def test_recorded_while_running(self):
+        seen = {}
+
+        def effect(argv, cwd):
+            with open(self.record) as f:
+                seen.update(json.load(f))
+            seen["mode"] = stat.S_IMODE(os.stat(self.record).st_mode)
+            seen["running"] = xess.state(self.ctx, self.settings)["xess"]["script_running"]
+        self.script(os.path.join(self.old, "tools", "switch-driver.sh"), effect=effect)
+        self.assertTrue(xess.set_driver(self.ctx, self.settings, "26.1")["ok"])
+        self.assertTrue(next(c for c in self.u.calls if c["argv"][0] == "bash")["detach"])
+        self.assertEqual(seen["what"], f"{os.path.realpath(self.old)}/tools/switch-driver.sh 26.1")
+        self.assertEqual((seen["plugin"], seen["mode"]), (os.getpid(), 0o600))
+        self.assertEqual(sysexec.proc_starttime(self.ctx, seen["pid"]), None)         # it has ended since
+        self.assertIsInstance(seen["starttime"], int)
+        self.assertIsNone(seen["running"])              # this process's own job: not "from before the restart"
+        self.assertFalse(os.path.lexists(self.record))
+
+    def test_refused_while_an_earlier_one_runs(self):
+        pid = self.earlier_process()
+        self.w.proton("proton-cachyos-native", "system", dll=STOCK)
+        self.settings.set("xess_shim_system", True)
+        self.settings.set("xess_old_folders", [self.old])
+        want = (f"an xess-xmx-linux script from before the plugin restarted is still running ({self.old}/install.sh); "
+                "try again when it has ended")
+        for name, fn in (("xess install", lambda: xess.install(self.ctx, self.settings, self.job)),
+                         ("xess uninstall", lambda: xess.uninstall(self.ctx, self.settings, self.job)),
+                         ("xess set driver", lambda: xess.set_driver(self.ctx, self.settings, "26.1")),
+                         ("xess shim system Protons", lambda: xess.shim_system_protons(self.ctx, self.settings)),
+                         ("xess remove folder", lambda: xess.remove_folder(self.ctx, self.settings, self.old))):
+            with self.subTest(name):
+                r = fn()
+                self.assertEqual((r["ok"], r["error"]), (False, f"{name}: {want}"))
+        self.assertEqual((self.u.calls, self.downloads), ([], []))
+        self.assertFalse(xess.system_protons_need_shim(self.ctx, self.settings))   # no start-up re-shim either
+        self.assertEqual(xess.state(self.ctx, self.settings)["xess"]["script_running"], f"{self.old}/install.sh")
+        # it ends: the record goes, and the package can be changed again
+        shutil.rmtree(os.path.join(self.w.sys("/proc"), str(pid)))
+        self.assertTrue(xess.system_protons_need_shim(self.ctx, self.settings))
+        self.assertIsNone(xess.state(self.ctx, self.settings)["xess"]["script_running"])
+        self.assertFalse(os.path.lexists(self.record))
+
+    def test_a_reused_pid_is_not_the_script(self):
+        self.earlier_process(start=1)          # the pid now belongs to a process started later
+        self.assertIsNone(xess.script_running(self.ctx))
+        self.assertFalse(os.path.lexists(self.record))
+
+    def test_an_old_record_found_ended_does_not_take_a_live_one_with_it(self):
+        """RS-4: xess_state (no _BUSY) finds an old record ended while a job writes its own live record; the old one
+        was removed by name, the live one with it, and a plugin restart then let a second script run beside it."""
+        self.owner()
+        self.earlier_process(start=1)              # ended (its pid now belongs to a newer process)
+        real_alive = sysexec.proc_alive
+        paused, go, seen = threading.Event(), threading.Event(), {}
+
+        def alive(ctx, pid, starttime):
+            r = real_alive(ctx, pid, starttime)
+            if threading.current_thread().name == "state":
+                paused.set()
+                go.wait(5)                         # between reading the old record and removing it
+            return r
+
+        def effect(argv, cwd):                     # switch-driver.sh runs: its record is in place
+            go.set()
+            state.join(5)
+            with open(self.record) as f:
+                seen.update(json.load(f))
+
+        self.script(os.path.join(self.old, "tools", "switch-driver.sh"), effect=effect)
+        answers = {}
+        with mock.patch.object(sysexec, "proc_alive", alive):
+            state = threading.Thread(target=lambda: answers.update(state=xess.script_running(self.ctx)), name="state")
+            state.start()
+            self.assertTrue(paused.wait(5))
+            job = threading.Thread(target=lambda: answers.update(job=xess.set_driver(self.ctx, self.settings, "26.1")))
+            job.start()
+            time.sleep(0.3)                        # the job waits for the record lock (it reached the script before)
+            go.set()
+            job.join(10)
+            state.join(5)
+        self.assertIsNone(answers["state"])
+        self.assertTrue(answers["job"]["ok"], answers["job"])
+        self.assertEqual((seen["what"], seen["plugin"]), (f"{os.path.realpath(self.old)}/tools/switch-driver.sh 26.1",
+                                                          os.getpid()))
+        self.assertFalse(os.path.lexists(self.record))       # the job removed its own record at the end
+
+    def test_only_the_record_read_is_removed(self):
+        os.makedirs(os.path.dirname(self.record), mode=0o700)
+        live = {"pid": 7, "starttime": 70, "what": "install.sh", "plugin": 1}
+        write(self.record, json.dumps(live))
+        with xess._RECORD:
+            xess._clear_record(self.ctx, dict(live, pid=8))    # another process's record, replaced since
+        self.assertTrue(os.path.lexists(self.record))
+        with xess._RECORD:
+            xess._clear_record(self.ctx, live)
+        self.assertFalse(os.path.lexists(self.record))
+
+    def test_bad_records_are_ignored(self):
+        os.makedirs(os.path.dirname(self.record), mode=0o700)
+        for raw in ("", "[]", "{", '{"pid": "1", "starttime": 1}', "\xff"):
+            with self.subTest(raw):
+                write(self.record, raw.encode("latin-1"))
+                self.assertIsNone(xess.script_running(self.ctx))
+        if os.path.lexists(self.record):
+            os.unlink(self.record)
+        os.symlink("/etc/passwd", self.record)
+        self.assertIsNone(xess.script_running(self.ctx))
 
 
 if __name__ == "__main__":

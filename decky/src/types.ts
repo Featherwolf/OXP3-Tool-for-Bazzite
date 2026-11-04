@@ -102,6 +102,7 @@ export type XessState = {
   installed: boolean; package_dir: string | null; version: string | null;
   found_by: "env" | "check-unit" | "settings" | null;
   managed: boolean;
+  package_dir_kept: string | null;         // why the XeSS tab will not remove package_dir once it is old (RC-2), or null
   drivers: XessDriver[]; preferred_driver: string | null;
   status: XessStatus;
   live: boolean;
@@ -112,9 +113,15 @@ export type XessState = {
   system_protons_need_shim: boolean;
   user_protons: { name: string; path: string; shimmed: boolean; hook: boolean }[];
   missing_tools: string[];
-  old_folders: string[];
+  old_folders: string[];                   // earlier package folders the XeSS tab can remove (after a re-login)
+  old_folders_kept: { path: string; why: string }[];   // earlier ones it leaves to the user: a git checkout, ...
   flatpak_steam: boolean;
-  latest: string | null; checked_at: number | null;
+  latest: string | null;                   // from the last update check; null unless newer than the installed package
+  update_available: boolean;               // latest is set and something is installed
+  checked_at: number | null;
+  missing_downloads: string[];             // "igc", "xess", "ffx": the package's get-<piece>.sh exists, its files not
+  repair: string | null;                   // install.sh should run again in this folder (same release), and why
+  script_running: string | null;           // a package script an earlier plugin process started, still running
   features: { fsr: boolean; alt_driver_store: boolean };
 };
 export type XessStateRes = Res & { xess: XessState | null };

@@ -18,6 +18,7 @@ re-login (until then Steam and its games still use the old folder's driver).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -49,6 +50,11 @@ TMP_PARENT: str | None = None    # where the download folder is made (tests)
 
 NEXT_INSTALL = "Log out of Game Mode and back in (or reboot) so Steam starts with the new driver."
 NEXT_UNINSTALL = "Log out of Game Mode and back in (or reboot) so Steam starts without the patched driver."
+NEXT_STOCK = ("Log out of Game Mode and back in (or reboot): Steam then starts with the system's stock Intel driver "
+              "(XeSS on DP4a).")
+NEXT_REBOOT = ("Reboot (not just log out): the session check, which falls back to the package's other driver or to the "
+               "stock one, runs again only at boot. After a log-out alone Game Mode may not start.")
+SCRIPT_RECORD = "xess-script.json"   # in sysexec.run_dir: the package script running detached (_run_script)
 HOOK_NOTE = ("System Protons get the shim but not the Proton hook (proton-cachyos-native ships its own "
              "user_settings.py as a package file): XMX and frame generation work there, the launch option shorthands "
              "XESS=latest, XESS=dp4a and XESS_LOG=1 (and FSR, FSR_FG) do not.")
@@ -121,6 +127,9 @@ print("unpacked %d files" % files)
 # One XeSS task at a time (install, uninstall, driver switch, system Protons, folder removal); a second one is
 # refused, not queued.
 _BUSY = threading.Lock()
+# SCRIPT_RECORD is read, checked and removed (script_running, any thread: xess_state takes no _BUSY), or written
+# (_run_script), by one thread at a time (RS-4).
+_RECORD = threading.Lock()
 _marker_cache: dict = {}
 
 
@@ -344,6 +353,15 @@ def newer(latest: str | None, installed: str | None) -> bool | None:
     return a > b
 
 
+def _update_offered(latest: str | None, installed: str | None) -> bool:
+    """check_update's rule: a newer tag; when either tag cannot be ordered (or the installed one is unknown), any
+    other tag."""
+    if not latest:
+        return False
+    cmp = newer(latest, installed)
+    return latest != installed if cmp is None else cmp
+
+
 # ---- driver status ---------------------------------------------------------------------------------------------------
 
 _OK = re.compile(r"^ok (\S+) (\S+) (.*?/libvulkan_intel\.so)(?: (.*))?$")
@@ -448,6 +466,109 @@ def _start_watcher(ctx, job) -> None:
     r = userexec.run(ctx, ["systemctl", "--user", "start", WATCH_PATH], timeout=60)
     if r.rc != 0:
         _say(job, f"Starting the shim watcher again: {_tail(r, 2)}")
+
+
+# ---- package scripts (detached) --------------------------------------------------------------------------------------
+
+def _record_dir(ctx) -> int | None:
+    """sysexec.run_dir (root's, 0700) as a folder descriptor, without creating it; None when missing or not ours."""
+    try:
+        fd = os.open(ctx.sys_path(sysexec.RUN_DIR), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if os.fstat(fd).st_uid == os.geteuid():
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def _record_in(dfd: int) -> dict | None:
+    raw = context.read_small(SCRIPT_RECORD, 4096, dir_fd=dfd)
+    try:
+        rec = json.loads(raw.decode("utf-8")) if raw else None
+    except ValueError:
+        rec = None
+    return rec if isinstance(rec, dict) else None
+
+
+def _read_record(ctx) -> dict | None:
+    dfd = _record_dir(ctx)
+    if dfd is None:
+        return None
+    try:
+        return _record_in(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _clear_record(ctx, expect: dict) -> None:
+    """Remove the record while it is still `expect`, the one read or written: another may have replaced it since
+    (a plugin process started meanwhile). Call with _RECORD held."""
+    dfd = _record_dir(ctx)
+    if dfd is None:
+        return
+    try:
+        if _record_in(dfd) == expect:
+            os.unlink(SCRIPT_RECORD, dir_fd=dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def script_running(ctx) -> str | None:
+    """The package script (its path and arguments) that an earlier plugin process started and that still runs: a
+    plugin restart does not end it (_run_script), and a second install.sh or uninstall.sh beside it would mix up
+    the session files and shims. None when there is none; the record of one that has ended is removed."""
+    with _RECORD:   # RS-4: else a job could write its live record between our read and our removal of an old one
+        rec = _read_record(ctx)
+        if rec is None or rec.get("plugin") == os.getpid():    # ours: a job of this process runs it (or just did)
+            return None
+        if sysexec.proc_alive(ctx, rec.get("pid"), rec.get("starttime")):
+            return str(rec.get("what") or "a package script")
+        _clear_record(ctx, rec)
+    return None
+
+
+def _refuse_while_script(ctx, step: str, **extra) -> dict | None:
+    what = script_running(ctx)
+    if what is None:
+        return None
+    return _err(step, f"an xess-xmx-linux script from before the plugin restarted is still running ({what}); try "
+                      "again when it has ended", **extra)
+
+
+def _run_script(ctx, script: str, *args: str, cwd: str, on_line=None, timeout=None) -> sysexec.Result:
+    """bash SCRIPT ARGS as the user, detached (userexec.run detach=True): its output goes through a root-only file,
+    so a plugin stop or update mid-install does not kill it at its next echo (SIGPIPE) and it runs to its end, EXIT
+    trap included. While it runs, run_dir/xess-script.json names it with runuser's pid and /proc start time, so that
+    a plugin process started meanwhile leaves the package alone until it has ended (script_running)."""
+    what = " ".join([script, *args])
+    recorded = []
+
+    def started(pid: int) -> None:
+        start = sysexec.proc_starttime(ctx, pid)
+        if start is None:       # already gone
+            return
+        data = json.dumps({"pid": pid, "starttime": start, "what": what, "plugin": os.getpid(),
+                           "started": time.time()})
+        try:   # through a folder descriptor, a new file renamed into place (context.write_atomic)
+            with _RECORD:
+                context.write_atomic(os.path.join(sysexec.run_dir(ctx), SCRIPT_RECORD), data.encode(), 0o600)
+            recorded.append(json.loads(data))      # as _clear_record reads it back
+        except OSError as e:
+            log.warning("xess: cannot record the running %s: %s", what, e)
+
+    try:
+        return userexec.run(ctx, ["bash", script, *args], cwd=cwd, on_line=on_line, timeout=timeout, detach=True,
+                            on_start=started)
+    finally:
+        if recorded:
+            with _RECORD:
+                _clear_record(ctx, recorded[0])
 
 
 # ---- Protons ---------------------------------------------------------------------------------------------------------
@@ -571,6 +692,25 @@ def _old_folders(settings, pkg: str | None) -> list[str]:
     return out
 
 
+def _left_to_user(ctx, real: str) -> str | None:
+    """Why remove_folder never deletes this earlier package folder (a real path), whatever else changes, as the end
+    of a sentence that starts with the path; None when it may (once nothing uses it). _state lists such a folder
+    apart, with no Remove button (RC-2)."""
+    home = os.path.realpath(ctx.home)
+    if not real.startswith(home.rstrip("/") + "/"):
+        return f"is outside {home}"
+    if not looks_like_package(real):
+        return "does not look like an xess-xmx-linux folder (no install.sh, uninstall.sh, tools/session-check.sh)"
+    # XESS-6: a clone of the repository has those files too, with the user's own work in it
+    if os.path.lexists(os.path.join(real, ".git")):
+        return "is a git checkout, not just an unpacked release; delete it yourself if you no longer need it"
+    name = os.path.basename(real)
+    if not is_managed(ctx, real) and not (name.startswith(NAME_PREFIX) and _SAFE_TAG.match(name[len(NAME_PREFIX):])):
+        return (f"is not named {NAME_PREFIX}<tag> like an unpacked release and was not installed by OXP3 Deck; delete "
+                "it yourself if you no longer need it")
+    return None
+
+
 def _remember_old(settings, folder: str | None, *, exclude: str | None = None) -> list[str]:
     olds = [p for p in (settings.get("xess_old_folders") or []) if isinstance(p, str)]
     if folder and folder not in olds:
@@ -612,27 +752,46 @@ def _state(ctx, settings) -> dict:
                and st["state"] != "failed")
     sysp = _system_protons(ctx)
     shim_wanted = settings.get("xess_shim_system") is True
+    version = package_version(pkg, settings)
+    units = _units(ctx) if pkg else {"check": None, "watcher": None}
+    missing = _missing_downloads(pkg) if det["installed"] else []
+    # The last check's tag only when it is an update (FE-1, XESS-7: one installed by hand since can be newer)
+    latest = settings.get("xess_latest") if isinstance(settings.get("xess_latest"), str) else None
+    update = det["installed"] and _update_offered(latest, version)
+    olds = _old_folders(settings, pkg)
+    if "igc" in missing:      # XESS-1: an earlier folder's compiler is the only one there is (and a repair copies it)
+        olds = [p for p in olds if not _igc_present(p)]
+    kept = [{"path": p, "why": _left_to_user(ctx, p)} for p in olds]     # RC-2: no Remove button for these
+    kept = [k for k in kept if k["why"]]
+    olds = [p for p in olds if p not in [k["path"] for k in kept]]
     return {
         "installed": det["installed"],
         "package_dir": pkg,
         "found_by": det["how"],
-        "version": package_version(pkg, settings),
+        "version": version,
         "managed": is_managed(ctx, pkg),
+        "package_dir_kept": _left_to_user(ctx, pkg) if pkg else None,
         "drivers": drivers(pkg),
         "preferred_driver": settings.get("xess_driver"),
         "status": st,
         "live": live,
         "steam_running": steam is not None,
         "relogin_needed": relogin,
-        "units": _units(ctx) if pkg else {"check": None, "watcher": None},
+        "units": units,
         "system_protons": sysp,
         "system_protons_need_shim": det["installed"] and shim_wanted and any(not p["shimmed"] for p in sysp),
         "user_protons": _user_protons(ctx),
         "missing_tools": missing_tools(ctx),
-        "old_folders": _old_folders(settings, pkg),
+        "old_folders": olds,
+        "old_folders_kept": kept,
         "flatpak_steam": steamlib.flatpak_steam(ctx),
-        "latest": settings.get("xess_latest"),
+        "latest": latest if update or not det["installed"] else None,
+        "update_available": update,
         "checked_at": settings.get("xess_checked_at"),
+        "missing_downloads": missing,
+        # _install repairs only a release it can name (an unknown one gets the newest release, as check_update says)
+        "repair": None if update or not version else _repair_reason(det, st, units, missing),
+        "script_running": script_running(ctx),
         "features": features(pkg),
     }
 
@@ -670,9 +829,12 @@ def summary(ctx, settings) -> dict:
 
 def system_protons_need_shim(ctx, settings) -> bool:
     """A package is installed, the shim was put into the system Protons before (xess_shim_system), and one of them
-    has its stock igdext64.dll again (a package update)."""
+    has its stock igdext64.dll again (a package update). Not while a package script from before a plugin restart
+    still runs (the start-up re-shim waits for the next start)."""
     try:
         if settings.get("xess_shim_system") is not True or not detect(ctx, settings)["installed"]:
+            return False
+        if script_running(ctx) is not None:
             return False
         return any(not has_marker(f) for f in _system_dlls(ctx))
     except Exception:
@@ -733,28 +895,84 @@ def _igc_present(pkg: str) -> bool:
 
 
 # The big downloads install.sh fetches only when missing (install.sh:30, :35; 20261104 :46-59): folder, the script
-# that fetches it, the presence test install.sh uses.
+# that fetches it, the presence test install.sh uses, and the script's lines that pin what it fetches. Pins: get-igc.sh
+# IGC_TAG / NEO_TAG (v2.10.10 and 25.18.33578.6 in both 20261031 and 20261104, although 20261104 rewrote the script:
+# checksums, no igc-opencl, which SPIR-V input never used); get-xess.sh the SDK's tag and checksum and the libraries
+# it takes; get-ffx.sh the SDK tag and each file with its checksum.
 PIECES = (
-    ("igc", "tools/get-igc.sh", _igc_present),
-    ("xess", "tools/get-xess.sh", lambda p: os.path.isfile(os.path.join(p, "xess", "libxess.dll"))),
+    ("igc", "tools/get-igc.sh", _igc_present, re.compile(rb"^(?:IGC_TAG|NEO_TAG)=.*$", re.M)),
+    ("xess", "tools/get-xess.sh", lambda p: os.path.isfile(os.path.join(p, "xess", "libxess.dll")),
+     re.compile(rb"^(?:XESS_TAG|XESS_SHA256|LIBS)=.*$", re.M)),
     ("ffx", "tools/get-ffx.sh", lambda p: all(os.path.isfile(os.path.join(p, "ffx", f)) for f in (
-        "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll"))),
+        "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll")),
+     re.compile(rb"^(?:FFX_TAG=.*|\S+ [0-9a-f]{64})$", re.M)),
 )
+PIECE_NAMES = {"igc": "the compiler (igc/)", "xess": "Intel's XeSS SDK (xess/)", "ffx": "AMD's FidelityFX SDK (ffx/)"}
+
+
+def _missing_downloads(pkg: str | None) -> list[str]:
+    """The pieces whose get script the package has but whose files are missing: install.sh only prints a line when a
+    download fails (rate limit, offline) and still exits 0 (20261104 install.sh:46-59, :275)."""
+    if not pkg:
+        return []
+    return [sub for sub, script, present, _pins in PIECES
+            if os.path.isfile(os.path.join(pkg, script)) and not present(pkg)]
+
+
+def _and(names: list[str]) -> str:
+    return names[0] if len(names) < 2 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _repair_reason(det: dict, st: dict, units: dict, missing: list[str]) -> str | None:
+    """Why the installed package needs its install.sh again (same folder, nothing downloaded but what is missing),
+    or None. install.sh writes the environment file first, then the shims and units, and the driver check's line
+    last (20261104 :62-87, :224-273): a run cut short leaves a package that reads as installed with the earlier
+    package's check line (XESS-2)."""
+    pkg = det["path"]
+    if not det["installed"] or not pkg:
+        return None
+    if missing:
+        names = [PIECE_NAMES.get(m, f"{m}/") for m in missing]
+        return f"{_and(names)} {'was' if len(names) == 1 else 'were'} not downloaded"
+    if det["how"] != "env":
+        return f"{ENV_FILE} does not name this package"
+    if not st["lib"]:
+        return "the driver check has not run for this package"
+    if not _under(os.path.realpath(st["lib"]), pkg):
+        return "the driver check belongs to another folder"
+    if units.get("check") == "not-found":
+        return "the login check unit is missing"
+    if st["state"] == "failed":
+        return "the driver check failed"
+    return None
+
+
+def _same_downloads(script: str, pins, a: bytes | None, b: bytes | None) -> str | None:
+    """Why two releases' get scripts fetch the same files ("is unchanged", "pins the same downloads"), or None."""
+    if a is None or b is None:
+        return None
+    if a == b:
+        return f"{script} is unchanged"
+    pa = [m.group(0).strip() for m in pins.finditer(a)]
+    if pa and pa == [m.group(0).strip() for m in pins.finditer(b)]:
+        return f"{script} pins the same downloads"
+    return None
 
 
 def _reuse_downloads(ctx, job, old: str, new: str) -> list[str]:
-    """Copy igc/, xess/ and ffx/ from the old package when the new release fetches them with the very same script:
-    install.sh then skips 95-230 MB, 77 MB and 87 MB of downloads."""
+    """Copy igc/, xess/ and ffx/ from the old package when the new release fetches the same files (its get script is
+    unchanged, or pins the same versions and checksums): install.sh then skips 95-230 MB, 77 MB and 87 MB of
+    downloads, and a rate-limited GitHub API cannot leave the new package without a compiler."""
     copied = []
-    for sub, script, present in PIECES:
-        if not present(old) or os.path.lexists(os.path.join(new, sub)):
+    for sub, script, present, pins in PIECES:
+        if not present(old) or os.path.lexists(os.path.join(new, sub)) or not os.path.isfile(os.path.join(new, script)):
             continue
-        a = context.read_small(os.path.join(old, script), 1 << 20)
-        b = context.read_small(os.path.join(new, script), 1 << 20)
-        if a is None or b is None or a != b:
+        same = _same_downloads(script, pins, context.read_small(os.path.join(old, script), 1 << 20),
+                               context.read_small(os.path.join(new, script), 1 << 20))
+        if same is None:
             _say(job, f"{sub}/: {script} differs in this release, so install.sh downloads it again")
             continue
-        _say(job, f"Copying {sub}/ from {old} ({script} is unchanged)")
+        _say(job, f"Copying {sub}/ from {old} ({same})")
         r = userexec.run(ctx, ["cp", "-a", "--", os.path.join(old, sub), os.path.join(new, sub)], timeout=1800)
         if r.rc == 0:
             copied.append(sub)
@@ -857,8 +1075,8 @@ def _apply_driver(ctx, settings, job, pkg: str) -> str | None:
     if any(d["default"] and d["version"].startswith(pref) for d in have):
         return None
     _say(job, f"Making Mesa {pref} the default again (tools/switch-driver.sh {pref})")
-    r = userexec.run(ctx, ["bash", os.path.join(pkg, "tools", "switch-driver.sh"), pref], cwd=pkg,
-                     on_line=job.say if job else None)
+    r = _run_script(ctx, os.path.join(pkg, "tools", "switch-driver.sh"), pref, cwd=pkg,
+                    on_line=job.say if job else None)
     if r.rc != 0:
         return f"Mesa {pref} could not be made the default again: {_tail(r, 2)}"
     return None
@@ -873,19 +1091,19 @@ def _install_into(ctx, settings, job, *, tag: str, new: str, old: str | None, kn
     _stop_watcher(ctx, job)
     if old:
         _say(job, f"Running {old}/uninstall.sh")
-        r = userexec.run(ctx, ["bash", os.path.join(old, "uninstall.sh")], cwd=old, on_line=job.say)
+        r = _run_script(ctx, os.path.join(old, "uninstall.sh"), cwd=old, on_line=job.say)
         if r.rc != 0:
             _start_watcher(ctx, job)
             settings.set("xess_old_folders", _remember_old(settings, new))
             return _err(step, f"uninstall.sh of {old} failed (exit {r.rc}): {_tail(r)}; nothing was changed, the "
                               f"new release stays in {new}", tag=tag, package_dir=old)
     _say(job, f"Running {new}/install.sh (it downloads the compiler and Intel's SDK when missing)")
-    r = userexec.run(ctx, ["bash", os.path.join(new, "install.sh")], cwd=new, on_line=job.say)
+    r = _run_script(ctx, os.path.join(new, "install.sh"), cwd=new, on_line=job.say)
     if r.rc != 0:
         rolled_back = None
         if old:
             _say(job, f"install.sh failed; putting {old} back with its install.sh")
-            rb = userexec.run(ctx, ["bash", os.path.join(old, "install.sh")], cwd=old, on_line=job.say)
+            rb = _run_script(ctx, os.path.join(old, "install.sh"), cwd=old, on_line=job.say)
             rolled_back = rb.rc == 0
             if not rolled_back:
                 _say(job, f"{old}/install.sh failed too (exit {rb.rc})")
@@ -896,6 +1114,16 @@ def _install_into(ctx, settings, job, *, tag: str, new: str, old: str | None, kn
         return _err(step, f"install.sh failed (exit {r.rc}): {_tail(r)}", tag=tag, package_dir=old or known,
                     rolled_back=rolled_back)
     warnings, notes = [], []
+    previous = old or (known if known != new else None)
+    # XESS-1: install.sh exits 0 when a download fails; the old folder (still listed) is hidden while it holds the
+    # only compiler (_state), and Repair copies it back or downloads again
+    for sub in _missing_downloads(new):
+        w = (f"{PIECE_NAMES.get(sub, sub + '/')} was not downloaded (see install.sh's output above); Repair on the "
+             "XeSS tab runs install.sh again to fetch it.")
+        if sub == "igc" and previous and _igc_present(previous):
+            w += f" {previous} keeps its compiler until then."
+        warnings.append(w)
+        _say(job, w)
     w = _apply_driver(ctx, settings, job, new)
     if w:
         warnings.append(w)
@@ -905,20 +1133,55 @@ def _install_into(ctx, settings, job, *, tag: str, new: str, old: str | None, kn
         notes += res.get("notes", [])
         if not res["ok"]:
             warnings.append(res["error"])
-    previous = old or (known if known != new else None)
     settings.update({"xess_package": new, "xess_tag": tag,
                      "xess_old_folders": _remember_old(settings, previous, exclude=new),
                      "xess_installed_at": time.time()})
     st = read_status(ctx)
+    reboot = False
+    nxt = NEXT_INSTALL
     if st["state"] == "failed":
-        warnings.append(f"The new driver failed its check ({st['reason']}). At the next login the session check "
-                        "tries the package's other driver, then the stock one (XeSS on DP4a).")
+        st, w, nxt = _check_again(ctx, job, new, st)
+        reboot = nxt == NEXT_REBOOT
+        if w:
+            warnings.append(w)
+            _say(job, w)
     steam = steamlib.steam_environ(ctx)
     relogin = steam is None or not _points_at(steam.get("VK_DRIVER_FILES"), new) or not in_place
-    _say(job, "Done. " + NEXT_INSTALL if relogin else "Done.")
+    if not relogin and nxt == NEXT_INSTALL:
+        nxt = None
+    _say(job, f"Done. {nxt}" if nxt else "Done.")
     return {"ok": True, "error": None, "tag": tag, "package_dir": new, "previous": previous,
-            "relogin_needed": relogin, "next": NEXT_INSTALL if relogin else None, "warnings": warnings,
+            "relogin_needed": relogin, "reboot_needed": reboot, "next": nxt, "warnings": warnings,
             "notes": notes, "status": st}
+
+
+def _check_again(ctx, job, pkg: str, st: dict) -> tuple[dict, str | None, str]:
+    """install.sh's driver check (session-check.sh --dry-run) failed; the dry run only reports. The check unit
+    (Type=oneshot, RemainAfterExit=yes, both releases) has been active since boot and install.sh only enables it, so
+    a log-out would not run it again while the user manager lives: restart it now. session-check.sh then switches to
+    the package's other driver, or points the user manager at the stock drivers (its fail()). Returns the status,
+    a warning and the next step: NEXT_REBOOT when the fallback is not in place."""
+    reason = st["reason"]
+    _say(job, f"The new driver failed its check ({reason}); running the session check now (systemctl --user "
+              f"restart {CHECK_UNIT})")
+    r = userexec.run(ctx, ["systemctl", "--user", "restart", CHECK_UNIT], timeout=120)
+    st = read_status(ctx)
+    if r.rc != 0:
+        return st, (f"The new driver failed its check ({reason}), and the session check could not run again "
+                    f"({_tail(r, 2)})."), NEXT_REBOOT
+    if st["state"] == "ok":
+        if st["switched_to"]:
+            return st, (f"The new default driver failed its check ({reason}); the session check made the package's "
+                        f"Mesa {st['switched_to']} driver the default instead."), NEXT_INSTALL
+        _say(job, "The session check passes now")
+        return st, None, NEXT_INSTALL
+    session = _session_env(ctx)
+    if session is not None and not _points_at(session.get("VK_DRIVER_FILES"), pkg):
+        return st, (f"The package's drivers failed their check ({st['reason'] or reason}): the session check set the "
+                    "system's stock Intel driver for the next session (XeSS runs on DP4a). A newer release of the "
+                    "package, or tools/rebuild-driver.sh, can fix it (the package's docs/debugging.md)."), NEXT_STOCK
+    return st, (f"The new driver failed its check ({st['reason'] or reason}), and the session check did not "
+                "switch this session to another driver."), NEXT_REBOOT
 
 
 def install(ctx, settings, job) -> dict:
@@ -926,7 +1189,7 @@ def install(ctx, settings, job) -> dict:
     if not _BUSY.acquire(blocking=False):
         return _err("xess install", "another XeSS task is running")
     try:
-        return _install(ctx, settings, job)
+        return _refuse_while_script(ctx, "xess install") or _install(ctx, settings, job)
     finally:
         _BUSY.release()
 
@@ -952,12 +1215,23 @@ def _install(ctx, settings, job) -> dict:
         _say(job, f"Newest release: {tag}; installed: {version or 'a release of unknown date'} in {old}")
     else:
         _say(job, f"Newest release: {tag}; nothing installed" + (f" ({pkg} is known but not set up)" if pkg else ""))
-    if pkg and version == tag:
-        st = read_status(ctx)
-        if old and st["state"] == "ok":
+    if old and (version == tag or newer(version, tag) is True):
+        # Nothing newer: up to date, or install.sh again in the folder (XESS-1, XESS-2), never a downgrade (FE-1)
+        missing = _missing_downloads(pkg)
+        reason = _repair_reason(det, read_status(ctx), _units(ctx), missing)
+        if reason is None and version == tag:
             _say(job, "Already up to date")
             return {"ok": True, "error": None, "up_to_date": True, "tag": tag, "package_dir": pkg,
                     "relogin_needed": False, "next": None}
+        if reason is None:
+            return _err(step, f"the installed {version} is newer than the newest release {tag}; nothing was changed",
+                        tag=tag, package_dir=pkg)
+        _say(job, f"{version} in {pkg}: {reason}; running its install.sh again (nothing else is downloaded)")
+        for folder in _old_folders(settings, pkg) if missing else []:   # an earlier folder's, with the same pins
+            _reuse_downloads(ctx, job, folder, pkg)
+        return _install_into(ctx, settings, job, tag=version, new=pkg, old=None, known=pkg)
+    if pkg and version == tag:
+        st = read_status(ctx)
         _say(job, f"{tag} is already unpacked in {pkg} (driver check: {st['state']}); running its install.sh again")
         return _install_into(ctx, settings, job, tag=tag, new=pkg, old=None, known=pkg)
     new = os.path.join(_managed_root(ctx), NAME_PREFIX + tag)
@@ -978,7 +1252,7 @@ def uninstall(ctx, settings, job) -> dict:
     if not _BUSY.acquire(blocking=False):
         return _err(step, "another XeSS task is running")
     try:
-        pre = _preflight(ctx, step, tools=False)
+        pre = _refuse_while_script(ctx, step) or _preflight(ctx, step, tools=False)
         if pre:
             return pre
         det = detect(ctx, settings)
@@ -987,7 +1261,7 @@ def uninstall(ctx, settings, job) -> dict:
             return _err(step, "xess-xmx-linux is not installed")
         _stop_watcher(ctx, job)
         _say(job, f"Running {pkg}/uninstall.sh")
-        r = userexec.run(ctx, ["bash", os.path.join(pkg, "uninstall.sh")], cwd=pkg, on_line=job.say)
+        r = _run_script(ctx, os.path.join(pkg, "uninstall.sh"), cwd=pkg, on_line=job.say)
         if r.rc != 0:
             _start_watcher(ctx, job)
             return _err(step, f"uninstall.sh failed (exit {r.rc}): {_tail(r)}", package_dir=pkg)
@@ -1013,6 +1287,9 @@ def set_driver(ctx, settings, prefix: str) -> dict:
     if not _BUSY.acquire(blocking=False):
         return _err(step, "another XeSS task is running", drivers=[])
     try:
+        busy = _refuse_while_script(ctx, step, drivers=[])
+        if busy:
+            return busy
         det = detect(ctx, settings)
         pkg = det["path"]
         if not det["installed"]:
@@ -1021,7 +1298,7 @@ def set_driver(ctx, settings, prefix: str) -> dict:
         if not any(d["version"].startswith(prefix) for d in have):
             names = ", ".join(d["version"] for d in have) or "none"
             return _err(step, f"no Mesa {prefix} driver in {pkg} (it has: {names})", drivers=have)
-        r = userexec.run(ctx, ["bash", os.path.join(pkg, "tools", "switch-driver.sh"), prefix], cwd=pkg, timeout=180)
+        r = _run_script(ctx, os.path.join(pkg, "tools", "switch-driver.sh"), prefix, cwd=pkg, timeout=180)
         output = [s for s in (r.out + "\n" + r.err).splitlines() if s.strip()]
         have = drivers(pkg)
         if r.rc != 0:
@@ -1118,6 +1395,9 @@ def shim_system_protons(ctx, settings, job=None) -> dict:
     if not _BUSY.acquire(blocking=False):
         return _err(step, "another XeSS task is running", done=[], failed=[], already=[], notes=[])
     try:
+        busy = _refuse_while_script(ctx, step, done=[], failed=[], already=[], notes=[])
+        if busy:
+            return busy
         det = detect(ctx, settings)
         if not det["installed"]:
             return _err(step, "xess-xmx-linux is not installed", done=[], failed=[], already=[], notes=[])
@@ -1174,21 +1454,23 @@ def remove_folder(ctx, settings, path: str) -> dict:
     if not _BUSY.acquire(blocking=False):
         return _err(step, "another XeSS task is running")
     try:
+        busy = _refuse_while_script(ctx, step)
+        if busy:
+            return busy
         real = os.path.realpath(path)
         listed = [p for p in (settings.get("xess_old_folders") or []) if isinstance(p, str)]
         if real not in [os.path.realpath(p) for p in listed]:
             return _err(step, f"{path} is not one of the earlier package folders")
-        home = os.path.realpath(ctx.home)
-        if not real.startswith(home.rstrip("/") + "/"):
-            return _err(step, f"{real} is outside {home}")
-        if not looks_like_package(real):
-            return _err(step, f"{real} does not look like an xess-xmx-linux folder (no install.sh, uninstall.sh, "
-                              "tools/session-check.sh)")
+        why = _left_to_user(ctx, real)     # outside the home, no package, a git checkout, not a release's name
+        if why:
+            return _err(step, f"{real} {why}")
         det = detect(ctx, settings)
         for p in [det["path"], det["env_pkg"], _package_from_unit(ctx)]:
             if p and (os.path.realpath(p) == real or _under(os.path.realpath(p), real)
                       or _under(real, os.path.realpath(p))):
                 return _err(step, f"{real} is the package in use")
+        if det["installed"] and "igc" in _missing_downloads(det["path"]) and _igc_present(real):
+            return _err(step, f"{real} has the only compiler (igc/): {det['path']} has none yet; use Repair first")
         steam = steamlib.steam_environ(ctx)
         if steam is not None and _references(steam.get("VK_DRIVER_FILES"), real):
             return _err(step, f"Steam still runs with the driver in {real}; log out and back in first")

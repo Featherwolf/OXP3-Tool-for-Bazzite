@@ -79,11 +79,12 @@ def from_decky() -> Ctx:
                plugin_dir=in_home(var("DECKY_PLUGIN_DIR")))
 
 
-def read_small(path: str, max_bytes: int = 1_000_000) -> bytes | None:
+def read_small(path: str, max_bytes: int = 1_000_000, dir_fd: int | None = None) -> bytes | None:
     """A regular file's content, or None when it is missing, too big, not a regular file or a symlink. Opened
-    non-blocking so a FIFO planted in a user folder cannot hang the backend."""
+    non-blocking so a FIFO planted in a user folder cannot hang the backend. dir_fd: `path` is relative to that
+    folder descriptor."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
     except OSError:
         return None
     try:
