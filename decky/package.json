@@ -7,7 +7,8 @@
     "build": "rollup -c",
     "watch": "rollup -c -w",
     "typecheck": "tsc --noEmit",
-    "test": "python3 -m unittest discover -s tests -t ."
+    "test": "python3 -m unittest discover -s tests -t .",
+    "zip": "python3 tools/build_zip.py"
   },
   "license": "MIT",
   "devDependencies": {

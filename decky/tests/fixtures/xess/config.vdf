@@ -1,0 +1,40 @@
+"InstallConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"AutoUpdateWindowEnabled"		"0"
+				"CompatToolMapping"
+				{
+					"0"
+					{
+						"name"		"proton_experimental"
+						"config"		""
+						"priority"		"75"
+					}
+					"292030"
+					{
+						"name"		"proton-cachyos-slr"
+						"config"		""
+						"priority"		"250"
+					}
+					"1091500"
+					{
+						"name"		"GE-Proton10-3"
+						"config"		""
+						"priority"		"250"
+					}
+					"570"
+					{
+						"name"		""
+						"config"		""
+						"priority"		"250"
+					}
+				}
+			}
+		}
+	}
+}

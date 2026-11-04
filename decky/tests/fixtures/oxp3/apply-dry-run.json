@@ -1,0 +1,104 @@
+{
+ "command": "apply",
+ "log": [
+  {
+   "stream": "out",
+   "text": "Planned changes:"
+  },
+  {
+   "stream": "out",
+   "text": "  buttons: Chassis buttons do what their labels say"
+  },
+  {
+   "stream": "out",
+   "text": "      create /etc/inputplumber/capability_maps.d/onexplayer_type9.yaml"
+  },
+  {
+   "stream": "out",
+   "text": "      create /etc/oxp3-tool/keys.json"
+  },
+  {
+   "stream": "out",
+   "text": "      create /usr/local/libexec/oxp3-tool/steam-actions-helper"
+  },
+  {
+   "stream": "out",
+   "text": "      create /etc/systemd/system/oxp3-tool-steam-actions.service"
+  },
+  {
+   "stream": "out",
+   "text": "      enable oxp3-tool-steam-actions.service"
+  },
+  {
+   "stream": "out",
+   "text": "      then reload systemd units"
+  },
+  {
+   "stream": "out",
+   "text": "      then restart InputPlumber so it loads the capability map"
+  },
+  {
+   "stream": "out",
+   "text": "      then start the Steam actions helper"
+  },
+  {
+   "stream": "out",
+   "text": "      takes effect: immediately (InputPlumber restarts when the map changes; reboot if the buttons act like an Xbox controller or do nothing)"
+  },
+  {
+   "stream": "out",
+   "text": "  volume-keys: Volume rocker stops sticking"
+  },
+  {
+   "stream": "out",
+   "text": "      create /etc/udev/hwdb.d/61-oxp3-tool-volume-keys.hwdb"
+  },
+  {
+   "stream": "out",
+   "text": "      then rebuild the udev hwdb"
+  },
+  {
+   "stream": "out",
+   "text": "      then make udev load the new hwdb"
+  },
+  {
+   "stream": "out",
+   "text": "      then re-run udev rules for the built-in keyboard"
+  },
+  {
+   "stream": "out",
+   "text": "      then wait for udev"
+  },
+  {
+   "stream": "out",
+   "text": "      takes effect: immediately (otherwise after a reboot)"
+  },
+  {
+   "stream": "out",
+   "text": "(dry run: nothing changed)"
+  }
+ ],
+ "ok": true,
+ "plan": [
+  "buttons: Chassis buttons do what their labels say",
+  "    create /etc/inputplumber/capability_maps.d/onexplayer_type9.yaml",
+  "    create /etc/oxp3-tool/keys.json",
+  "    create /usr/local/libexec/oxp3-tool/steam-actions-helper",
+  "    create /etc/systemd/system/oxp3-tool-steam-actions.service",
+  "    enable oxp3-tool-steam-actions.service",
+  "    then reload systemd units",
+  "    then restart InputPlumber so it loads the capability map",
+  "    then start the Steam actions helper",
+  "    takes effect: immediately (InputPlumber restarts when the map changes; reboot if the buttons act like an Xbox controller or do nothing)",
+  "volume-keys: Volume rocker stops sticking",
+  "    create /etc/udev/hwdb.d/61-oxp3-tool-volume-keys.hwdb",
+  "    then rebuild the udev hwdb",
+  "    then make udev load the new hwdb",
+  "    then re-run udev rules for the built-in keyboard",
+  "    then wait for udev",
+  "    takes effect: immediately (otherwise after a reboot)"
+ ],
+ "rc": 0,
+ "schema": 1,
+ "version": "0.4.0"
+}

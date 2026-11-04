@@ -1,0 +1,148 @@
+{
+ "catalog": {
+  "button_actions": {
+   "fps-limit": "turn the frame limit on or off (--fps-limit, default 72; Steam's own with Decky Loader; through oxp3-tool's helper)",
+   "guide": "Steam button (opens the Steam menu; hold it for Steam+button shortcuts)",
+   "home": "Steam Home screen (through oxp3-tool's helper)",
+   "keyboard": "Steam on-screen keyboard (native Steam Input: through oxp3-tool's helper; a second press closes it in Game Mode with Decky Loader)",
+   "keyboard-chord": "Steam on-screen keyboard through the Steam+X shortcut (no helper)",
+   "ogui-menu": "OpenGamepadUI menu (with native Steam Input this takes a screenshot instead)",
+   "quick-access": "Quick Access menu (the '...' button)",
+   "screenshot": "Steam screenshot"
+  },
+  "button_keys": {
+   "home": {
+    "default": "guide",
+    "flag": "--home",
+    "label": "home key (MCU button 0x24, decoded by InputPlumber as gamepad Keyboard)",
+    "stock": "keyboard-chord"
+   },
+   "keyboard": {
+    "default": "keyboard",
+    "flag": "--keyboard-key",
+    "label": "keyboard key (sends Ctrl+Meta+O)",
+    "stock": "ogui-menu"
+   },
+   "onex": {
+    "default": "quick-access",
+    "flag": "--onex-key",
+    "label": "ONEX / console key (sends Ctrl+Alt+Meta)",
+    "stock": "quick-access"
+   },
+   "xbox": {
+    "default": "guide",
+    "flag": "--xbox-key",
+    "label": "Xbox key (arrives as the gamepad Guide button)",
+    "stock": "guide"
+   }
+  },
+  "fixes": [
+   {
+    "details": "InputPlumber 0.82 supports the OXP3 controller, but its stock map (id oxp9)\nsends the keyboard key to QuickAccess2 and the home key to gamepad Keyboard.\nIn Bazzite's default Game Mode, which runs Steam behind the OpenGamepadUI\noverlay, that makes the keyboard key open the OpenGamepadUI menu and the home key\ndo nothing; with native Steam Input (CachyOS always, Bazzite after\n`ujust configure-opengamepadui disable`) they take a screenshot and open the keyboard.\nThis installs a replacement map with the same id in\n/etc/inputplumber/capability_maps.d, written for the Game Mode input in use.\nDefaults: ONEX/console -> Quick Access, keyboard key -> Steam on-screen keyboard,\nhome -> Steam menu, Xbox key -> Steam menu (as stock). Choose others with\n--onex-key, --keyboard-key, --home and --xbox-key (guide, quick-access, keyboard,\nkeyboard-chord, home, fps-limit, screenshot, ogui-menu; `oxp3-tool list` ends\nwith what each does). --xbox-key also sets what the xbox-key helper does.\nSome actions are not a button: a small helper service\n(oxp3-tool-steam-actions.service) carries them out in your Steam session.\n- keyboard (native Steam Input) opens and closes Steam's keyboard in Game Mode\n  the way Steam+X does, in Steam's own interface over its remote debugging\n  (Decky Loader turns it on), on any screen (over the game while one runs);\n  Steam's Steam+X shortcut itself does nothing on some setups. In Desktop\n  Mode, or without remote debugging, it sends steam://open/keyboard, which\n  Game Mode only acts on while a game is in front. keyboard-chord sends\n  Steam+X instead.\n- home takes Game Mode to its Home screen (steam://open/library).\n- fps-limit turns a frame limit of --fps-limit (default 72) on, and the next\n  press turns it off. With Steam's remote debugging on (Decky Loader turns it\n  on) it changes Steam's global frame limit, which Quick Access shows, using\n  the nearest value Quick Access offers. Otherwise, or while the game has its\n  own per-game profile, it sets gamescope's limit (values that divide 144 keep\n  the panel at 144 Hz with VRR off). Steam is not told then: Quick Access keeps\n  showing its own setting, Steam replaces the limit when it next sends its own,\n  and off means 144 Hz again. Either way it caps games, never Steam's own\n  screens: check it in a game that runs faster, with the performance overlay on.\nOnly the Steam button can be held for Steam+button shortcuts, and the\nxbox-key helper can only tap, so keep guide on Home to keep them.\nCheck each key with `inputplumber device 0 test` (press q to quit; closing the\nwindow instead leaves InputPlumber in test mode until\n`sudo systemctl restart inputplumber`; with native Steam Input, then reboot, or on\nBazzite run `systemctl --user restart bazzite-native-steam-input.service`, to get the\nSteam Deck controller back). A key that goes to the helper shows\nnothing there; `journalctl -u oxp3-tool-steam-actions.service -f` logs its presses\n(`journalctl -u oxp3-tool-xbox-key.service -f` for an Xbox key the xbox-key helper reads).\nYour choice is kept when you apply again\n(--defaults resets it). On Bazzite, apply again after\n`ujust configure-opengamepadui` switches Game Mode input. The override replaces\nthe whole stock map, so it is only recommended while the stock map is the one it\nwas written for (InputPlumber 0.82.0 to 0.83.1).\nInputPlumber is restarted when the map changes.",
+    "group": "controller",
+    "id": "buttons",
+    "level": "recommended",
+    "summary": "Keyboard key opens the on-screen keyboard, Home opens Steam (InputPlumber map)",
+    "takes_effect": "immediately (InputPlumber restarts when the map changes; reboot if the buttons act like an Xbox controller or do nothing)",
+    "title": "Chassis buttons do what their labels say"
+   },
+   {
+    "details": "On some OXP3 units the controller reports the Xbox key (the lit logo key below\nHome) only on its vendor interface, as button 0x25. InputPlumber 0.82 cannot\ndecode that id: it logs 'OXP HID: failed to parse B2 report ... 25 ...' and the\nkey does nothing. Which units do this depends on the button layout stored in the\ncontroller (OneXConsole on Windows can change it); on others the key arrives as\nthe normal Xbox guide button and works without this fix.\nThis installs a small helper and a systemd service that read that interface\n(read-only: nothing is written to the controller). On each press the helper\ndoes what `oxp3-tool apply buttons --xbox-key` chose, read from\n/etc/oxp3-tool/keys.json (the Steam button when buttons is not applied):\na button tap through InputPlumber over D-Bus, or a Steam action in your session\n(keyboard, home, fps-limit). The key can only tap: holding it for Steam+button\nshortcuts does not work (InputPlumber 0.82's hold-capable D-Bus call is\nbroken); use Home for those.\nFiles: /usr/local/libexec/oxp3-tool/xbox-key-helper and /etc/systemd/system/oxp3-tool-xbox-key.service.\nRecommended when InputPlumber's log shows button 25 this boot (press the key\nonce, then run `sudo oxp3-tool status`).",
+    "group": "controller",
+    "id": "xbox-key",
+    "level": "optional",
+    "summary": "Helper that gives the Xbox key (vendor button 0x25) a job",
+    "takes_effect": "immediately",
+    "title": "Xbox key works (as the Steam button, or what --xbox-key chose)"
+   },
+   {
+    "details": "The OXP3 embedded controller drops the key-release scancodes of the volume\nrocker, so volume keeps changing after the key is let go. This adds a udev hwdb\nentry marking both keys as force-release. Trade-off: holding a volume key no\nlonger auto-repeats. Not for use with Handheld Daemon, which drops the forced\nreleases together with the presses (hhd#342). A reboot is needed to fully undo\nit after revert.",
+    "group": "controller",
+    "id": "volume-keys",
+    "level": "recommended",
+    "summary": "Force key releases for the volume rocker (EC drops them)",
+    "takes_effect": "immediately (otherwise after a reboot)",
+    "title": "Volume rocker stops sticking"
+   },
+   {
+    "details": "The OXP3's BMI260 IMU uses ACPI ID 10EC5280, which both bmi160_i2c and (on\nkernels with the OGC patch, such as Bazzite's; not CachyOS's yet) bmi270_i2c\nclaim. bmi160 cannot drive the chip. If the gyro is\nmissing (no IIO device named 'bmi260'), this keeps bmi160_i2c from loading so\nbmi270 can bind. Only offered when the running kernel's bmi270_i2c knows 10EC5280.\nUntested on hardware. Needs a reboot.",
+    "group": "controller",
+    "id": "gyro",
+    "level": "experimental",
+    "summary": "Blacklist bmi160_i2c so the BMI260 IMU shows up for InputPlumber",
+    "takes_effect": "after reboot",
+    "title": "Let bmi270 drive the gyro"
+   },
+   {
+    "details": "InputPlumber ships inputplumber-suspend.service, which pauses its virtual\ncontrollers before sleep and restores them after resume. Neither Bazzite nor\nCachyOS enables it. Try this if the controller misbehaves after waking from\nsleep. Untested on the OXP3.",
+    "group": "controller",
+    "id": "inputplumber-suspend",
+    "level": "experimental",
+    "summary": "Enable InputPlumber's own suspend/resume hook (shipped but disabled)",
+    "takes_effect": "from the next suspend",
+    "title": "InputPlumber sleep hook"
+   },
+   {
+    "details": "On the OXP3 the firmware asks for ACPI 'simple suspend' on the SSD, and the\nAcer Predator GM7 (PCI 1dee:1602) then fails to come back: the kernel logs\n'Disabling device after reset failure: -19', the root file system drops out,\nthe screen stays black and the device will not sleep again until it is powered\noff. nvme.noacpi=1 turns simple suspend off and fixed resume in community\ntesting on the OXP3. Recommended with the GM7, when the kernel log shows the\nfailure, or when the firmware uses simple suspend for the installed SSD;\n--any-ssd applies it anyway. Costs a little battery while asleep. Needs a reboot.",
+    "group": "display",
+    "id": "nvme-resume",
+    "level": "recommended",
+    "summary": "nvme.noacpi=1 so the SSD comes back from sleep (black screen, no further sleep)",
+    "takes_effect": "after reboot",
+    "title": "SSD survives sleep"
+   },
+   {
+    "details": "gamescope drives the OXP3 panel (Samsung SDC 0x4301, the Legion Go 2 panel) with\nBT.2020/PQ when HDR is on. On the OXP3 that leaves the panel black in Game Mode,\nincluding after boot, session switches and resume, and the brightness slider\nstops working. This installs a gamescope display profile in /etc/gamescope/scripts\nthat keeps the panel in its native gamma 2.2 mode (the Steam Deck OLED approach):\nHDR still works through gamescope's tone mapping. It also lists the panel's\n48-144 Hz refresh rates; --min-refresh=30 extends that down to 30 Hz (untested,\nkept when you apply again). Only Game Mode (bazzite-deck images, CachyOS Handheld\nEdition) uses it; it does not change HDR in Desktop Mode, where KDE always sends\nPQ (keep HDR off there). gamescope 3.17 ships a Legion Go 2 profile that matches\nthis panel with PQ; this one takes priority over it.",
+    "group": "display",
+    "id": "oled-profile",
+    "level": "recommended",
+    "summary": "gamescope profile that keeps the OLED out of PQ/BT.2020 mode",
+    "takes_effect": "next time Game Mode starts",
+    "title": "No black screen from HDR"
+   },
+   {
+    "details": "Panel Replay is the eDP power-saving mode that most often breaks on Panther Lake\nOLED panels. Setting xe.enable_panel_replay=0 falls back to PSR (selective update\nwhere the panel supports it, else PSR1). On the OXP3 it kept the display working\nin community testing but did not cure all tearing or the white dots that flicker\non dark scenes, and nobody has shown it fixes resume problems. Intel calls these\ndebug knobs; the kernel marks itself tainted when they are set. Costs some\nbattery. Never combined with xe.enable_psr=0 or xe.enable_psr2_sel_fetch=0: both\ncombinations gave a black screen on the OXP3. Needs a reboot.",
+    "group": "display",
+    "id": "xe-panel-replay-off",
+    "level": "experimental",
+    "summary": "xe.enable_panel_replay=0 for intermittent black or garbled screens",
+    "takes_effect": "after reboot",
+    "title": "Disable Panel Replay (xe)"
+   },
+   {
+    "details": "Makes the kernel use Intel's eDP HDR backlight interface, which switches the\npanel into HDR decoding and sets its brightness in nits. Only offered when the\npanel reports the interface and eDP 1.4b or older (read-only DPCD check, needs\nroot): the kernel never uses it on eDP 1.5 panels, which is what OXP3 panels have\nreported so far. No report shows it fixing the Desktop Mode HDR black screen,\nwhich also happens on other Intel OLED laptops (KDE bug 525650); on a Panther\nLake Dell XPS 14 OLED it left brightness dead. The kernel log hint suggesting\nenable_dpcd_backlight=3 is not a reliable sign that it helps.\nUntested on the OXP3: HDR brightness moves to the panel's AUX channel, and SDR\nbrightness too if the panel reports 'SDR brightness over AUX' (otherwise it stays\non the SoC's PWM output, and a slider that works today may stop working). Before\ntrying it, make sure you can boot without it: on Bazzite run\n`ujust configure-grub show` so the boot menu can start the previous version (you\nneed a keyboard there); on CachyOS edit the entry in the boot loader's menu for\none boot (you need a USB keyboard there; with an enrolled Limine config checksum\nLimine has no editor, so keep a CachyOS USB stick ready). Or keep SSH ready.\nTest in Desktop Mode (System Settings > Display > HDR). Game Mode keeps HDR\ntone-mapped while oled-profile is applied. Needs a reboot.",
+    "group": "display",
+    "id": "xe-hdr-backlight",
+    "level": "experimental",
+    "summary": "xe.enable_dpcd_backlight=3 (not shown to fix HDR blanking; n/a on eDP 1.5 panels)",
+    "takes_effect": "after reboot",
+    "title": "Force Intel's panel backlight interface"
+   },
+   {
+    "details": "Under gamescope the xe driver can log '[CRTC:...] DSB 0 poll error' every frame,\nflooding the journal; some Panther Lake users also see cursor trails or flicker.\nxe.enable_dsb=0 makes the driver program the display without the Display State\nBuffer. Cosmetic: it does not fix suspend or resume. Taints the kernel. Needs a\nreboot.",
+    "group": "display",
+    "id": "xe-dsb-off",
+    "level": "optional",
+    "summary": "xe.enable_dsb=0 to stop 'DSB poll error' log floods and cursor trails",
+    "takes_effect": "after reboot",
+    "title": "Disable DSB (xe)"
+   }
+  ],
+  "fps_limit": {
+   "default": 72,
+   "max": 144,
+   "min": 10
+  },
+  "min_refresh": {
+   "default": 48,
+   "max": 48,
+   "min": 30
+  }
+ },
+ "command": "list",
+ "log": [],
+ "ok": true,
+ "rc": 0,
+ "schema": 1,
+ "version": "0.4.0"
+}

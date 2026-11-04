@@ -46,6 +46,16 @@ sudo oxp3-tool revert --all         # undo every fix, then reboot if kernel argu
 curl -fsSL https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/uninstall.sh | sudo bash
 ```
 
+## Decky plugin
+
+**OXP3 Deck** does the same from Quick Access in Game Mode, with no Konsole: it installs and updates oxp3-tool, shows its status, applies and reverts fixes, sets the button layout and switches kernels. It also installs and updates [xess-xmx-linux](https://github.com/HHHHanasak1/xess-xmx-linux) (XeSS on the Arc GPU's XMX cores) and sets its per-game launch options. It needs [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader). In Decky's settings, turn on Developer mode, then under Developer > Install Plugin from URL enter:
+
+```
+https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/decky/release/OXP3Deck.zip
+```
+
+It is new and not yet tested on a real device. Uninstalling the plugin reverts nothing: revert fixes and uninstall XeSS with its buttons first. See [decky/README.md](decky/README.md).
+
 ## Common problems
 
 | What you see | Most likely cause | What to do |

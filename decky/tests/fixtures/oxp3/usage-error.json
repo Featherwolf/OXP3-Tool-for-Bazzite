@@ -1,0 +1,13 @@
+{
+ "command": null,
+ "log": [
+  {
+   "stream": "err",
+   "text": "error: argument --home: invalid choice: 'nope' (choose from 'guide', 'quick-access', 'keyboard', 'keyboard-chord', 'home', 'fps-limit', 'screenshot', 'ogui-menu')"
+  }
+ ],
+ "ok": false,
+ "rc": 2,
+ "schema": 1,
+ "version": "0.4.0"
+}

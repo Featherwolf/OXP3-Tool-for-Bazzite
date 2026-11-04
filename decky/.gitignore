@@ -2,4 +2,8 @@ node_modules/
 dist/
 out/
 *.zip
+# The release copy users install from its raw GitHub URL (tools/build_zip.py writes it)
+!release/OXP3Deck.zip
+# build_zip.py's temporary file, left behind only if it was killed
+.*.zip.*.tmp
 __pycache__/

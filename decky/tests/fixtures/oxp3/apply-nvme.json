@@ -1,0 +1,53 @@
+{
+ "command": "apply",
+ "log": [
+  {
+   "stream": "out",
+   "text": "Planned changes:"
+  },
+  {
+   "stream": "out",
+   "text": "  nvme-resume: SSD survives sleep"
+  },
+  {
+   "stream": "out",
+   "text": "      add kernel argument nvme.noacpi=1 (Limine drop-in, then limine-mkinitcpio, reboot needed)"
+  },
+  {
+   "stream": "out",
+   "text": "      takes effect: after reboot"
+  },
+  {
+   "stream": "out",
+   "text": "Applying:"
+  },
+  {
+   "stream": "out",
+   "text": "  running: limine-mkinitcpio (rebuilds every kernel's initramfs and Limine boot entry; this takes a minute or two)"
+  },
+  {
+   "stream": "out",
+   "text": "Reboot to finish (kernel arguments change at boot)."
+  },
+  {
+   "stream": "out",
+   "text": "Done."
+  }
+ ],
+ "ok": true,
+ "outcome": {
+  "changed": true,
+  "errors": [],
+  "messages": [],
+  "ok": true,
+  "reboot_needed": true
+ },
+ "plan": [
+  "nvme-resume: SSD survives sleep",
+  "    add kernel argument nvme.noacpi=1 (Limine drop-in, then limine-mkinitcpio, reboot needed)",
+  "    takes effect: after reboot"
+ ],
+ "rc": 0,
+ "schema": 1,
+ "version": "0.4.0"
+}

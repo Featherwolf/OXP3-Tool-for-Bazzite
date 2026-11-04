@@ -1,0 +1,186 @@
+{
+ "command": "status",
+ "log": [],
+ "ok": true,
+ "rc": 0,
+ "schema": 1,
+ "status": {
+  "boot": "Limine",
+  "can_change": true,
+  "device": {
+   "bios": "5.09",
+   "product": "ONEXPLAYER 3",
+   "supported": true,
+   "vendor": "ONE-NETBOOK"
+  },
+  "fixes": [
+   {
+    "applied_at": null,
+    "group": "controller",
+    "id": "buttons",
+    "level": "recommended",
+    "notes": [],
+    "options": {},
+    "pending": null,
+    "state": "recommended",
+    "summary": "Keyboard key opens the on-screen keyboard, Home opens Steam (InputPlumber map)",
+    "takes_effect": "immediately (InputPlumber restarts when the map changes; reboot if the buttons act like an Xbox controller or do nothing)",
+    "title": "Chassis buttons do what their labels say"
+   },
+   {
+    "applied_at": null,
+    "group": "controller",
+    "id": "xbox-key",
+    "level": "optional",
+    "notes": [
+     "the controller's vendor interface (1a86:fe00, interface 2) was not found"
+    ],
+    "options": {},
+    "pending": null,
+    "state": "n/a",
+    "summary": "Helper that gives the Xbox key (vendor button 0x25) a job",
+    "takes_effect": "immediately",
+    "title": "Xbox key works (as the Steam button, or what --xbox-key chose)"
+   },
+   {
+    "applied_at": null,
+    "group": "controller",
+    "id": "volume-keys",
+    "level": "recommended",
+    "notes": [],
+    "options": {},
+    "pending": null,
+    "state": "recommended",
+    "summary": "Force key releases for the volume rocker (EC drops them)",
+    "takes_effect": "immediately (otherwise after a reboot)",
+    "title": "Volume rocker stops sticking"
+   },
+   {
+    "applied_at": null,
+    "group": "controller",
+    "id": "gyro",
+    "level": "experimental",
+    "notes": [],
+    "options": {},
+    "pending": null,
+    "state": "experimental",
+    "summary": "Blacklist bmi160_i2c so the BMI260 IMU shows up for InputPlumber",
+    "takes_effect": "after reboot",
+    "title": "Let bmi270 drive the gyro"
+   },
+   {
+    "applied_at": null,
+    "group": "controller",
+    "id": "inputplumber-suspend",
+    "level": "experimental",
+    "notes": [],
+    "options": {},
+    "pending": null,
+    "state": "experimental",
+    "summary": "Enable InputPlumber's own suspend/resume hook (shipped but disabled)",
+    "takes_effect": "from the next suspend",
+    "title": "InputPlumber sleep hook"
+   },
+   {
+    "applied_at": "2026-11-04T19:20:20+00:00",
+    "group": "display",
+    "id": "nvme-resume",
+    "level": "recommended",
+    "notes": [
+     "nvme.noacpi=1 is set for the next boot (reboot to activate)"
+    ],
+    "options": {
+     "any_ssd": true,
+     "evidence": [
+      "the Predator GM7 SSD is installed (the hardware-tested case)"
+     ]
+    },
+    "pending": "reboot",
+    "state": "applied",
+    "summary": "nvme.noacpi=1 so the SSD comes back from sleep (black screen, no further sleep)",
+    "takes_effect": "after reboot",
+    "title": "SSD survives sleep"
+   },
+   {
+    "applied_at": null,
+    "group": "display",
+    "id": "oled-profile",
+    "level": "recommended",
+    "notes": [],
+    "options": {},
+    "pending": null,
+    "state": "recommended",
+    "summary": "gamescope profile that keeps the OLED out of PQ/BT.2020 mode",
+    "takes_effect": "next time Game Mode starts",
+    "title": "No black screen from HDR"
+   },
+   {
+    "applied_at": null,
+    "group": "display",
+    "id": "xe-panel-replay-off",
+    "level": "experimental",
+    "notes": [],
+    "options": {},
+    "pending": null,
+    "state": "experimental",
+    "summary": "xe.enable_panel_replay=0 for intermittent black or garbled screens",
+    "takes_effect": "after reboot",
+    "title": "Disable Panel Replay (xe)"
+   },
+   {
+    "applied_at": null,
+    "group": "display",
+    "id": "xe-hdr-backlight",
+    "level": "experimental",
+    "notes": [
+     "could not check the panel: no DP AUX device for the eDP panel (/dev/drm_dp_aux*)"
+    ],
+    "options": {},
+    "pending": null,
+    "state": "n/a",
+    "summary": "xe.enable_dpcd_backlight=3 (not shown to fix HDR blanking; n/a on eDP 1.5 panels)",
+    "takes_effect": "after reboot",
+    "title": "Force Intel's panel backlight interface"
+   },
+   {
+    "applied_at": null,
+    "group": "display",
+    "id": "xe-dsb-off",
+    "level": "optional",
+    "notes": [],
+    "options": {},
+    "pending": null,
+    "state": "optional",
+    "summary": "xe.enable_dsb=0 to stop 'DSB poll error' log floods and cursor trails",
+    "takes_effect": "after reboot",
+    "title": "Disable DSB (xe)"
+   }
+  ],
+  "game_mode": true,
+  "game_mode_input": "steam",
+  "needs_root": false,
+  "notes": [],
+  "os": {
+   "handheld": true,
+   "image": null,
+   "kernel": "7.2.11-1-cachyos-deckify",
+   "name": "CachyOS",
+   "platform": "cachyos"
+  },
+  "reboot_pending": true,
+  "rebuild_unfinished": null,
+  "refresh": {
+   "advice": [
+    "Could not read the display firmware version. If it is v2.33 or later, variable refresh (Adaptive Sync, VRR) holds the screen far below 144 Hz on this kernel."
+   ],
+   "summary": [
+    "display mode not checked: no readable i915_display_info for eDP-1 under /sys/kernel/debug/dri",
+    "display firmware (DMC) version unknown; the kernel predates the variable-refresh fix (7.2.10)"
+   ]
+  },
+  "secure_boot": false,
+  "text": "oxp3-tool 0.4.0\nDevice:   ONE-NETBOOK ONEXPLAYER 3 (BIOS 5.09) - supported\nOS:       CachyOS, Handheld Edition, kernel 7.2.11-1-cachyos-deckify\nBoot:     Limine (/etc/limine-entry-tool.d/90-oxp3-tool.conf, then `limine-mkinitcpio`)\nInput:    InputPlumber 0.83.1 (active), OXP3 config /usr/share/inputplumber/devices/50-onexplayer_3.yaml, map oxp9\nDisplay:  card1-eDP-1: SDC 0x4301 (AMS881KB01-0); xe loaded; gamescope Game Mode\nStorage:  nvme0 Predator SSD GM7 1TB (1dee:1602)\nGyro:     IMU driver bmi160_i2c; IIO devices: none\nSleep:    mem_sleep [s2idle]\nPanel:    not checked: no DP AUX device for the eDP panel (/dev/drm_dp_aux*)\nRefresh:  display mode not checked: no readable i915_display_info for eDP-1 under /sys/kernel/debug/dri\n          display firmware (DMC) version unknown; the kernel predates the variable-refresh fix (7.2.10)\nGame Mode: native Steam Input (CachyOS gamescope-session; Steam gets InputPlumber's Xbox Elite controller (no steamos-manager))\n\nController fixes\n  [recommended ] buttons               Keyboard key opens the on-screen keyboard, Home opens Steam (InputPlumber map)\n  [n/a         ] xbox-key              Helper that gives the Xbox key (vendor button 0x25) a job\n                                       the controller's vendor interface (1a86:fe00, interface 2) was not found\n  [recommended ] volume-keys           Force key releases for the volume rocker (EC drops them)\n  [experimental] gyro                  Blacklist bmi160_i2c so the BMI260 IMU shows up for InputPlumber\n  [experimental] inputplumber-suspend  Enable InputPlumber's own suspend/resume hook (shipped but disabled)\n\nDisplay and wake-from-sleep fixes\n  [applied     ] nvme-resume           nvme.noacpi=1 so the SSD comes back from sleep (black screen, no further sleep)\n                                       nvme.noacpi=1 is set for the next boot (reboot to activate)\n  [recommended ] oled-profile          gamescope profile that keeps the OLED out of PQ/BT.2020 mode\n  [experimental] xe-panel-replay-off   xe.enable_panel_replay=0 for intermittent black or garbled screens\n  [n/a         ] xe-hdr-backlight      xe.enable_dpcd_backlight=3 (not shown to fix HDR blanking; n/a on eDP 1.5 panels)\n                                       could not check the panel: no DP AUX device for the eDP panel (/dev/drm_dp_aux*)\n  [optional    ] xe-dsb-off            xe.enable_dsb=0 to stop 'DSB poll error' log floods and cursor trails\n\nRefresh rate\n  - Could not read the display firmware version. If it is v2.33 or later, variable refresh (Adaptive\n    Sync, VRR) holds the screen far below 144 Hz on this kernel.\n\n`sudo oxp3-tool apply` applies the recommended fixes; `oxp3-tool list` explains each one.",
+  "warnings": []
+ },
+ "version": "0.4.0"
+}

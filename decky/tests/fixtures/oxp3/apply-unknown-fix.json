@@ -1,0 +1,13 @@
+{
+ "command": "apply",
+ "log": [
+  {
+   "stream": "err",
+   "text": "error: unknown fix: no-such-fix (see `oxp3-tool list`)"
+  }
+ ],
+ "ok": false,
+ "rc": 1,
+ "schema": 1,
+ "version": "0.4.0"
+}

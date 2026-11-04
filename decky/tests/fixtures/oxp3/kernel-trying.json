@@ -1,0 +1,64 @@
+{
+ "command": "kernel",
+ "kernel": {
+  "conf": "/boot/limine.conf",
+  "kernels": [
+   {
+    "default": true,
+    "entry": "CachyOS/linux-cachyos-deckify",
+    "package": "linux-cachyos-deckify",
+    "release": "7.2.11-1-cachyos-deckify",
+    "running": true,
+    "usable": true
+   },
+   {
+    "default": false,
+    "entry": "CachyOS/linux-cachyos-deckify-vsw",
+    "package": "linux-cachyos-deckify-vsw",
+    "release": "7.2.11-1-cachyos-deckify-vsw",
+    "running": false,
+    "usable": true
+   }
+  ],
+  "next_boot": {
+   "package": "linux-cachyos-deckify-vsw",
+   "then": "linux-cachyos-deckify",
+   "why": "one-shot"
+  },
+  "notes": [
+   "Limine boots its default entry, linux-cachyos-deckify, at every power-on (`oxp3-tool kernel try` turned remember_last_entry off; `sudo oxp3-tool kernel keep`, on the kernel to keep, puts it back)"
+  ],
+  "remember_last_entry": false,
+  "trying": true
+ },
+ "log": [
+  {
+   "stream": "out",
+   "text": "Kernels (/boot/limine.conf):"
+  },
+  {
+   "stream": "out",
+   "text": "  * linux-cachyos-deckify      7.2.11-1-cachyos-deckify  (entry CachyOS/linux-cachyos-deckify)  [running, Limine's default entry]"
+  },
+  {
+   "stream": "out",
+   "text": "    linux-cachyos-deckify-vsw  7.2.11-1-cachyos-deckify-vsw  (entry CachyOS/linux-cachyos-deckify-vsw)"
+  },
+  {
+   "stream": "out",
+   "text": "Next boot: linux-cachyos-deckify-vsw (once, asked for with `kernel try`)."
+  },
+  {
+   "stream": "out",
+   "text": "The power-on after that: linux-cachyos-deckify."
+  },
+  {
+   "stream": "out",
+   "text": "Limine boots its default entry, linux-cachyos-deckify, at every power-on (`oxp3-tool kernel try` turned remember_last_entry off; `sudo oxp3-tool kernel keep`, on the kernel to keep, puts it back)"
+  }
+ ],
+ "ok": true,
+ "rc": 0,
+ "schema": 1,
+ "version": "0.4.0"
+}
