@@ -108,12 +108,13 @@ tasks with their logs.
 - **The old folder stays** until after that re-login, because Steam still uses its driver until then. The XeSS page
   lists it under old package folders, with a button to remove it; not while it has the only compiler (the new
   folder's download failed). A git checkout, or a folder not named `xess-xmx-linux-<tag>` that the plugin did not
-  install, is yours to delete.
+  install, is yours to delete: the page lists it without a Remove button.
 - **A hand install** such as `~/Documents/xess-xmx-linux-20261031` is adopted: the plugin shows it, and updates it
   the same way. Its folder is kept like any old folder.
 - **Update** is offered only for a release newer than the installed one. **Repair** runs `install.sh` of the
   installed release again in its folder, with nothing uninstalled, when the plugin finds it unfinished (for
-  example the compiler download failed); the button says why.
+  example the compiler download failed); the button says why. Repair also works when GitHub cannot be reached
+  or is limiting requests, since it needs no release lookup.
 - **Your default Mesa driver is kept** when you chose it on the XeSS page. Each release brings its own default. The
   plugin remembers your choice and sets it again after an update. A driver switched by hand with
   `tools/switch-driver.sh` is not carried over: pick it on the XeSS page once.
@@ -149,7 +150,8 @@ next start. No re-login is needed.
 - Everything else in the launch options stays as you wrote it: wrappers such as `gamemoderun`, other variables, and
   the game's own arguments. Options without `%command%` are game arguments, so the plugin writes
   `VARIABLES %command% ARGUMENTS`, with each argument in quotes where the shell would read it otherwise
-  (`-name (Player One)` becomes `-name '(Player' 'One)'`). A `%command` without its closing `%` is shown as a warning.
+  (`-name (Player One)` becomes `-name '(Player' 'One)'`; a backslash, as in `C:\Games\cfg.ini`, stays as it is).
+  A `%command` without its closing `%` is shown as a warning.
 
 ## What it never does
 

@@ -88,12 +88,17 @@ export const installLines = (o: XessOffer, x: XessState | null | undefined, user
     lines.push(`Downloads xess-xmx-linux ${o.latest ?? "(the newest release)"} from GitHub into a new folder and runs its install.sh as ${
       who} (it also fetches Intel's XeSS SDK and compiler: a few hundred MB).`);
   }
-  // XESS-3: only a driver chosen in OXP3 Deck (xess_driver) is set again; lib/active belongs to the old folder
+  // XESS-3: only a driver chosen in OXP3 Deck (xess_driver) is set again; lib/active belongs to the old folder.
+  // RC-1: without xess_state (x null, even after installXess asked again) the job may do either: say both.
   const driver = x?.preferred_driver ? `Your default Mesa driver (Mesa ${x.preferred_driver}) is set again afterwards.`
+    : !x ? "A default Mesa driver chosen on the XeSS tab is set again afterwards; otherwise the release's own default is used."
     : o.kind === "update" ? "The new release starts with its own default Mesa driver (one switched by hand with switch-driver.sh is not carried over); pick another on the XeSS tab afterwards if needed."
     : "";
   if (o.kind === "update") {
-    const folder = x && !x.managed && x.package_dir ? `; its folder ${x.package_dir} stays, for you to remove after the re-login (XeSS tab)` : "";
+    // RC-2: a folder the XeSS tab will not remove (a git checkout, ...) is the user's to delete
+    const folder = !x || x.managed || !x.package_dir ? ""
+      : x.package_dir_kept ? `; its folder ${x.package_dir} stays: it ${x.package_dir_kept}`
+      : `; its folder ${x.package_dir} stays, for you to remove after the re-login (XeSS tab)`;
     lines.push(`First the installed ${o.version ?? "package"} is uninstalled with its own uninstall.sh${folder}. ${driver}`.trim());
   } else if (driver) {
     lines.push(driver);
@@ -102,6 +107,8 @@ export const installLines = (o: XessOffer, x: XessState | null | undefined, user
   const sys = (x?.system_protons ?? []).map((p) => p.name);
   if (sys.length) {
     lines.push(`Also puts the XMX shim into the system Proton${sys.length === 1 ? "" : "s"} ${and(sys)} as root (keeping igdext64.dll.stock); Uninstall puts the stock file back.`);
+  } else if (!x) {
+    lines.push("If system Protons (CachyOS's proton-cachyos-*) are installed, also puts the XMX shim into them as root (keeping igdext64.dll.stock); Uninstall puts the stock file back.");
   }
   lines.push(o.kind === "repair"
     ? "Close running games first. The task says at the end whether you need to log out and back in."

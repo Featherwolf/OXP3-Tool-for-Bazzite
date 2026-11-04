@@ -32,3 +32,18 @@ test("the XeSS tab says when a package script from before a plugin restart still
   // the backend refuses the xess buttons meanwhile; the README promises the page says why
   assert.match(src("pages/XeSS.tsx"), /\{x\?\.script_running && \(/);
 });
+
+test("the install confirmation asks for xess_state when the page has none (RC-1)", () => {
+  // the lines on the system Protons (shimmed as root) and the driver come from xess_state
+  const s = src("actions.tsx");
+  const fn = s.slice(s.indexOf("export const installXess"), s.indexOf("export const uninstallXess"));
+  assert.match(fn, /const state = x \?\? await xess_state\(\)/);
+  assert.match(fn, /installLines\(offer, state, user\)/);
+});
+
+test("old folders xess_remove_folder always refuses get no Remove button (RC-2)", () => {
+  const s = src("pages/XeSS.tsx");
+  assert.match(s, /\(x\.old_folders_kept \?\? \[\]\)\.map\(\(k\) => \(\s*<Note key=\{k\.path\}/);
+  assert.match(s, /x\.old_folders\.map\(\(p\) => <PanelSectionRow key=\{p\}><OldFolder /);
+  assert.doesNotMatch(s, /old_folders_kept[^\n]*<OldFolder/);
+});

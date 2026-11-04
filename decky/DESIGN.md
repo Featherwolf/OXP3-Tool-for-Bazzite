@@ -195,6 +195,10 @@ type XessState = {
   package_dir: string|null, version: string|null,      // version = folder tag
   found_by: "env"|"check-unit"|"settings"|null,  // settings: only the plugin's record (installed is then false)
   managed: boolean,                     // installed by this plugin (else: by hand, e.g. ~/Documents/...)
+  package_dir_kept: string|null,        // why xess_remove_folder would refuse package_dir once it is old, whatever
+                                        // else changes (outside the home, no package files, a git checkout, a name
+                                        // other than xess-xmx-linux-<tag> and not the plugin's), as the end of a
+                                        // sentence after the path; the update confirmation says the user deletes it
   drivers: XessDriver[], preferred_driver: string|null,
   status: { state: "ok"|"failed"|"unknown", line: string|null, driver: string|null, notes: string[],
             date: string|null, lib: string|null, driver_info: string|null, reason: string|null,
@@ -211,6 +215,8 @@ type XessState = {
   missing_tools: string[],              // curl, ar, tar, zstd, sha256sum, cmp, python3; "vulkaninfo (optional)"
   old_folders: string[],                // earlier package folders that can be removed after a re-login; one with a
                                         // compiler is left out while the installed package has none
+  old_folders_kept: { path: string, why: string }[],   // earlier ones xess_remove_folder always refuses (why: as
+                                        // package_dir_kept); the XeSS tab shows them with no Remove button
   flatpak_steam: boolean,
   latest: string|null, checked_at: number|null,   // from the last update check; latest only when it is newer
                                         // than the installed release (xess.newer; any other tag when either cannot
@@ -294,8 +300,9 @@ The frontend offers `FSR` / `FSR_FG` only when the installed package is 20261104
 
 Options without `%command%` are game arguments: the plugin writes `VARS %command% ARGS`, each argument as a literal
 shell word (`-name (Player One)` becomes `-name '(Player' 'One)'`), since Steam runs a line with `%command%` through a
-shell. Quotes group words as before; with an unclosed quote every word is taken as it is. A `%command` without the
-closing `%` is shown as a warning.
+shell. The old text is split at spaces, tabs and line ends (a no-break space stays in its word); quotes group words
+as before and are dropped, a backslash is an ordinary character (`C:\Games\cfg.ini` stays as it is); with an
+unclosed quote every word is taken as it is. A `%command` without the closing `%` is shown as a warning.
 
 ### Jobs and misc
 
@@ -327,9 +334,10 @@ A plugin stop (Decky kills the process 5 s after asking) ends the job's own step
 oxp3-tool and the xess-xmx-linux scripts (install.sh, uninstall.sh, switch-driver.sh: `userexec.run(...,
 detach=True)`) run in their own session with stdout and stderr going to a new root-only file in `/run/oxp3deck`
 instead of a pipe, so they never die of SIGPIPE and run to their end, EXIT traps included; the plugin follows that
-file while it lives and removes it when the program ends. A file is not slowed down by its reader like a pipe: it
-is emptied when a read reaches its end past 8 MB, and emptied unread at 16 MB (a program that writes faster than
-its lines are logged; one line says output was skipped). Short helpers (cp, rm, mv, the unpacker, systemctl) keep
+file while it lives and removes it when the program ends. A file does not slow its writer down as a pipe does, so
+it is read every 20 ms while nothing new is in it, emptied when a read reaches its end past 8 MB, and emptied unread
+at 16 MB (a program that writes faster than its lines are logged; one line says output was skipped): `yes` peaks at
+about 35 MB. Short helpers (cp, rm, mv, the unpacker, systemctl) keep
 their pipes. Every program run as the user gets its own session, so a timeout kills runuser's child too, not only
 runuser. While an xess-xmx-linux script runs, `/run/oxp3deck/xess-script.json` (root's, 0600, written through the
 folder's descriptor) names it with runuser's pid, its /proc start time and the plugin process; it is removed when the
@@ -360,9 +368,13 @@ finds an old record ended cannot remove the live one a job has written since.
     `buttons`, and `xbox-key` when the Xbox key needs its helper).
   - XeSS: version, driver status, a package script from before a plugin restart that still runs (`script_running`:
     the xess buttons wait for it), default Mesa driver dropdown, Install / Update / Repair / Uninstall, system
-    Protons, missing tools, downloads install.sh could not fetch (`missing_downloads`), old folders. The install
-    confirmation says what the job will do: an update uninstalls the old package first; the default Mesa driver is
-    promised back only when one was chosen in OXP3 Deck (`preferred_driver`); the system Protons get the shim as root.
+    Protons, missing tools, downloads install.sh could not fetch (`missing_downloads`), old folders (Remove, or a
+    note for one in `old_folders_kept`). The install confirmation says what the job will do: an update uninstalls the
+    old package first (and says when its folder is the user's to delete: `package_dir_kept`); the default Mesa driver
+    is promised back only when one was chosen in OXP3 Deck (`preferred_driver`); the system Protons get the shim as
+    root. A page without `xess_state` (the quick panel, Updates) asks for it before the confirmation; when that fails
+    too, the confirmation says both: the driver chosen in OXP3 Deck, else the release's, and the shim in any system
+    Proton.
   - Games: the running game, or the last one; same controls as the quick panel plus the full advice and last-run
     details.
   - Kernel: installed kernels, next boot, Try (boot once) / Keep.

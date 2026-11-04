@@ -1210,6 +1210,20 @@ class RepairTest(XessCase):
         self.assertIsNone(xess.state(self.ctx, self.settings)["xess"]["repair"])
         self.assertTrue(xess.install(self.ctx, self.settings, self.job)["up_to_date"])
 
+    def test_repair_works_without_the_release_lookup(self):
+        self.latest = downloads.DownloadError("latest release of x: HTTP 403 (GitHub's rate limit?)")
+        self.script(os.path.join(self.pkg, "install.sh"), effect=self.fake_install_of(self.pkg))
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual([c for c in self.u.commands() if c.startswith("bash")], [f"bash {self.pkg}/install.sh"])
+        self.assertTrue(any(f"repairing the installed {TAG_NEW} anyway" in line for line in self.job.log), self.job.log)
+        # nothing to repair: the lookup error is the answer, and nothing runs
+        self.u.units = UNITS_ON
+        r = xess.install(self.ctx, self.settings, self.job)
+        self.assertFalse(r["ok"])
+        self.assertIn("rate limit", r["error"])
+        self.assertEqual(len([c for c in self.u.commands() if c.startswith("bash")]), 1)
+
     def test_no_repair_offered_while_an_update_is(self):
         self.settings.set("xess_latest", "20261110")
         x = xess.state(self.ctx, self.settings)["xess"]

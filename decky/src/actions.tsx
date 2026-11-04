@@ -3,7 +3,7 @@
 // started, or cancelled).
 import { useState } from "react";
 
-import { oxp3_apply, oxp3_install, oxp3_plan, oxp3_revert, reboot, xess_install, xess_uninstall } from "./backend";
+import { oxp3_apply, oxp3_install, oxp3_plan, oxp3_revert, reboot, xess_install, xess_state, xess_uninstall } from "./backend";
 import { confirm } from "./components/confirm";
 import { currentJob, noteJob } from "./store";
 import type { ApplyOpts, Job, JobStart, XessState } from "./types";
@@ -113,13 +113,15 @@ export const installOxp3 = async (source: "bundled" | "online", version: string 
 
 /**
  * Install, update or repair xess-xmx-linux. `offer` is what the button showed (xessOffer, from the overview in the
- * quick panel), so the confirmation says the same even when xess_state is missing (FE-4); `x` adds the details.
+ * quick panel), so the confirmation says the same even when xess_state is missing (FE-4); `x` adds the details: the
+ * system Protons the job shims as root, the driver it sets again. Without it, xess_state is asked once more (RC-1).
  */
 export const installXess = async (offer: XessOffer, x: XessState | null, user: string | null): Promise<string | null> => {
+  const state = x ?? await xess_state().then((r) => (r.ok ? r.xess : null));
   const ok = await confirm({
     title: installTitle(offer),
     ok: offer.kind === "update" ? "Update" : offer.kind === "repair" ? "Repair" : "Install",
-    text: <>{installLines(offer, x, user).map((l, i) => <div key={i} style={i ? { marginTop: 8 } : undefined}>{l}</div>)}</>,
+    text: <>{installLines(offer, state, user).map((l, i) => <div key={i} style={i ? { marginTop: 8 } : undefined}>{l}</div>)}</>,
   });
   if (!ok) return null;
   return started(await xess_install());

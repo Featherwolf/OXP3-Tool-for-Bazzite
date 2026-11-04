@@ -26,7 +26,8 @@ KEEP_MAX = 16 << 20     # bytes of each stream kept in Result; more is still str
 LINE_MAX = 64 << 10     # a longer line without a newline is passed on in pieces
 EXIT_GRACE = 1.0        # seconds to wait for EOF after the program exits (a background child may keep the pipe)
 RUN_DIR = "/run/oxp3deck"   # output files, root only (oxp3tool.py's RUN_DIR, the same folder)
-FOLLOW_EVERY = 0.25     # seconds between reads of an output file while nothing new is in it
+FOLLOW_EVERY = 0.02     # seconds between reads of an output file while nothing new is in it: short, since a file
+                        # does not slow its writer down, and FILE_CAP is checked only when we read (RS-1)
 FILE_MAX = 8 << 20      # an output file read this far is emptied (tmpfs is memory); see _read_file
 FILE_CAP = 16 << 20     # an output file this big is emptied unread: the program writes faster than we follow
 SKIPPED = "[... output skipped: the program wrote faster than it could be followed ...]"
@@ -43,8 +44,10 @@ class _Pipe:
     def __init__(self) -> None:
         self.partial = bytearray()
         self.kept = bytearray()
+        self.gapped = False     # nothing came since gap()'s last note
 
     def feed(self, chunk: bytes) -> list[str]:
+        self.gapped = False
         if len(self.kept) < KEEP_MAX:
             self.kept += chunk[:KEEP_MAX - len(self.kept)]
         self.partial += chunk
@@ -65,7 +68,11 @@ class _Pipe:
         return [_line(rest)] if rest else []
 
     def gap(self, note: str) -> list[str]:
-        """A part of the stream that is skipped: the unfinished line, then note on a line of its own (kept too)."""
+        """A part of the stream that is skipped: the unfinished line, then note on a line of its own (kept too); one
+        note for gaps with nothing in between."""
+        if self.gapped:
+            return []
+        self.gapped = True
         lines = self.flush()
         raw = ("\n" if lines else "") + note + "\n"
         if len(self.kept) < KEEP_MAX:
@@ -204,11 +211,8 @@ def _follow(proc: subprocess.Popen, rfd: int, wfd: int, pipe: _Pipe, deadline: f
         if deadline is not None and now >= deadline:
             return True
         if not _read_file(rfd, wfd, pipe, emit):
-            wait = FOLLOW_EVERY if deadline is None else min(FOLLOW_EVERY, deadline - now)
-            try:
-                proc.wait(max(0.0, wait))     # returns early when it exits
-            except subprocess.TimeoutExpired:
-                pass
+            # a plain sleep: proc.wait(timeout) would poll in a loop of ever longer sleeps of its own
+            time.sleep(max(0.0, FOLLOW_EVERY if deadline is None else min(FOLLOW_EVERY, deadline - now)))
     return False
 
 

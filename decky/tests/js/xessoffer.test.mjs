@@ -40,10 +40,10 @@ test("tagNewer: the cases the buttons meet", () => {
 
 const state = (over = {}) => ({
   installed: true, package_dir: "/home/jordan/Documents/xess-xmx-linux-20261031", version: "20261031",
-  found_by: "env", managed: false, drivers: [], preferred_driver: null,
+  found_by: "env", managed: false, package_dir_kept: null, drivers: [], preferred_driver: null,
   status: { state: "ok", line: null, driver: null, notes: [], date: null, lib: null, driver_info: null, reason: null, switched_to: null },
   live: true, steam_running: false, relogin_needed: false, units: { check: "enabled", watcher: "active" },
-  system_protons: [], system_protons_need_shim: false, user_protons: [], missing_tools: [], old_folders: [],
+  system_protons: [], system_protons_need_shim: false, user_protons: [], missing_tools: [], old_folders: [], old_folders_kept: [],
   flatpak_steam: false, latest: null, update_available: false, checked_at: null, missing_downloads: [], repair: null,
   features: { fsr: false, alt_driver_store: false }, ...over,
 });
@@ -101,6 +101,7 @@ test("the update confirmation (FE-4, XESS-3, XESS-5)", () => {
   let text = installLines(o, null, null).join("\n");
   assert.match(text, /First the installed 20261031 is uninstalled with its own uninstall\.sh\./);
   // XESS-3: no stored choice, so no promise to keep it
+  text = installLines(o, state(), null).join("\n");
   assert.match(text, /starts with its own default Mesa driver/);
   assert.doesNotMatch(text, /is set again/);
   const x = state({ preferred_driver: "26.1", latest: "20261104", update_available: true,
@@ -112,10 +113,36 @@ test("the update confirmation (FE-4, XESS-3, XESS-5)", () => {
   // XESS-5: the system Protons are changed as root
   assert.match(text, /system Protons proton-cachyos-slr and proton-cachyos as root \(keeping igdext64\.dll\.stock\)/);
   // a first install says nothing about uninstalling or a driver
-  text = installLines(xessOffer(false, null, null), null, null).join("\n");
+  const none = state({ installed: false, package_dir: null, version: null });
+  text = installLines(xessOffer(false, null, none), none, null).join("\n");
   assert.equal(installTitle(xessOffer(false, null, null)), "Install xess-xmx-linux?");
   assert.doesNotMatch(text, /uninstall|Mesa driver|system Proton/);
   assert.match(text, /Downloads xess-xmx-linux \(the newest release\)/);
+});
+
+test("the confirmation without xess_state still says what the job may do as root (RC-1)", () => {
+  // the job sets settings.xess_driver again and shims every system Proton whatever the page knew
+  for (const o of [xessOffer(true, "20261031", null, check()), xessOffer(false, null, null)]) {
+    const text = installLines(o, null, "jordan").join("\n");
+    assert.match(text, /A default Mesa driver chosen on the XeSS tab is set again afterwards; otherwise the release's own default is used\./, o.kind);
+    assert.doesNotMatch(text, /starts with its own default Mesa driver/, o.kind);
+    assert.match(text, /If system Protons \(CachyOS's proton-cachyos-\*\) are installed, also puts the XMX shim into them as root \(keeping igdext64\.dll\.stock\)/, o.kind);
+  }
+  // with xess_state the lines name what is there instead
+  const x = state({ system_protons: [{ path: "/usr/share/steam/compatibilitytools.d/proton-cachyos", name: "proton-cachyos", shimmed: false, stock: false }] });
+  const text = installLines(xessOffer(true, "20261031", x, check()), x, "jordan").join("\n");
+  assert.doesNotMatch(text, /If system Protons|chosen on the XeSS tab/);
+  assert.match(text, /system Proton proton-cachyos as root/);
+});
+
+test("an update from a folder the XeSS tab will not remove says it is the user's (RC-2)", () => {
+  const why = "is a git checkout, not just an unpacked release; delete it yourself if you no longer need it";
+  const x = state({ package_dir: "/home/jordan/src/xess-xmx-linux", package_dir_kept: why });
+  const text = installLines(xessOffer(true, "20261031", x, check()), x, "jordan").join("\n");
+  assert.match(text, /its folder \/home\/jordan\/src\/xess-xmx-linux stays: it is a git checkout, not just an unpacked release; delete it yourself if you no longer need it\. /);
+  assert.doesNotMatch(text, /for you to remove after the re-login/);
+  const managed = state({ managed: true, package_dir: "/home/jordan/.local/share/oxp3deck/xess/xess-xmx-linux-20261031" });
+  assert.doesNotMatch(installLines(xessOffer(true, "20261031", managed, check()), managed, "jordan").join("\n"), /its folder/);
 });
 
 test("checkText (FE-5)", () => {

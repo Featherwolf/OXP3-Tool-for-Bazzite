@@ -1203,6 +1203,16 @@ def _install(ctx, settings, job) -> dict:
     try:
         tag = downloads.latest_release_tag(REPO)
     except downloads.DownloadError as e:
+        # Offline or GitHub's rate limit (the usual reason a download is missing): a repair needs no lookup
+        det = detect(ctx, settings)
+        pkg = det["path"]
+        version = package_version(pkg, settings)
+        if det["installed"] and version:
+            missing = _missing_downloads(pkg)
+            reason = _repair_reason(det, read_status(ctx), _units(ctx), missing)
+            if reason:
+                _say(job, f"Could not look up the newest release ({e}); repairing the installed {version} anyway")
+                return _repair_in_place(ctx, settings, job, pkg, version, reason, missing)
         return _err(step, str(e))
     settings.update({"xess_latest": tag, "xess_checked_at": time.time()})
     if not _SAFE_TAG.match(tag):
@@ -1226,10 +1236,7 @@ def _install(ctx, settings, job) -> dict:
         if reason is None:
             return _err(step, f"the installed {version} is newer than the newest release {tag}; nothing was changed",
                         tag=tag, package_dir=pkg)
-        _say(job, f"{version} in {pkg}: {reason}; running its install.sh again (nothing else is downloaded)")
-        for folder in _old_folders(settings, pkg) if missing else []:   # an earlier folder's, with the same pins
-            _reuse_downloads(ctx, job, folder, pkg)
-        return _install_into(ctx, settings, job, tag=version, new=pkg, old=None, known=pkg)
+        return _repair_in_place(ctx, settings, job, pkg, version, reason, missing)
     if pkg and version == tag:
         st = read_status(ctx)
         _say(job, f"{tag} is already unpacked in {pkg} (driver check: {st['state']}); running its install.sh again")
@@ -1242,6 +1249,14 @@ def _install(ctx, settings, job) -> dict:
     if old:
         _reuse_downloads(ctx, job, old, new)
     return _install_into(ctx, settings, job, tag=tag, new=new, old=old, known=pkg)
+
+
+def _repair_in_place(ctx, settings, job, pkg: str, version: str, reason: str, missing: list[str]) -> dict:
+    """install.sh again in the installed package's own folder; a missing piece comes from an old folder first."""
+    _say(job, f"{version} in {pkg}: {reason}; running its install.sh again (nothing else is downloaded)")
+    for folder in _old_folders(settings, pkg) if missing else []:   # an earlier folder's, with the same pins
+        _reuse_downloads(ctx, job, folder, pkg)
+    return _install_into(ctx, settings, job, tag=version, new=pkg, old=None, known=pkg)
 
 
 # ---- uninstall -------------------------------------------------------------------------------------------------------

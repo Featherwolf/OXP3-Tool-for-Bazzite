@@ -49,6 +49,13 @@ test("game arguments moved behind %command% stay literal", () => {
     ["-say it's", "XESS_FG=3 %command% -say 'it'\\''s'", ["-say", "it's"]],        // unclosed quote: every word as it is
     ["-x \"a b", "XESS_FG=3 %command% -x '\"a' b", ["-x", "\"a", "b"]],
     ["-empty \"\"", "XESS_FG=3 %command% -empty ''", ["-empty", ""]],
+    // RC-3: a backslash is no escape character for the game (Windows paths); a no-break space is no separator
+    ["-config C:\\Games\\cfg.ini", "XESS_FG=3 %command% -config 'C:\\Games\\cfg.ini'", ["-config", "C:\\Games\\cfg.ini"]],
+    ["-path \"C:\\Program Files\\Game\\\" -x", "XESS_FG=3 %command% -path 'C:\\Program Files\\Game\\' -x",
+      ["-path", "C:\\Program Files\\Game\\", "-x"]],
+    ["a\\ b", "XESS_FG=3 %command% 'a\\' b", ["a\\", "b"]],
+    ["-a\u00a0b -c\u00a0", "XESS_FG=3 %command% '-a\u00a0b' '-c\u00a0'", ["-a\u00a0b", "-c\u00a0"]],
+    ["\t-x\t-y ", "XESS_FG=3 %command% -x -y", ["-x", "-y"]],
   ];
   for (const [before, line, words] of cases) {
     assert.equal(setManaged(before, { XESS_FG: "3" }), line, before);

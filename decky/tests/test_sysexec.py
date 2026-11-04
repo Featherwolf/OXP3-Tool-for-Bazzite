@@ -234,6 +234,36 @@ class OutputFileTest(unittest.TestCase):
         self.assertLess(max(sizes), 2 << 20)       # without the cap: about 7 MB
         self.assertIn(sysexec.SKIPPED + "\n", r.out)
 
+    def test_a_burst_after_a_quiet_start_is_read_soon(self):
+        """RS-1: with nothing new in the file the follower sleeps FOLLOW_EVERY; a program that writes fast meanwhile
+        fills the file for that long (at 0.25 s, `yes` reached 400 MB of tmpfs before the next read)."""
+        peak, stop, seen = [0], threading.Event(), []
+
+        def watch():
+            while not stop.is_set():
+                try:
+                    peak[0] = max(peak[0], os.stat(self.path).st_size)
+                except OSError:
+                    pass
+                time.sleep(0.001)
+
+        code = ("import sys, time\n"
+                "time.sleep(0.3); chunk = ('z' * 1023 + '\\n') * 64; end = time.monotonic() + 0.5\n"
+                "while time.monotonic() < end:\n"
+                "    sys.stdout.write(chunk); sys.stdout.flush(); time.sleep(0.001)\n")   # about 50 MB/s
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            with mock.patch.object(sysexec, "FILE_MAX", 256 << 10):      # emptied at each end it reaches past this
+                r = sysexec.run(py(code), timeout=60, output_file=self.path, on_line=seen.append)
+        finally:
+            stop.set()
+            watcher.join(5)
+        self.assertEqual(r.rc, 0)
+        self.assertLess(peak[0], 8 << 20)          # 1.5 to 3 MB; with FOLLOW_EVERY 0.25 s: 13 to 15 MB
+        self.assertNotIn(sysexec.SKIPPED, seen)     # it keeps up: nothing is lost
+        self.assertEqual({len(line) for line in seen}, {1023})
+
     def test_capped_file_is_emptied_unread(self):
         with open(self.path, "x"):
             pass
@@ -246,6 +276,9 @@ class OutputFileTest(unittest.TestCase):
             os.write(wfd, b"first\nunfinished")
             self.assertTrue(sysexec._read_file(rfd, wfd, pipe, seen.extend, chunks=1))
             os.write(wfd, b" line\n" + b"y\n" * 1000)
+            self.assertTrue(sysexec._read_file(rfd, wfd, pipe, seen.extend))
+            self.assertEqual(os.fstat(wfd).st_size, 0)
+            os.write(wfd, b"z" * 1000)               # skipped again with nothing read in between: no second note
             self.assertTrue(sysexec._read_file(rfd, wfd, pipe, seen.extend))
             self.assertEqual(os.fstat(wfd).st_size, 0)
             os.write(wfd, b"after\n")
