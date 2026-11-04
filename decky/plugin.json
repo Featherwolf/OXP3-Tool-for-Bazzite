@@ -1,0 +1,11 @@
+{
+  "name": "OXP3Deck",
+  "author": "Featherwolf",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["onexplayer", "oxp3", "intel", "xess", "root"],
+    "description": "oxp3-tool's fixes and xess-xmx-linux (XeSS on the XMX cores) for the ONEXPLAYER 3, installed, configured and updated from one Quick Access panel.",
+    "image": "https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/decky/assets/banner.png"
+  }
+}
