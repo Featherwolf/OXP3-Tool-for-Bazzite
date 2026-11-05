@@ -626,7 +626,8 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("diagnose", parents=[jp], help="write a diagnostic archive for bug reports")
     d.add_argument("-o", "--output", help="archive path (default: oxp3-diagnose-<time>.tar.gz)")
 
-    k = sub.add_parser("kernel", parents=[jp], help="CachyOS with Limine: list the kernels, boot another one once safely, keep it",
+    k = sub.add_parser("kernel", parents=[jp],
+                       help="CachyOS with Limine: list the kernels, boot another one once safely, keep it",
                        description="Without an action: the installed kernels and what Limine boots next. `try "
                                    "PACKAGE` boots PACKAGE once; a power-on after that (also after a hang) boots "
                                    "Limine's default entry. `keep` keeps booting the kernel running now.")

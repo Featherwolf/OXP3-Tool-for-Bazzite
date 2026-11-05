@@ -817,7 +817,8 @@ class FakeCachyOS(FakeOxp3):
             if ln.startswith("//"):
                 sub = ln[2:].lstrip("+").strip()
                 is_dir = any(x.startswith("///") for x in lines[i + 1:i + 2])
-                kid = next((x.split("=", 1)[1].strip() for x in lines[i + 1:i + 6] if x.startswith("comment: kernel-id=")),
+                kid = next((x.split("=", 1)[1].strip() for x in lines[i + 1:i + 6]
+                            if x.startswith("comment: kernel-id=")),
                            sub)
                 visible.append((f"{top}/{sub}", None if is_dir else kid))
             elif ln.startswith("/"):

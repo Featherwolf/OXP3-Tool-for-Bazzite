@@ -496,8 +496,8 @@ def _keep(lk: LimineKernels, kernels: list[Kernel], assume_yes: bool, dry_run: b
     for line in plan:
         out(f"  - {line}")
     if nxt is None:
-        raise KernelError(f"after that Limine would boot nothing at power-on (its default entry names no bootable "
-                          f"entry); nothing changed")
+        raise KernelError("after that Limine would boot nothing at power-on (its default entry names no bootable "
+                          "entry); nothing changed")
     out(f"Then every power-on boots {lk.name(nxt, kernels, after)}.")
     if running is not None and lk.owner(nxt, kernels) is not running:
         out(f"note: that is not {running.package}, the kernel running now (Limine has not recorded booting it).")

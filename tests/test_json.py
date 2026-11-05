@@ -66,7 +66,8 @@ class JsonTest(unittest.TestCase):
     def test_pending_reboot_and_notes(self):
         self.f = FakeCachyOS(self.root, kernels=dict(KERNELS))
         self.f.power_on()
-        self.assertTrue(self.run_json("apply", "nvme-resume", "--yes", "--any-ssd", "--json")["outcome"]["reboot_needed"])
+        res = self.run_json("apply", "nvme-resume", "--yes", "--any-ssd", "--json")
+        self.assertTrue(res["outcome"]["reboot_needed"])
         st = self.run_json("status", "--json")["status"]
         nvme = next(f for f in st["fixes"] if f["id"] == "nvme-resume")
         self.assertEqual((nvme["state"], nvme["pending"]), ("applied", "reboot"))

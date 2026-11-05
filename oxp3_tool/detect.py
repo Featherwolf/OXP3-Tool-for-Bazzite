@@ -584,8 +584,8 @@ class Context:
         hides the same name in /run and /usr), the last setting winning."""
         files = [p for p in ("/etc/systemd/logind.conf", "/usr/lib/systemd/logind.conf") if self.sys.exists(p)][:1]
         dropins: dict[str, str] = {}
-        for d in ("/usr/lib/systemd/logind.conf.d", "/usr/local/lib/systemd/logind.conf.d", "/run/systemd/logind.conf.d",
-                  "/etc/systemd/logind.conf.d"):  # lowest priority first
+        for d in ("/usr/lib/systemd/logind.conf.d", "/usr/local/lib/systemd/logind.conf.d",
+                  "/run/systemd/logind.conf.d", "/etc/systemd/logind.conf.d"):  # lowest priority first
             for path in self.sys.glob(f"{d}/*.conf"):
                 dropins[path.rsplit("/", 1)[1]] = path
         value = None

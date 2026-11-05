@@ -335,7 +335,8 @@ class RefreshStateTest(unittest.TestCase):
         self.f.display_debugfs()
         self.f.write("/sys/kernel/debug/dri/0000:00:02.0/i915_vbt", self.vbt((10, True)))
         self.f.runner.journal["0"] = "xe 0000:00:02.0: [drm] *ERROR* DSB 0 poll error\n" * 3  # flooded
-        self.f.write("/proc/kallsyms", "0000000000000000 T vfs_read\n0000000000000000 t intel_bios_get_c10_vspeo\t[xe]\n")
+        self.f.write("/proc/kallsyms",
+                     "0000000000000000 T vfs_read\n0000000000000000 t intel_bios_get_c10_vspeo\t[xe]\n")
         out = " ".join(self.status().split())
         self.assertNotIn("this kernel ignores them", out)
         self.assertIn("this kernel has the 'Vswing / Pre-emphasis Override' fix, but the firmware's VBT has no level "

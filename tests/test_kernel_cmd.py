@@ -10,7 +10,7 @@ from pathlib import Path
 from oxp3_tool import limine_menu as lm
 from oxp3_tool.cli import main
 
-from .fakeroot import LAST_BOOTED_VAR, LIMINE_EFI, ONESHOT_VAR, FakeCachyOS, FakeOxp3
+from .fakeroot import LIMINE_EFI, ONESHOT_VAR, FakeCachyOS, FakeOxp3
 
 STOCK, VSW = "linux-cachyos-deckify", "linux-cachyos-deckify-vsw"
 KERNELS = {STOCK: "7.2.11-1-cachyos-deckify", VSW: "7.2.11-1-cachyos-deckify-vsw"}
@@ -376,7 +376,8 @@ class LeftoverStateTest(Base):
         self.cli("kernel", "try", VSW, "-y")
         self.f.write(CONF, self.conf().replace("remember_last_entry: no", "remember_last_entry: yes"))
         out = " ".join(self.cli("kernel")[1].split())
-        self.assertIn("warning: limine.conf has remember_last_entry: yes again under `oxp3-tool kernel try`'s marker", out)
+        self.assertIn("warning: limine.conf has remember_last_entry: yes again under "
+                      "`oxp3-tool kernel try`'s marker", out)
         self.assertNotIn("Limine boots its default entry", out)
         self.assertEqual(self.cli("kernel", "keep", "-y")[0], 0)
         self.assertNotIn("oxp3-tool", self.conf())
@@ -500,8 +501,10 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(menu.by_index(3).name, "Snapshots")  # a collapsed directory hides its entries
         self.assertEqual(menu.by_index(4).name, "Other systems")
         wins = [e for e in menu.walk() if e.name == "Windows/Boot"]
-        self.assertEqual([menu.path(e) for e in wins], ["Other systems/Windows\\/Boot", "Other systems/Windows\\/Boot#1"])
-        self.assertEqual([menu.bli_id(e) for e in wins], ["Other-systems.Windows-.Boot", "Other-systems.Windows-.Boot-1"])
+        self.assertEqual([menu.path(e) for e in wins],
+                         ["Other systems/Windows\\/Boot", "Other systems/Windows\\/Boot#1"])
+        self.assertEqual([menu.bli_id(e) for e in wins],
+                         ["Other-systems.Windows-.Boot", "Other-systems.Windows-.Boot-1"])
         self.assertIs(menu.by_path("Other systems/Windows\\/Boot#1"), wins[1])
         self.assertIs(menu.by_bli_id_or_path("Other-systems.Windows-.Boot-1"), wins[1])
         self.assertIsNone(menu.by_path("Other systems/Old BIOS"))  # hidden on UEFI
@@ -518,7 +521,8 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(flat.by_index(1).name, "b")
 
     def test_globals_end_at_the_first_entry(self):
-        menu = lm.parse("timeout: 3\n/+CachyOS\n  //k\n    path: boot():/k\ndefault_entry: 2\nremember_last_entry: yes\n")
+        menu = lm.parse("timeout: 3\n/+CachyOS\n  //k\n    path: boot():/k\n"
+                        "default_entry: 2\nremember_last_entry: yes\n")
         self.assertIsNone(menu.value("default_entry"))
         self.assertFalse(menu.remembers())
         self.assertIsNone(menu.default())  # index 0: the directory
@@ -534,7 +538,8 @@ class MenuTest(unittest.TestCase):
             self.assertFalse(hidden(cond), cond)
 
     def test_paths_round_trip(self):
-        menu = lm.parse("/A\\\n  //x\n/snap #3\n  path: boot():/a\n/snap #3\n  path: boot():/b\n/linux é\n  path: boot():/c\n")
+        menu = lm.parse("/A\\\n  //x\n/snap #3\n  path: boot():/a\n/snap #3\n  path: boot():/b\n"
+                        "/linux é\n  path: boot():/c\n")
         for e in menu.walk():
             self.assertIs(menu.by_path(menu.path(e)), e, menu.path(e))
         self.assertEqual(menu.bli_id(menu.top[3]), "linux---")  # one '-' per UTF-8 byte, as Limine
