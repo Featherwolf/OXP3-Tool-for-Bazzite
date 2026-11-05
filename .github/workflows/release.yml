@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag such as v0.1.0 to publish dist/oxp3-tool as a GitHub release.
+# Push an annotated tag such as v0.1.0 to publish dist/oxp3-tool as a GitHub release.
+# The tag's message becomes the release notes.
 on:
   push:
     tags: ["v*"]
@@ -23,4 +24,6 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/oxp3-tool dist/oxp3-tool.sha256 get.sh uninstall.sh --generate-notes
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/oxp3-tool dist/oxp3-tool.sha256 get.sh uninstall.sh
+          --verify-tag --notes-from-tag --title "oxp3-tool ${GITHUB_REF_NAME#v}"
