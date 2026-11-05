@@ -1,6 +1,6 @@
 # Third-party notices
 
-oxp3-tool contains the third-party material listed here. Each section says where the material comes from, where the tool uses it, and which licence covers it, with that licence's full text. This file is also packed into the single-file build `dist/oxp3-tool`; on an installed copy, `unzip -p /usr/local/bin/oxp3-tool THIRD_PARTY_NOTICES.md` shows it.
+oxp3-tool's own code is under the MIT License, in [LICENSE](LICENSE). It contains the third-party material listed here, which keeps its own licence. Each section says where the material comes from, where the tool uses it, and which licence covers it, with that licence's full text. This file is also packed into the single-file build `dist/oxp3-tool`; on an installed copy, `unzip -p /usr/local/bin/oxp3-tool THIRD_PARTY_NOTICES.md` shows it.
 
 Projects whose findings, documentation or behaviour the tool builds on, without copying their code, are credited in the README under [Background and credits](README.md#background-and-credits).
 
@@ -106,4 +106,4 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ## InputPlumber (test data only)
 
 - Project: [InputPlumber](https://github.com/ShadowBlip/InputPlumber), GPL-3.0-or-later ([LICENSE](https://github.com/ShadowBlip/InputPlumber/blob/main/LICENSE)). Its ONEXPLAYER 3 support is by Andrei Aldea (Grippy98).
-- Used in: `tests/fakeroot.py`. `IP_MAP_YAML` is InputPlumber v0.82.0's `rootfs/usr/share/inputplumber/capability_maps/onexplayer_type9.yaml` without its comments, and `IP_DEVICE_YAML` is a shortened `rootfs/usr/share/inputplumber/devices/50-onexplayer_3.yaml`. Both are configuration data (device names, key codes and the format's keys) that the tests need as InputPlumber ships them, because the `buttons` fix only replaces a stock map it recognises. They are not part of `dist/oxp3-tool`.
+- Used in: `tests/fixtures/inputplumber/` (read by `tests/fakeroot.py`). `onexplayer_type9.yaml` is InputPlumber v0.82.0's `rootfs/usr/share/inputplumber/capability_maps/onexplayer_type9.yaml` without its comments, and `50-onexplayer_3.yaml` is a shortened `rootfs/usr/share/inputplumber/devices/50-onexplayer_3.yaml`. The folder keeps InputPlumber's licence; its full text is in `tests/fixtures/inputplumber/COPYING`. Both are configuration data (device names, key codes and the format's keys) that the tests need as InputPlumber ships them, because the `buttons` fix only replaces a stock map it recognises. They are not part of `dist/oxp3-tool`.

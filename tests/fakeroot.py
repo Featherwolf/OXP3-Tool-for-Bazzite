@@ -4,12 +4,11 @@ Values come from real OXP3 reports (DMI from InputPlumber issue #693,
 https://github.com/ShadowBlip/InputPlumber/issues/693; panel and SSD IDs from community testing,
 https://github.com/HHHHanasak1/onexplayer3-steamos-setup).
 
-InputPlumber files: IP_MAP_YAML is InputPlumber v0.82.0's
-rootfs/usr/share/inputplumber/capability_maps/onexplayer_type9.yaml without its comments, and IP_DEVICE_YAML
-a shortened rootfs/usr/share/inputplumber/devices/50-onexplayer_3.yaml (InputPlumber,
-https://github.com/ShadowBlip/InputPlumber, GPL-3.0-or-later; ONEXPLAYER 3 support by Andrei Aldea, commit
-d9718db). Keep IP_MAP_YAML as InputPlumber ships it: the buttons fix only replaces a stock map it recognises.
-See THIRD_PARTY_NOTICES.md.
+InputPlumber's files are read from tests/fixtures/inputplumber/, which keeps their own licence
+(GPL-3.0-or-later; see its README.md): IP_MAP_YAML is InputPlumber v0.82.0's
+rootfs/usr/share/inputplumber/capability_maps/onexplayer_type9.yaml without its comments, and IP_DEVICE_YAML a
+shortened rootfs/usr/share/inputplumber/devices/50-onexplayer_3.yaml. Keep IP_MAP_YAML as InputPlumber ships it:
+the buttons fix only replaces a stock map it recognises.
 """
 
 from __future__ import annotations
@@ -24,6 +23,8 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from oxp3_tool.system import CommandResult, System
+
+IP_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "inputplumber"
 
 OXP3_DMI = {
     "sys_vendor": "ONE-NETBOOK",
@@ -44,49 +45,9 @@ OXP3_MODALIAS = (
     "cvnDefaultstring:ct3:cvrDefaultstring:skuDefaultstring:"
 )
 
-IP_DEVICE_YAML = """\
-version: 1
-kind: CompositeDevice
-name: ONEXPLAYER 3
-matches:
-  - dmi_data:
-      product_name: ONEXPLAYER 3
-      sys_vendor: ONE-NETBOOK
-source_devices:
-  - group: gamepad
-    evdev:
-      name: Microsoft X-Box 360 pad
-options:
-  auto_manage: true
-target_devices:
-  - xbox-elite
-capability_map_id: oxp9
-"""
+IP_DEVICE_YAML = (IP_FIXTURES / "50-onexplayer_3.yaml").read_text(encoding="utf-8")
 
-IP_MAP_YAML = """\
-version: 1
-kind: CapabilityMap
-name: OneXPlayer Type 9
-id: oxp9
-mapping:
-  - name: ONEX
-    source_events:
-      - keyboard: KeyLeftCtrl
-      - keyboard: KeyLeftAlt
-      - keyboard: KeyLeftMeta
-    target_event:
-      gamepad:
-        button: QuickAccess
-  - name: Keyboard
-    source_events:
-      - keyboard: KeyLeftCtrl
-      - keyboard: KeyLeftMeta
-      - keyboard: KeyO
-    target_event:
-      gamepad:
-        button: QuickAccess2
-filtered_events: []
-"""
+IP_MAP_YAML = (IP_FIXTURES / "onexplayer_type9.yaml").read_text(encoding="utf-8")
 
 
 # The panel's two EDID modes (fixed 380.16 MHz clock, htotal 2000), as xe prints them.

@@ -1,0 +1,16 @@
+version: 1
+kind: CompositeDevice
+name: ONEXPLAYER 3
+matches:
+  - dmi_data:
+      product_name: ONEXPLAYER 3
+      sys_vendor: ONE-NETBOOK
+source_devices:
+  - group: gamepad
+    evdev:
+      name: Microsoft X-Box 360 pad
+options:
+  auto_manage: true
+target_devices:
+  - xbox-elite
+capability_map_id: oxp9

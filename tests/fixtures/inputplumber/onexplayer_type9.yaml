@@ -1,0 +1,22 @@
+version: 1
+kind: CapabilityMap
+name: OneXPlayer Type 9
+id: oxp9
+mapping:
+  - name: ONEX
+    source_events:
+      - keyboard: KeyLeftCtrl
+      - keyboard: KeyLeftAlt
+      - keyboard: KeyLeftMeta
+    target_event:
+      gamepad:
+        button: QuickAccess
+  - name: Keyboard
+    source_events:
+      - keyboard: KeyLeftCtrl
+      - keyboard: KeyLeftMeta
+      - keyboard: KeyO
+    target_event:
+      gamepad:
+        button: QuickAccess2
+filtered_events: []

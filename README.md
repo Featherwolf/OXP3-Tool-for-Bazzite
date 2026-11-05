@@ -223,6 +223,10 @@ oxp3-tool builds on the work of the projects and people below. Code and data tak
 
 oxp3-tool is an unofficial community project, not affiliated with or endorsed by ONE-NETBOOK (ONEXPLAYER), Intel, Valve, Universal Blue (Bazzite) or CachyOS. ONEXPLAYER, Intel Arc, XeSS, Steam and Steam Deck are trademarks of their owners.
 
+## License
+
+oxp3-tool is under the [MIT License](LICENSE), Copyright (c) 2026 Featherwolf. The third-party material it contains keeps its own licence: see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Both files are also packed into `dist/oxp3-tool` (`unzip -p /usr/local/bin/oxp3-tool LICENSE`).
+
 ## Development
 
 ```bash
