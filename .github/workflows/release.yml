@@ -1,10 +1,18 @@
 name: Release
 
-# Push an annotated tag such as v0.1.0 to publish dist/oxp3-tool as a GitHub release.
-# The tag's message becomes the release notes.
+# Publishes dist/oxp3-tool as a GitHub release, in either of two ways:
+# - Actions > Release > Run workflow, with the version (for example 0.4.1). The workflow creates the tag v0.4.1 on
+#   the commit it runs on, with the notes in release-notes/v0.4.1.md.
+# - Pushing an annotated tag such as v0.4.1. The tag's message becomes the notes.
+# Either way the version must match oxp3_tool/__init__.py and dist/ must match the sources.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (it must match oxp3_tool/__init__.py)"
+        required: true
 
 permissions:
   contents: write
@@ -12,18 +20,29 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check the tag name
+        run: |
+          printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "not a version tag: $TAG"; exit 1; }
       - name: Check that dist/ matches the sources
         run: python -m unittest tests.test_dist -v
       - name: Check the version matches the tag
-        run: test "$(python3 dist/oxp3-tool --version)" = "oxp3-tool ${GITHUB_REF_NAME#v}"
+        run: test "$(python3 dist/oxp3-tool --version)" = "oxp3-tool ${TAG#v}"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "$GITHUB_REF_NAME" dist/oxp3-tool dist/oxp3-tool.sha256 get.sh uninstall.sh
-          --verify-tag --notes-from-tag --title "oxp3-tool ${GITHUB_REF_NAME#v}"
+        run: |
+          files="dist/oxp3-tool dist/oxp3-tool.sha256 get.sh uninstall.sh"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test -f "release-notes/$TAG.md" || { echo "release-notes/$TAG.md is missing"; exit 1; }
+            gh release create "$TAG" $files --target "$GITHUB_SHA" --notes-file "release-notes/$TAG.md" \
+              --title "oxp3-tool ${TAG#v}"
+          else
+            gh release create "$TAG" $files --verify-tag --notes-from-tag --title "oxp3-tool ${TAG#v}"
+          fi
