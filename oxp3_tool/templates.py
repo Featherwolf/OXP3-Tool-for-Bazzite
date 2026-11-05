@@ -74,7 +74,9 @@ def _target_lines(target: tuple[str, str]) -> list[str]:
 
 
 # The four face keys, what InputPlumber 0.82.0's stock map "oxp9" does with
-# them, and this tool's defaults.
+# them, and this tool's defaults. The stock map is InputPlumber's (https://github.com/ShadowBlip/InputPlumber)
+# rootfs/usr/share/inputplumber/capability_maps/onexplayer_type9.yaml; the key chords are the ones it lists,
+# checked with evtest (see also InputPlumber issue #693).
 BUTTON_KEYS = {
     "onex": "ONEX / console key (sends Ctrl+Alt+Meta)",
     "keyboard": "keyboard key (sends Ctrl+Meta+O)",
@@ -155,6 +157,9 @@ def capability_map_yaml(map_id: str, actions: dict[str, str], upstream_path: Opt
 
 # -- udev hwdb: volume rocker ------------------------------------------------
 
+# The problem and the force-release fix: https://github.com/hhd-dev/hhd/issues/342. The same three data lines are in
+# ZeroSegFault's https://github.com/ZeroSegFault/CachyOS-OneXPlayer3 (files/etc/udev/hwdb.d/61-oxp3-volume.hwdb).
+# The format and the '!' prefix are systemd's (hwdb.d/60-keyboard.hwdb).
 VOLUME_HWDB = f"""\
 # Installed by oxp3-tool ({PROJECT_URL}).
 # Remove with `sudo oxp3-tool revert volume-keys`.
@@ -306,9 +311,12 @@ blacklist bmi160_i2c
 
 # -- gamescope display profile ---------------------------------------------------
 
-# Vertical front porch per refresh rate, copied from gamescope's
-# scripts/00-gamescope/displays/lenovo.legiongo2.oled.lua (same panel,
-# BSD-2-Clause, Copyright Valve Corporation and contributors).
+# The profile oled_lua() writes is modelled on gamescope's scripts/00-gamescope/displays/lenovo.legiongo2.oled.lua
+# (https://github.com/ValveSoftware/gamescope, master 2b5cf191; same panel; BSD-2-Clause, Copyright (c) 2013-2022,
+# Valve Corporation; Copyright (c) 2022, NVIDIA CORPORATION) and on the HDR profile in oxp3-apply-fixes.sh of
+# https://github.com/HHHHanasak1/onexplayer3-steamos-setup (fix pack 20261015; MIT, Copyright (c) 2026 HANA & Claude).
+# LEGIONGO2_VFPS is gamescope's vertical front porch per refresh rate, unchanged.
+# Both licences in full: THIRD_PARTY_NOTICES.md (also packed into dist/oxp3-tool).
 LEGIONGO2_VFPS = [
     2696, 2615, 2538, 2463, 2391, 2322, 2256, 2192, 2130, 2071,
     2013, 1958, 1904, 1852, 1802, 1753, 1706, 1660, 1616, 1572,
@@ -330,7 +338,8 @@ def panel_vfp(refresh: int) -> int:
     """Front porch for ``refresh`` Hz at the panel's fixed 380.16 MHz clock.
 
     The native modes (60 Hz and 144 Hz) share htotal 2000 and 1264 lines of
-    vdisplay + sync + back porch, so vtotal = clock / (2000 * refresh).
+    vdisplay + sync + back porch, so vtotal = clock / (2000 * refresh), the
+    formula of the fix pack's profile (see the comment above LEGIONGO2_VFPS).
     Reproduces the gamescope table above for every rate except 67 Hz, where
     that table rounds down.
     """

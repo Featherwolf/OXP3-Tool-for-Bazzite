@@ -4,6 +4,11 @@ entry and the one-shot entry, and the UEFI variables behind the last two.
 What Limine boots at power-on (common/menu.c): the one-shot entry (LoaderEntryOneShot, erased when read), else
 with `remember_last_entry: yes` the entry that booted last (LimineLastBootedEntry, which Limine writes before
 every boot), else `default_entry`. A default naming a directory or nothing stops the countdown at the menu.
+
+The behaviour follows Limine (https://github.com/Limine-Bootloader/Limine) 12.9, common/menu.c and
+common/lib/config.c, checked against v12.9.6. Short routines such as bli_entry_base_id are written again here to
+give the same results. Limine is BSD-2-Clause, Copyright (C) 2019-2026 Mintsuki, 2026 Kamila Szewczyk, and
+contributors; its licence is in THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations

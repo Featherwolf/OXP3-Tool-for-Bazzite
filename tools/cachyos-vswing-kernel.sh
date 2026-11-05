@@ -3,12 +3,14 @@
 # "Vswing / Pre-emphasis Override" fix (mainline Linux 7.4) for the white dots on the OXP3's
 # screen, as a second kernel (linux-cachyos-deckify-vsw) next to the stock one.
 #
-# It uses CachyOS's own build recipe and sources, pinned to the 7.2.11-1 release, adds the
-# eight patches from Linus Torvalds' tree, builds for x86-64-v3 like CachyOS's published
-# package, and prints the install command. The kernel is not installed until you run that
-# command yourself. Before that, the script installs base-devel and git, makepkg adds the build
-# tools (rust, rust-src, rust-bindgen with clang, pahole, ...; about 1 GB, and they stay
-# installed), and gpg adds CachyOS's two signing keys to ~/.gnupg.
+# It uses CachyOS's own build recipe and sources (https://github.com/CachyOS/linux-cachyos and
+# https://github.com/CachyOS/kernel-patches), pinned to the 7.2.11-1 release, adds the
+# eight patches of the series by Michał Grzelak (Intel) from Linus Torvalds' tree, builds for
+# x86-64-v3 like CachyOS's published package, and prints the install command. The kernel is
+# not installed until you run that command yourself. Before that, the script installs
+# base-devel and git, makepkg adds the build tools (rust, rust-src, rust-bindgen with clang,
+# pahole, ...; about 1 GB, and they stay installed), and gpg adds CachyOS's two signing keys
+# to ~/.gnupg.
 #
 # Run it as your normal user (not with sudo), plugged in, from Desktop Mode, in Konsole:
 #   curl -fsSLO https://raw.githubusercontent.com/Featherwolf/OXP3-Tool-for-Bazzite/HEAD/tools/cachyos-vswing-kernel.sh

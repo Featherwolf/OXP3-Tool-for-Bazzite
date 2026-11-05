@@ -4,8 +4,8 @@
     python3 tools/build_zipapp.py            # writes dist/oxp3-tool and dist/oxp3-tool.sha256
     python3 tools/build_zipapp.py -o FILE    # writes FILE only
 
-Run it after changing anything in oxp3_tool/; the tests fail while the
-committed dist/ file is out of date.
+Run it after changing anything in oxp3_tool/ or THIRD_PARTY_NOTICES.md
+(packed in too); the tests fail while the committed dist/ file is out of date.
 """
 
 from __future__ import annotations
@@ -45,6 +45,8 @@ def members() -> list[tuple[str, bytes]]:
     files = [("__main__.py", MAIN)]
     for path in sorted(PACKAGE.glob("*.py")):
         files.append((f"oxp3_tool/{path.name}", path.read_bytes()))
+    # The licences of the third-party code in oxp3_tool/ travel with the single file.
+    files.append(("THIRD_PARTY_NOTICES.md", (ROOT / "THIRD_PARTY_NOTICES.md").read_bytes()))
     return files
 
 

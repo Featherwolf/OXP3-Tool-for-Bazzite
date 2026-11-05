@@ -1,8 +1,15 @@
 """A fake ONEXPLAYER 3 running Bazzite, as a directory tree plus a fake command runner.
 
-Values come from real OXP3 reports (DMI from InputPlumber issue #693, panel and
-SSD IDs from community testing). InputPlumber files are minimal stand-ins with
-the same structure as the 0.82.0 originals.
+Values come from real OXP3 reports (DMI from InputPlumber issue #693,
+https://github.com/ShadowBlip/InputPlumber/issues/693; panel and SSD IDs from community testing,
+https://github.com/HHHHanasak1/onexplayer3-steamos-setup).
+
+InputPlumber files: IP_MAP_YAML is InputPlumber v0.82.0's
+rootfs/usr/share/inputplumber/capability_maps/onexplayer_type9.yaml without its comments, and IP_DEVICE_YAML
+a shortened rootfs/usr/share/inputplumber/devices/50-onexplayer_3.yaml (InputPlumber,
+https://github.com/ShadowBlip/InputPlumber, GPL-3.0-or-later; ONEXPLAYER 3 support by Andrei Aldea, commit
+d9718db). Keep IP_MAP_YAML as InputPlumber ships it: the buttons fix only replaces a stock map it recognises.
+See THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations
@@ -441,7 +448,8 @@ class FakeCachyRunner(FakeRunner):
     """The CachyOS tools: pacman, limine-entry-tool/limine-mkinitcpio, sdboot-manage, grub-mkconfig.
 
     The boot-entry generators follow their real counterparts (limine-entry-tool's ConfigReader,
-    sdboot-manage, grub-mkconfig's grub.d loop), written independently of oxp3_tool.kargs.
+    https://gitlab.com/Zesko/limine-entry-tool; sdboot-manage; grub-mkconfig's grub.d loop), written
+    independently of oxp3_tool.kargs.
     """
 
     def __init__(self, root: Path, kernels: dict[str, str]):
