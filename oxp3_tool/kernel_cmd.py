@@ -4,8 +4,10 @@ CachyOS writes `remember_last_entry: yes` into limine.conf: Limine boots whateve
 booted once (and then hung, or left the screen dark) boots again at every power-on, and only a key press in
 Limine's menu gets back. `kernel try` makes the kernel running now the one every power-on boots
 (`remember_last_entry: no`, and `default_entry` pointed at it when it is not the default already), then asks Limine
-for one boot of the other kernel (LoaderEntryOneShot, through bootctl). `kernel keep` puts both lines back, so the
-kernel running then is the one Limine keeps booting.
+for one boot of the other kernel (LoaderEntryOneShot, through bootctl). `kernel keep` puts both lines back and makes
+the kernel running then the one Limine keeps booting: with `remember_last_entry: yes` it is the entry Limine booted
+last, so when LimineLastBootedEntry (in the variable the Limine that boots next reads) names another entry or none,
+keep writes it as Limine would have; with remember_last_entry off it points `default_entry` at that kernel.
 """
 
 from __future__ import annotations
@@ -89,8 +91,39 @@ class LimineKernels:
         return lm.read_efivar(self.sys, lm.ONESHOT_VAR, utf16=True)
 
     @property
+    def next_limine(self) -> Optional[tuple[int, int, int]]:
+        if not hasattr(self, "_next_limine"):
+            self._next_limine = lm.next_limine(self.sys, self.esp)
+        return self._next_limine
+
+    def last_booted_vars(self) -> list[str]:
+        """The LimineLastBootedEntry variables the Limine that boots next may read: the one for its version, and
+        when that version is unknown, also the other one if it is there."""
+        main = lm.last_booted_var(self.next_limine)
+        other = lm.LAST_BOOTED_VAR_OLD if main == lm.LAST_BOOTED_VAR else lm.LAST_BOOTED_VAR
+        return [main] + ([other] if self.next_limine is None and self.sys.exists(other) else [])
+
+    @property
     def last_booted(self) -> Optional[str]:
-        return lm.read_efivar(self.sys, lm.LAST_BOOTED_VAR, utf16=False)
+        return lm.read_efivar(self.sys, lm.last_booted_var(self.next_limine), utf16=False)
+
+    def running_entry(self, running: Kernel) -> tuple[Optional[lm.Entry], str]:
+        """The running kernel's own entry (the one LoaderEntrySelected says booted, when several boot it), or None
+        and why not."""
+        menu = self.menu
+        own = [e for e in menu.walk() if not e.is_dir and not e.skipped() and
+               (e.kernel_id == running.package or (not e.kernel_id and e.name == running.package))]
+        selected = lm.read_efivar(self.sys, lm.SELECTED_VAR, utf16=True)
+        booted = menu.by_bli_id_or_path(selected) if selected else None
+        entry = booted if any(booted is e for e in own) else own[0] if len(own) == 1 else None
+        if entry is None:
+            return None, (f"{running.package} has no Limine entry of its own in {self.conf}" if not own else
+                          f"{running.package} has {len(own)} entries in {self.conf} "
+                          f"({', '.join(repr(menu.path(e)) for e in own)}) and Limine did not say which one booted")
+        if not self.files_ok(entry):
+            return None, (f"the files of {running.package}'s entry '{menu.path(entry)}' on the ESP are missing or "
+                          "do not match the checksums in limine.conf")
+        return entry, ""
 
     def files_ok(self, entry: lm.Entry) -> bool:
         """Every file the entry loads is on the ESP, and matches the checksum limine.conf gives it (Limine stops
@@ -165,10 +198,12 @@ class LimineKernels:
         finally:
             os.close(fd)
 
-    def commit(self, new: Optional[bytes], oneshot: Optional[str], out: Out) -> None:
+    def commit(self, new: Optional[bytes], oneshot: Optional[str], out: Out,
+               last_booted: tuple[list[str], str] = ([], "")) -> None:
         """Replace limine.conf with ``new`` (enrolling its checksum where that is set up; any mismatch puts the old
-        file back), then set the one-shot entry ("" clears it). Holds the boot-partition lock, and keeps Ctrl+C and
-        a closed terminal from stopping it half way; re-reads limine.conf at the end."""
+        file back), then set the one-shot entry ("" clears it, first). ``last_booted``: LimineLastBootedEntry
+        variables to set to an entry's path, before limine.conf changes. Holds the boot-partition lock, and keeps
+        Ctrl+C and a closed terminal from stopping it half way; re-reads limine.conf at the end."""
         notes: list[str] = []
         try:
             with self.boot_lock(), _shielded():
@@ -179,6 +214,12 @@ class LimineKernels:
                     raise KernelError(f"{self.conf} changed while this ran; run the command again")
                 if oneshot == "":  # keep: never remember_last_entry: yes on disk while a one-shot is pending
                     self.set_oneshot("")
+                for var in last_booted[0]:  # keep: before remember_last_entry: yes is back, so it boots this
+                    try:
+                        lm.write_last_booted(self.sys, var, last_booted[1])
+                    except OSError as e:
+                        raise KernelError(f"writing {var} failed ({e.strerror or e}); {self.conf} was not "
+                                          "changed") from e
                 if new is not None and new != self.data:
                     self._replace(new, notes)
                 if oneshot:  # try: only once remember_last_entry: no is in place
@@ -287,6 +328,10 @@ def _notes(lk: LimineKernels, kernels: list[Kernel]) -> list[str]:
         notes.append(f"Limine's default entry is {name} since `oxp3-tool kernel try` (a failed boot comes back to "
                      f"it). Do not remove {name} before `sudo oxp3-tool kernel keep` on the kernel to keep, or "
                      "Limine waits in its menu at power-on")
+    elif lm.keep_original(menu) is not None and not menu.remembers():
+        name = lk.name(default, kernels)
+        notes.append(f"Limine's default entry is {name} since `oxp3-tool kernel keep` (remember_last_entry is off). "
+                     f"Do not remove {name} while it is, or Limine waits in its menu at power-on")
     if lm.marked_original(menu) is not None and menu.remembers():
         notes.append("warning: limine.conf has remember_last_entry: yes again under `oxp3-tool kernel try`'s marker, "
                      "so a failed boot no longer comes back to Limine's default entry; `sudo oxp3-tool kernel keep` "
@@ -468,13 +513,17 @@ def _keep(lk: LimineKernels, kernels: list[Kernel], assume_yes: bool, dry_run: b
     originals = {key: lm.marked_original(menu, key) for key in ("remember_last_entry", "default_entry")}
     running = lk.running(kernels)
     pending = lk.oneshot
-    if not any(originals.values()) and not pending:
-        if menu.remembers():
-            out("Nothing to change: Limine boots the entry that booted last (remember_last_entry: yes).")
-        else:
-            out(f"Nothing to change: remember_last_entry is off in {lk.conf} (not by this tool), so Limine boots its "
-                f"default entry, {lk.name(menu.default(), kernels)}.")
-        return 0
+    if running is None:
+        raise KernelError(f"the kernel running now ({lk.ctx.kernel_release or '?'}) is no longer installed (pacman "
+                          "updated or removed it), so it cannot be made the one every power-on boots; nothing "
+                          "changed. Reboot, then run `sudo oxp3-tool kernel keep` on the kernel to keep")
+    entry, why_not = lk.running_entry(running)
+    if entry is None:
+        raise KernelError(f"{why_not}, so this tool cannot make it the one every power-on boots; nothing changed")
+    if not menu.autoboots():
+        raise KernelError(f"{lk.conf} has `timeout: no`: Limine waits in its menu for a key at every power-on, "
+                          "whichever entry it selects; nothing changed")
+    path = menu.path(entry)
     text = lk.data.decode("utf-8")
     plan = []
     if pending:
@@ -484,30 +533,81 @@ def _keep(lk: LimineKernels, kernels: list[Kernel], assume_yes: bool, dry_run: b
         if original is not None:
             text = lm.set_global(text, key, original, marker=None)
             plan.append(f"put `{original}` back in {lk.conf}")
-    if any(originals.values()) and lk.backend.enroll_enabled:
+    after = lm.parse(text)
+    writes: list[str] = []
+    if after.remembers():
+        # Limine boots the entry it booted last. It records every boot, but in the variable of its own version
+        # (12.9.5 moved it), so after a Limine update, or when the firmware lost the write, it can name another one.
+        if lk.next_limine is not None and lk.next_limine < (12, 0, 0):
+            raise KernelError(f"the Limine that boots next ({'.'.join(map(str, lk.next_limine))}) is older than "
+                              "12.0, which this tool does not read; run `sudo limine-update`")
+        writes = [v for v in lk.last_booted_vars() if lm.read_efivar(lk.sys, v, utf16=False) != path]
+        if writes:
+            now = lk.last_booted
+            had = after.by_path(now) if now else None
+            plan.insert(1 if pending else 0,
+                        f"record {running.package} (entry '{path}') as the entry Limine booted last, which "
+                        "remember_last_entry: yes boots (UEFI variable LimineLastBootedEntry, as Limine writes it; "
+                        + ("it has no entry recorded now)" if had is None else
+                           f"it names {lk.name(had, kernels, after)} now)"))
+        predicted = path
+    else:
+        predicted = None
+        default = after.default()
+        if default is None or after.path(default) != path:
+            at = after.value_line("default_entry")
+            if at is None:
+                raise KernelError(f"{lk.conf} has no global default_entry line; this tool does not add one")
+            line = after.lines[at]
+            kept = lm.keep_original(after)
+            back = lm.set_global(text, "default_entry", kept, marker=None) if kept is not None else None
+            restored = lm.parse(back) if back is not None else None
+            was = restored.default() if restored is not None else None
+            if back is not None and was is not None and restored.path(was) == path:
+                text = back  # the line an earlier keep replaced boots it: put that back, and its comment goes
+                plan.append(f"put `{kept}` back in {lk.conf} (remember_last_entry is off, so Limine boots its "
+                            "default entry)")
+            else:
+                text = lm.set_global(text, "default_entry", f"default_entry: {path}",
+                                     marker=lm.keep_comment_for(line))
+                plan.append(f"change `{line}` to `default_entry: {path}` in {lk.conf} (remember_last_entry is "
+                            "off, so Limine boots its default entry)")
+    conf_changes = text != lk.data.decode("utf-8")
+    if conf_changes and lk.backend.enroll_enabled:
         plan[-1] += " and enroll its checksum"
-    if any(originals.values()):
+    final = lm.parse(text)
+    nxt, why = final.boots(None, predicted if final.remembers() else lk.last_booted)
+    if lk.owner(nxt, kernels) is not running:
+        raise KernelError(f"Limine would still boot {lk.name(nxt, kernels, final)} at power-on ({why}), not "
+                          f"{running.package}; nothing changed")
+    if not plan:
+        out(f"Nothing to change: every power-on boots {running.package}, the kernel running now ("
+            + ("Limine booted it last, and limine.conf has remember_last_entry: yes)" if final.remembers() else
+               "Limine's default entry)"))
+        return 0
+    if conf_changes or writes:
         problem = lk.edit_problem()
         if problem:
             raise KernelError(problem)
-    after = lm.parse(text)
-    nxt, _ = after.boots(None, lk.last_booted)
     out("This will:")
     for line in plan:
         out(f"  - {line}")
-    if nxt is None:
-        raise KernelError("after that Limine would boot nothing at power-on (its default entry names no bootable "
-                          "entry); nothing changed")
-    out(f"Then every power-on boots {lk.name(nxt, kernels, after)}.")
-    if running is not None and lk.owner(nxt, kernels) is not running:
-        out(f"note: that is not {running.package}, the kernel running now (Limine has not recorded booting it).")
+    out(f"Then every power-on boots {running.package}, the kernel running now.")
+    if lm.keep_original(final) is not None:
+        out(f"note: do not remove {running.package} while Limine's default entry points at it: Limine would then "
+            "wait in its menu at power-on.")
     if dry_run:
         return 0
     if not confirm("Go ahead?", assume_yes):
         out("Nothing changed.")
         return 1
-    lk.commit(text.encode("utf-8") if any(originals.values()) else None, "" if pending else None, out)
-    out("Done.")
+    lk.commit(text.encode("utf-8") if conf_changes else None, "" if pending else None, out, (writes, path))
+    nxt, why = lk.menu.boots(lk.oneshot, lk.last_booted)
+    if lk.owner(nxt, kernels) is not running:
+        raise KernelError(f"after the change Limine would boot {lk.name(nxt, kernels)} at power-on ({why}), not "
+                          f"{running.package} (another tool changed limine.conf?); `sudo oxp3-tool kernel` shows "
+                          "the state")
+    out(f"Done: every power-on boots {running.package}, the kernel running now.")
     return 0
 
 

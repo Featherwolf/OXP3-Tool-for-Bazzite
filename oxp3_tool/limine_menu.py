@@ -3,7 +3,10 @@ entry and the one-shot entry, and the UEFI variables behind the last two.
 
 What Limine boots at power-on (common/menu.c): the one-shot entry (LoaderEntryOneShot, erased when read), else
 with `remember_last_entry: yes` the entry that booted last (LimineLastBootedEntry, which Limine writes before
-every boot), else `default_entry`. A default naming a directory or nothing stops the countdown at the menu.
+every boot, one-shot boots included, whatever remember_last_entry says), else `default_entry`. A default naming a
+directory or nothing stops the countdown at the menu. Limine 12.9.5 moved LimineLastBootedEntry to another vendor
+GUID ("Remember the last booted entry under a valid version 4 UUID. Entries remembered by earlier versions are not
+read back."), so which variable counts depends on the Limine that boots next.
 
 The behaviour follows Limine (https://github.com/Limine-Bootloader/Limine) 12.9, common/menu.c and
 common/lib/config.c, checked against v12.9.6. Short routines such as bli_entry_base_id are written again here to
@@ -13,17 +16,25 @@ contributors; its licence is in THIRD_PARTY_NOTICES.md.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
+import os
 import re
+import struct
 from dataclasses import dataclass, field
 from typing import Optional
 
 from .system import System
 
 EFIVARS = "/sys/firmware/efi/efivars"
-LIMINE_GUID = "513ee0d0-6e43-cb05-b272-f146a2fcb88a"
+LIMINE_GUID = "03884334-1756-4978-9c8c-86fb8998b4ea"  # limine_efi_vendor_guid since 12.9.5
+LIMINE_GUID_OLD = "513ee0d0-6e43-cb05-b272-f146a2fcb88a"  # 12.0 to 12.9.4 (the entry's path; before 12.0 an index)
+NEW_GUID_SINCE = (12, 9, 5)
 BLI_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 LAST_BOOTED_VAR = f"{EFIVARS}/LimineLastBootedEntry-{LIMINE_GUID}"
+LAST_BOOTED_VAR_OLD = f"{EFIVARS}/LimineLastBootedEntry-{LIMINE_GUID_OLD}"
+LOADER_INFO_VAR = f"{EFIVARS}/LoaderInfo-{BLI_GUID}"
 ONESHOT_VAR = f"{EFIVARS}/LoaderEntryOneShot-{BLI_GUID}"
 SELECTED_VAR = f"{EFIVARS}/LoaderEntrySelected-{BLI_GUID}"
 # In the EFI binary: this marker, then the enrolled BLAKE2b of limine.conf in hex (all zeros: none enrolled).
@@ -210,7 +221,10 @@ class Menu:
         return None
 
     def boots(self, oneshot: Optional[str], last_booted: Optional[str]) -> tuple[Optional[Entry], str]:
-        """(entry, why) for the next power-on; entry None means Limine waits in its menu."""
+        """(entry, why) for the next power-on; entry None means Limine waits in its menu (with `timeout: no` it
+        does whichever entry is selected, the one-shot and the remembered one too)."""
+        if not self.autoboots():
+            return None, "timeout: no"
         if oneshot:
             e = self.by_bli_id_or_path(oneshot)
             if e is not None:
@@ -222,7 +236,7 @@ class Menu:
         e = self.default()
         if e is None:
             return None, "no valid default entry"
-        return (e, "default") if self.autoboots() else (None, "timeout: no")
+        return e, "default"
 
 
 def _split_path(path: str) -> list[tuple[str, int]]:
@@ -294,27 +308,43 @@ def parse(text: str) -> Menu:
 
 def set_global(text: str, key: str, new_line: str, marker: Optional[str] = None) -> str:
     """Replace the line Limine reads `key` from (a global one, above the first entry) with ``new_line``. ``marker``
-    goes on its own line above it, unless a marker is there already (the first one keeps the original); None
-    removes a marker found there."""
+    goes on its own line above it, unless a `kernel try` marker is there already (the first one keeps the
+    original; a `kernel keep` comment is replaced); None removes either found there."""
     menu = parse(text)
     at = menu.value_line(key)
     if at is None or at >= menu.first_entry_line:
         raise MenuError(f"limine.conf has no global {key} line")
     raw = text.split("\n")
     raw[at] = new_line
-    marked = at > 0 and raw[at - 1].strip().startswith(MARKER_PREFIX)
-    if marker is not None and not marked:
+    above = raw[at - 1].strip() if at > 0 else ""
+    if above.startswith(KEEP_PREFIX) and marker is not None:
+        raw[at - 1] = marker
+    elif marker is not None and not above.startswith(MARKER_PREFIX):
         raw.insert(at, marker)
-    elif marker is None and marked:
+    elif marker is None and above.startswith((MARKER_PREFIX, KEEP_PREFIX)):
         del raw[at - 1]
     return "\n".join(raw)
 
 
 MARKER_PREFIX = "# oxp3-tool kernel try:"
+KEEP_PREFIX = "# oxp3-tool kernel keep:"
 
 
 def marker_for(original: str) -> str:
     return f'{MARKER_PREFIX} was "{original}"; `sudo oxp3-tool kernel keep` puts it back'
+
+
+def keep_comment_for(original: str) -> str:
+    return f'{KEEP_PREFIX} was "{original}"; it points at the kernel kept'
+
+
+def keep_original(menu: Menu, key: str = "default_entry") -> Optional[str]:
+    """The global line `kernel keep` replaced, from its comment above the current one."""
+    at = menu.value_line(key)
+    if at is None or at == 0 or at >= menu.first_entry_line:
+        return None
+    m = re.fullmatch(re.escape(KEEP_PREFIX) + r' was "(.*)"; .*', menu.lines[at - 1])
+    return m.group(1) if m else None
 
 
 def marked_original(menu: Menu, key: str = "remember_last_entry") -> Optional[str]:
@@ -332,10 +362,86 @@ def read_efivar(sys: System, path: str, utf16: bool) -> Optional[str]:
         return None
     body = data[4:]  # efivarfs: 4 bytes of attributes, then the value
     try:
-        text = body.decode("utf-16-le") if utf16 else body.decode("ascii")
+        text = body.decode("utf-16-le") if utf16 else body.decode("utf-8")
     except UnicodeDecodeError:
         return None
     return text.split("\0", 1)[0] or None
+
+
+def parse_version(text: str) -> Optional[tuple[int, int, int]]:
+    m = re.search(r"Limine ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", text)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def next_limine(sys: System, esp: str) -> Optional[tuple[int, int, int]]:
+    """The version of the Limine that boots next: the one in the ESP's EFI binaries (its menu branding, "Limine
+    X.Y.Z (x86-64, UEFI)"), else the one that started this boot (LoaderInfo); None when the binaries differ."""
+    found = set()
+    for rel in EFI_BINARIES:
+        data = sys.read_bytes(f"{esp}/{rel}")
+        m = re.search(rb"Limine ([0-9]+)\.([0-9]+)\.([0-9]+) \(", data or b"")
+        if m:
+            found.add(tuple(int(g) for g in m.groups()))
+    if len(found) > 1:
+        return None
+    if found:
+        return found.pop()  # type: ignore[return-value]
+    return parse_version(read_efivar(sys, LOADER_INFO_VAR, utf16=True) or "")
+
+
+def last_booted_var(version: Optional[tuple[int, int, int]]) -> str:
+    """The LimineLastBootedEntry that Limine ``version`` reads (unknown: the current one)."""
+    return LAST_BOOTED_VAR_OLD if version is not None and version < NEW_GUID_SINCE else LAST_BOOTED_VAR
+
+
+FS_IOC_GETFLAGS, FS_IOC_SETFLAGS, FS_IMMUTABLE_FL = 0x80086601, 0x40086602, 0x10
+EFI_NV_BS_RT = 0x07  # EFI_VARIABLE_NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS, as Limine sets it
+
+
+def _immutable_off(path: os.PathLike) -> Optional[int]:
+    """Clear the immutable flag efivarfs sets on vendor variables (an immutable file cannot even be opened for
+    writing), as systemd's chattr_path does; returns the flags to put back, None when there is nothing to put back."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        flags = struct.unpack("i", fcntl.ioctl(fd, FS_IOC_GETFLAGS, struct.pack("i", 0)))[0]
+        if not flags & FS_IMMUTABLE_FL:
+            return None
+        fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack("i", flags & ~FS_IMMUTABLE_FL))
+        return flags
+    except OSError:  # no flags on this file system (a test root)
+        return None
+    finally:
+        os.close(fd)
+
+
+def write_last_booted(sys: System, path: str, entry_path: str) -> None:
+    """Write LimineLastBootedEntry the way Limine does (attributes NV|BS|RT, the entry's path as its bytes, and a
+    NUL), through efivarfs the way systemd's efi_set_variable does (the immutable flag off meanwhile, one write())."""
+    data = struct.pack("<I", EFI_NV_BS_RT) + entry_path.encode("utf-8") + b"\0"
+    target = sys.path(path)
+    flags = _immutable_off(target)
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+        try:
+            if os.write(fd, data) != len(data):
+                raise OSError("short write")
+            if os.fstat(fd).st_size > len(data):  # a plain file (efivarfs replaces the whole variable)
+                os.ftruncate(fd, len(data))
+        finally:
+            os.close(fd)
+    finally:
+        if flags is not None:
+            with contextlib.suppress(OSError):
+                fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack("i", flags))
+                finally:
+                    os.close(fd)
+    if read_efivar(sys, path, utf16=False) != entry_path:
+        raise OSError(f"{path} does not read back as written")
 
 
 def enrolled_hashes(sys: System, esp: str) -> dict[str, str]:

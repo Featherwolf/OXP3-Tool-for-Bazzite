@@ -10,7 +10,8 @@ from pathlib import Path
 from oxp3_tool import limine_menu as lm
 from oxp3_tool.cli import main
 
-from .fakeroot import LIMINE_EFI, ONESHOT_VAR, FakeCachyOS, FakeOxp3
+from .fakeroot import (LAST_BOOTED_VAR, LAST_BOOTED_VAR_OLD, LIMINE_EFI, ONESHOT_VAR, SELECTED_VAR, FakeCachyOS,
+                       FakeOxp3)
 
 STOCK, VSW = "linux-cachyos-deckify", "linux-cachyos-deckify-vsw"
 KERNELS = {STOCK: "7.2.11-1-cachyos-deckify", VSW: "7.2.11-1-cachyos-deckify-vsw"}
@@ -104,7 +105,9 @@ class TryTest(Base):
         rc, out, err = self.cli("kernel", "keep", "-y")
         self.assertEqual(rc, 0, err + out)
         self.assertIn("put `remember_last_entry: yes` back", out)
-        self.assertIn("Then every power-on boots linux-cachyos-deckify-vsw.", out)
+        self.assertIn("Then every power-on boots linux-cachyos-deckify-vsw, the kernel running now.", out)
+        self.assertIn("Done: every power-on boots linux-cachyos-deckify-vsw, the kernel running now.", out)
+        self.assertNotIn("record", out)  # Limine recorded the one-shot boot itself
         self.assertNotIn("oxp3-tool", self.conf())
         self.assertIn("\nremember_last_entry: yes\n", self.conf())
         self.assertEqual(self.f.power_on(), VSW)
@@ -192,6 +195,223 @@ class TryTest(Base):
         rc, _, err = self.cli("kernel", "try", VSW)  # stdin is no terminal: no confirmation
         self.assertEqual(rc, 1)
         self.assertEqual(self.conf(), conf)
+
+
+class KeepTest(Base):
+    """`kernel keep` makes the kernel running now the one every power-on boots, whatever Limine recorded."""
+
+    def last(self, var=LAST_BOOTED_VAR):
+        p = self.root / var.lstrip("/")
+        return p.read_bytes() if p.is_file() else None
+
+    def set_last(self, path, var=LAST_BOOTED_VAR):
+        self.f.write(var, b"\x07\x00\x00\x00" + path.encode() + b"\0")
+
+    def tried_and_booted(self):
+        self.assertEqual(self.cli("kernel", "try", VSW, "-y")[0], 0)
+        self.assertEqual(self.f.power_on(), VSW)
+        self.assertEqual(self.running(), KERNELS[VSW])
+
+    def assert_kept(self, out):
+        self.assertIn("Then every power-on boots linux-cachyos-deckify-vsw, the kernel running now.", out)
+        self.assertIn("Done: every power-on boots linux-cachyos-deckify-vsw, the kernel running now.", out)
+        self.assertNotIn("not linux-cachyos-deckify-vsw", out)
+        self.assertNotIn("oxp3-tool", self.conf())
+        self.assertIn("\nremember_last_entry: yes\n", self.conf())
+        self.assertIn("Next boot: linux-cachyos-deckify-vsw (it booted last", self.cli("kernel")[1])
+        self.assertEqual([self.f.power_on() for _ in range(3)], [VSW, VSW, VSW])
+
+    def test_owner_report_stale_variable_of_an_older_limine(self):
+        """The report: vsw booted from `kernel try`'s one-shot, and keep said every power-on boots the stock kernel
+        ("Limine has not recorded booting it"). Limine 12.9.6 had recorded it, under the vendor GUID 12.9.5 moved
+        LimineLastBootedEntry to; the tool read the old GUID's variable, last written by 12.9.4 for the stock
+        kernel."""
+        self.fake()
+        self.set_last("CachyOS/linux-cachyos-deckify", LAST_BOOTED_VAR_OLD)  # left by Limine 12.9.4
+        self.tried_and_booted()
+        self.assertEqual(self.last(), b"\x07\x00\x00\x00CachyOS/linux-cachyos-deckify-vsw\0")
+        rc, out, err = self.cli("kernel", "keep", "--yes")
+        self.assertEqual(rc, 0, err + out)
+        self.assertEqual(out, "This will:\n  - put `remember_last_entry: yes` back in /boot/limine.conf\n"
+                              "Then every power-on boots linux-cachyos-deckify-vsw, the kernel running now.\n"
+                              "Done: every power-on boots linux-cachyos-deckify-vsw, the kernel running now.\n")
+        self.assertEqual(self.last(LAST_BOOTED_VAR_OLD), b"\x07\x00\x00\x00CachyOS/linux-cachyos-deckify\0")
+        self.assert_kept(out)
+
+    def test_last_booted_names_the_stock_kernel(self):
+        """vsw booted from the one-shot, but LimineLastBootedEntry still names the stock kernel (the firmware
+        dropped Limine's write): keep records vsw itself, as Limine writes it."""
+        self.fake()
+        self.assertEqual(self.cli("kernel", "try", VSW, "-y")[0], 0)
+        self.f.lose_last_booted = True
+        self.assertEqual(self.f.power_on(), VSW)
+        self.assertEqual(self.last(), b"\x07\x00\x00\x00CachyOS/linux-cachyos-deckify\0")
+        rc, out, err = self.cli("kernel", "keep", "-n")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.last(), b"\x07\x00\x00\x00CachyOS/linux-cachyos-deckify\0")  # dry run
+        rc, out, err = self.cli("kernel", "keep", "--yes")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("  - record linux-cachyos-deckify-vsw (entry 'CachyOS/linux-cachyos-deckify-vsw') as the entry "
+                      "Limine booted last, which remember_last_entry: yes boots (UEFI variable LimineLastBootedEntry, "
+                      "as Limine writes it; it names linux-cachyos-deckify now)\n"
+                      "  - put `remember_last_entry: yes` back in /boot/limine.conf\n", out)
+        self.assertEqual(self.last(), b"\x07\x00\x00\x00CachyOS/linux-cachyos-deckify-vsw\0")
+        self.assert_kept(out)
+        self.remove_vsw()  # the remembered path then names nothing: the default boots, as before
+        self.assertEqual(self.f.power_on(), STOCK)
+
+    def test_after_an_earlier_keep_that_left_the_stock_kernel(self):
+        """No `kernel try` state left (an older keep restored remember_last_entry only): keep still records it."""
+        self.fake()
+        self.tried_and_booted()
+        self.f.write(CONF, re.sub(r"# oxp3-tool kernel try: .*\nremember_last_entry: no", "remember_last_entry: yes",
+                                  self.conf()))
+        self.set_last("CachyOS/linux-cachyos-deckify")
+        self.assertIn("Next boot: linux-cachyos-deckify (it booted last", self.cli("kernel")[1])
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("record linux-cachyos-deckify-vsw", out)
+        self.assert_kept(out)
+        rc, out, _ = self.cli("kernel", "keep", "-y")
+        self.assertEqual(out, "Nothing to change: every power-on boots linux-cachyos-deckify-vsw, the kernel running "
+                              "now (Limine booted it last, and limine.conf has remember_last_entry: yes)\n")
+
+    def test_limine_updated_after_the_boot(self):
+        """vsw booted by Limine 12.9.4 (recorded under the old GUID), then pacman updated Limine to 12.9.6, which
+        reads only the new GUID's variable, where nothing is recorded."""
+        self.fake()
+        (self.root / LAST_BOOTED_VAR.lstrip("/")).unlink()
+        self.f.update_limine("12.9.4")
+        self.assertEqual(self.f.power_on(), STOCK)
+        self.tried_and_booted()
+        self.assertIsNone(self.last())
+        self.f.update_limine("12.9.6")
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("as Limine writes it; it has no entry recorded now)", out)
+        self.assert_kept(out)
+
+    def test_enrolled_checksum_and_the_record(self):
+        self.fake(limine_default=ENROLL)
+        self.f.regenerate()
+        self.assertEqual(self.cli("kernel", "try", VSW, "-y")[0], 0)
+        self.f.lose_last_booted = True
+        self.assertEqual(self.f.power_on(), VSW)
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("back in /boot/limine.conf and enroll its checksum\n", out)
+        self.assert_kept(out)
+
+    def test_remember_last_entry_off_by_the_user(self):
+        """Without remember_last_entry, the default entry is what boots: keep points it at the running kernel."""
+        self.fake()
+        self.f.write(CONF, self.conf().replace("remember_last_entry: yes", "remember_last_entry: no"))
+        self.f.runner(["bootctl", "set-oneshot", "CachyOS.linux-cachyos-deckify-vsw"])
+        self.assertEqual(self.f.power_on(), VSW)
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("change `default_entry: 2` to `default_entry: CachyOS/linux-cachyos-deckify-vsw` in "
+                      "/boot/limine.conf (remember_last_entry is off", out)
+        self.assertIn("note: do not remove linux-cachyos-deckify-vsw while Limine's default entry points at it", out)
+        self.assertIn("Done: every power-on boots linux-cachyos-deckify-vsw, the kernel running now.", out)
+        self.assertIn('# oxp3-tool kernel keep: was "default_entry: 2"; it points at the kernel kept\n'
+                      "default_entry: CachyOS/linux-cachyos-deckify-vsw\n", self.conf())
+        self.assertEqual([self.f.power_on() for _ in range(2)], [VSW, VSW])
+        self.assertIn("Limine's default entry is linux-cachyos-deckify-vsw since `oxp3-tool kernel keep` "
+                      "(remember_last_entry is off). Do not remove linux-cachyos-deckify-vsw", self.cli("kernel")[1])
+        # Back to the stock kernel with try: its fallback is the running kernel, already the default.
+        self.assertEqual(self.cli("kernel", "try", STOCK, "-y")[0], 0)
+        self.assertEqual(self.f.power_on(), STOCK)
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("  - put `default_entry: 2` back in /boot/limine.conf (remember_last_entry is off", out)
+        self.assertNotIn("note: do not remove", out)
+        self.assertIn("Done: every power-on boots linux-cachyos-deckify, the kernel running now.", out)
+        self.assertNotIn("oxp3-tool", self.conf())  # limine.conf as it was before the first keep
+        self.assertIn("\ndefault_entry: 2\n", self.conf())
+        self.assertNotIn("Do not remove", self.cli("kernel")[1])
+        self.assertEqual([self.f.power_on() for _ in range(2)], [STOCK, STOCK])
+
+    def test_timeout_no(self):
+        """`timeout: no` stops Limine at its menu whichever entry it selects: keep says so and changes nothing."""
+        self.fake()
+        self.tried_and_booted()
+        self.f.write(CONF, "timeout: no\n" + self.conf())
+        conf = self.conf()
+        self.assertIn("Next boot: nothing (Limine waits in its menu) (timeout: no).", self.cli("kernel")[1])
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("has `timeout: no`: Limine waits in its menu for a key at every power-on", err)
+        self.assertNotIn("Done", out)
+        self.assertEqual(self.conf(), conf)
+        self.assertIsNone(self.f.power_on())
+
+    def test_two_entries_of_the_running_kernel(self):
+        self.fake()
+        self.tried_and_booted()
+        conf = self.conf()
+        block = re.search(r"  //linux-cachyos-deckify-vsw\n(?:    .*\n)*", conf).group(0)
+        self.f.write(CONF, conf.replace(block, block + block.replace("//linux-cachyos-deckify-vsw", "//vsw copy")))
+        conf = self.conf()
+        self.f.write(SELECTED_VAR, b"\x06\x00\x00\x00" + "CachyOS.gone\0".encode("utf-16-le"))
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("linux-cachyos-deckify-vsw has 2 entries in /boot/limine.conf "
+                      "('CachyOS/linux-cachyos-deckify-vsw', 'CachyOS/vsw copy') and Limine did not say which one "
+                      "booted", err)
+        self.assertNotIn("Done", out)
+        self.assertEqual(self.conf(), conf)
+        # LoaderEntrySelected names the copy: that is the one kept.
+        self.f.write(SELECTED_VAR, b"\x06\x00\x00\x00" + "CachyOS.vsw-copy\0".encode("utf-16-le"))
+        self.set_last("CachyOS/linux-cachyos-deckify")
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 0, err + out)
+        self.assertIn("(entry 'CachyOS/vsw copy')", out)
+        self.assertEqual(self.last(), b"\x07\x00\x00\x00CachyOS/vsw copy\0")
+
+    def test_running_kernel_updated_or_without_its_entry(self):
+        self.fake()
+        self.tried_and_booted()
+        conf = self.conf()
+        self.f.write("/proc/sys/kernel/osrelease", "7.2.12-1-cachyos-deckify-vsw\n")
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("is no longer installed (pacman updated or removed it), so it cannot be made the one every "
+                      "power-on boots; nothing changed", err)
+        self.f.write("/proc/sys/kernel/osrelease", KERNELS[VSW] + "\n")
+        self.f.write(f"/boot/0123456789abcdef0123456789abcdef/{VSW}/vmlinuz", "changed")
+        rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("on the ESP are missing or do not match", err)
+        self.assertEqual(self.conf(), conf)
+        self.assertNotIn("Done", out)
+
+    def test_failed_variable_write_changes_no_file(self):
+        from unittest import mock
+        self.fake()
+        self.assertEqual(self.cli("kernel", "try", VSW, "-y")[0], 0)
+        self.f.lose_last_booted = True
+        self.f.power_on()
+        conf = self.conf()
+        with mock.patch.object(lm, "write_last_booted", side_effect=OSError(28, "No space left on device")):
+            rc, out, err = self.cli("kernel", "keep", "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("failed (No space left on device); /boot/limine.conf was not changed", err)
+        self.assertNotIn("Done", out)
+        self.assertEqual(self.conf(), conf)  # remember_last_entry: no: the stock kernel still boots, safely
+        self.assertEqual(self.f.power_on(), STOCK)
+
+    def test_versions(self):
+        self.fake()
+        sys = self.f.system()
+        self.assertEqual(lm.next_limine(sys, "/boot"), (12, 9, 6))  # LoaderInfo: no binary on the ESP here
+        self.f.update_limine("12.9.4")
+        self.assertEqual(lm.next_limine(sys, "/boot"), (12, 9, 4))  # the binary that boots next
+        self.assertEqual(lm.last_booted_var((12, 9, 4)), LAST_BOOTED_VAR_OLD)
+        self.assertEqual(lm.last_booted_var((12, 9, 5)), LAST_BOOTED_VAR)
+        self.assertEqual(lm.last_booted_var(None), LAST_BOOTED_VAR)
+        self.f.write("/boot/EFI/BOOT/BOOTX64.EFI", b"MZ\0Limine 12.9.6 (x86-64, UEFI)\0")
+        self.assertIsNone(lm.next_limine(sys, "/boot"))  # two different binaries: unknown
 
 
 class DiagnoseTest(Base):

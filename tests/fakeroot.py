@@ -379,7 +379,9 @@ class FakeOxp3:
 MACHINE_ID = "0123456789abcdef0123456789abcdef"
 EFIVARS = "/sys/firmware/efi/efivars"
 ONESHOT_VAR = f"{EFIVARS}/LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
-LAST_BOOTED_VAR = f"{EFIVARS}/LimineLastBootedEntry-513ee0d0-6e43-cb05-b272-f146a2fcb88a"
+LAST_BOOTED_VAR = f"{EFIVARS}/LimineLastBootedEntry-03884334-1756-4978-9c8c-86fb8998b4ea"  # Limine 12.9.5 and later
+LAST_BOOTED_VAR_OLD = f"{EFIVARS}/LimineLastBootedEntry-513ee0d0-6e43-cb05-b272-f146a2fcb88a"  # 12.0 to 12.9.4
+LOADER_INFO_VAR = f"{EFIVARS}/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 SELECTED_VAR = f"{EFIVARS}/LoaderEntrySelected-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 LIMINE_EFI = "/boot/EFI/limine/limine_x64.efi"
 B2SUM_SIGNATURE = b"++CONFIG_B2SUM_SIGNATURE++"
@@ -425,6 +427,7 @@ class FakeCachyRunner(FakeRunner):
         self.enroll_exit = 0
         self.after_oneshot = None  # called after `bootctl set-oneshot` (another tool's write in the same moment)
         self.enroll_strips = False  # a failing limine-enroll-config leaves the binary without a checksum
+        self.limine_version = "12.9.6"  # of the Limine EFI binary on the ESP
         # Command -> how many of its runs pass before one gets Ctrl+C (before it writes anything).
         self.interrupt: dict[str, int] = {}
         # Command -> (runs that pass, signal this process then gets): a closed terminal or a stopped service.
@@ -579,14 +582,18 @@ class FakeCachyRunner(FakeRunner):
         if self.enroll_exit and self.enroll_strips:  # limine-enroll-config put back the binary without one
             p = self.root / LIMINE_EFI.lstrip("/")
             if p.is_file():
-                p.write_bytes(b"MZ\0" + B2SUM_SIGNATURE + b"0" * 128 + b"\0")
+                p.write_bytes(self.limine_binary() + B2SUM_SIGNATURE + b"0" * 128 + b"\0")
         if self.enroll_exit or not re.search(r"^ENABLE_ENROLL_LIMINE_CONFIG=[\"']?yes", self.read("/etc/default/limine")
                                              or "", re.M):
             return
         digest = hashlib.blake2b((self.root / "boot/limine.conf").read_bytes(), digest_size=64).hexdigest()
         p = self.root / LIMINE_EFI.lstrip("/")
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(b"MZ\0" + B2SUM_SIGNATURE + digest.encode() + b"\0")
+        p.write_bytes(self.limine_binary() + B2SUM_SIGNATURE + digest.encode() + b"\0")
+
+    def limine_binary(self) -> bytes:
+        """The start of the fake EFI binary: its menu branding, as Limine's has it."""
+        return b"MZ\0Limine " + self.limine_version.encode() + b" (x86-64, UEFI)\0"
 
     # -- sdboot-manage / grub-mkconfig ----------------------------------------------
 
@@ -659,6 +666,7 @@ class FakeCachyOS(FakeOxp3):
         self.runner = FakeCachyRunner(self.root, kernels or CACHY_KERNELS)
         self.bootloader = bootloader
         self.hangs: set[str] = set()
+        self.lose_last_booted = False  # the next boot's LimineLastBootedEntry write does not reach NVRAM
         self.build(inputplumber=inputplumber, gm7=gm7)
         self.cachyos(bootloader, limine_default, loader_info, handheld, inputplumber, steamos_manager, secure_boot)
 
@@ -688,8 +696,8 @@ class FakeCachyOS(FakeOxp3):
         if secure_boot:
             self.write("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
                        b"\x06\x00\x00\x00\x01")
-        names = {"limine": "Limine 12.9.4", "systemd-boot": "systemd-boot 258.1-1", "grub": "GRUB 2.16",
-                 "refind": "rEFInd 0.14.2"}
+        names = {"limine": f"Limine {self.runner.limine_version}", "systemd-boot": "systemd-boot 258.1-1",
+                 "grub": "GRUB 2.16", "refind": "rEFInd 0.14.2"}
         info = names.get(bootloader) if loader_info == "default" else loader_info
         if info:
             self.write("/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f",
@@ -760,8 +768,10 @@ class FakeCachyOS(FakeOxp3):
 
     def power_on(self) -> Optional[str]:
         """Limine 12.9 at power-on, for the limine.conf layout the fake writes: the one-shot entry (erased once
-        read), else with remember_last_entry: yes the entry that booted last, else default_entry (an index among
-        the visible entries, or a path). Boots it and returns its kernel-id; None when Limine waits in its menu.
+        read), else with remember_last_entry: yes the entry that booted last (LimineLastBootedEntry under the vendor
+        GUID of the binary's version: 12.9.5 moved it), else default_entry (an index among the visible entries, or
+        a path). Records the entry booted, then boots it and returns its kernel-id; None when Limine waits in its
+        menu.
         A kernel in ``self.hangs`` boots (Limine records it) but never reaches userspace."""
         conf = (self.root / "boot/limine.conf").read_bytes()
         efi = self.root / LIMINE_EFI.lstrip("/")
@@ -797,11 +807,17 @@ class FakeCachyOS(FakeOxp3):
         def find(value: Optional[str]) -> Optional[tuple[str, Optional[str]]]:
             return next((v for v in visible if value in (v[0], v[0].replace("/", "."))), None) if value else None
         var = self.root / ONESHOT_VAR.lstrip("/")
+        if option("timeout") == "no":  # the menu waits for a key, whichever entry is selected
+            if var.is_file():
+                var.unlink()
+            return None
         chosen = None
         if var.is_file():
             chosen = find(var.read_bytes()[4:].decode("utf-16-le").rstrip("\0"))
             var.unlink()
-        last = self.root / LAST_BOOTED_VAR.lstrip("/")
+        version = tuple(int(x) for x in self.runner.limine_version.split("."))
+        last_var = LAST_BOOTED_VAR if version >= (12, 9, 5) else LAST_BOOTED_VAR_OLD
+        last = self.root / last_var.lstrip("/")
         if chosen is None and (option("remember_last_entry") or "").lower() == "yes" and last.is_file():
             chosen = find(last.read_bytes()[4:].decode().rstrip("\0"))
         if chosen is None:
@@ -811,15 +827,29 @@ class FakeCachyOS(FakeOxp3):
                 chosen = visible[n] if n < len(visible) else visible[0]
             else:
                 chosen = find(default)
-            if chosen is None or chosen[1] is None or option("timeout") == "no":
+            if chosen is None or chosen[1] is None:
                 return None
         path, kid = chosen
-        self.write(LAST_BOOTED_VAR, b"\x07\x00\x00\x00" + path.encode() + b"\0")
+        if self.lose_last_booted:  # firmware that drops the write
+            self.lose_last_booted = False
+        else:
+            self.write(last_var, b"\x07\x00\x00\x00" + path.encode() + b"\0")
+        self.write(LOADER_INFO_VAR,
+                   b"\x06\x00\x00\x00" + f"Limine {self.runner.limine_version}\0".encode("utf-16-le"))
         self.write(SELECTED_VAR, b"\x06\x00\x00\x00" + (path.replace("/", ".") + "\0").encode("utf-16-le"))
         if kid in self.hangs:
             return kid
         self.boot(kid)
         return kid
+
+    def update_limine(self, version: str) -> None:
+        """`pacman -Syu` of limine and its hook deploying the new EFI binary (an enrolled checksum stays)."""
+        self.runner.limine_version = version
+        p = self.root / LIMINE_EFI.lstrip("/")
+        old = p.read_bytes() if p.is_file() else b""
+        at = old.find(B2SUM_SIGNATURE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(self.runner.limine_binary() + (old[at:] if at >= 0 else B2SUM_SIGNATURE + b"0" * 128 + b"\0"))
 
     def pacman_lock(self, on: bool = True) -> None:
         if on:
