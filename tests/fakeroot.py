@@ -95,6 +95,7 @@ class FakeRunner:
         self.ip_journal = ""  # this boot's inputplumber.service messages
         self.session_journal = ""  # this boot's other messages (gamescope)
         self.bmi270_aliases = "i2c:bmi270\nacpi*:BMI0260:*\nacpi*:10EC5280:*\n"
+        self.pw_dump: dict[str, str] = {}  # user -> what `pw-dump` prints for that user's PipeWire
 
     def _failing(self, argv: Sequence[str]) -> bool:
         joined = " ".join(argv)
@@ -138,6 +139,11 @@ class FakeRunner:
             return CommandResult(1, "", "modinfo: ERROR: Module not found.")
         if cmd in ("systemd-hwdb", "udevadm", "restorecon"):
             return CommandResult(0)
+        if cmd == "runuser" and argv[-1] == "pw-dump":
+            user = argv[argv.index("-u") + 1]
+            if user not in self.pw_dump:
+                return CommandResult(1, "", "pw-dump: can't connect: Host is down")
+            return CommandResult(0, self.pw_dump[user])
         return CommandResult(0, f"(fake output of {shlex.join(argv)})\n")
 
     def _rpm_ostree(self, args: list[str]) -> CommandResult:
@@ -218,7 +224,7 @@ class FakeOxp3:
               inputplumber: bool = True, gamescope: bool = True, gm7: bool = True,
               edid: Optional[bytes] = None, force_release: str = "369-370",
               imu_driver: Optional[str] = "bmi160_i2c", iio: Sequence[str] = (),
-              game_mode: bool = True) -> None:
+              game_mode: bool = True, pipewire: bool = True) -> None:
         for k, v in (dmi or OXP3_DMI).items():
             self.write(f"/sys/class/dmi/id/{k}", v + "\n")
         self.write("/etc/os-release", f'NAME="Bazzite"\nID={os_id}\nPRETTY_NAME="Bazzite 44 (FROM Fedora Kinoite)"\n')
@@ -263,6 +269,32 @@ class FakeOxp3:
             self.symlink("/sys/devices/pci0000:00/i2c-10EC5280:00/driver", f"../../../bus/i2c/drivers/{imu_driver}")
         for i, name in enumerate(iio):
             self.write(f"/sys/bus/iio/devices/iio:device{i}/name", name + "\n")
+        if pipewire:
+            self.pipewire("/usr/lib64")
+
+    def pipewire(self, libdir: str) -> None:
+        """PipeWire 1.4+ with filter-chain and its builtin filters, WirePlumber 0.5+, pw-dump."""
+        for d in ("/usr/lib64", "/usr/lib"):
+            for f in ("pipewire-0.3/libpipewire-module-filter-chain.so",
+                      "spa-0.2/filter-graph/libspa-filter-graph-plugin-builtin.so"):
+                (self.root / d.lstrip("/") / f).unlink(missing_ok=True)
+        for f in ("pipewire-0.3/libpipewire-module-filter-chain.so",
+                  "spa-0.2/filter-graph/libspa-filter-graph-plugin-builtin.so"):
+            self.write(f"{libdir}/{f}", b"")
+        for tool in ("pipewire", "wireplumber", "pw-dump"):
+            self.write(f"/usr/bin/{tool}", "")
+        self.write("/usr/share/wireplumber/scripts/linking/find-filter-target.lua", "")
+
+    def login(self, user: str = "gamer", uid: int = 1000, dump: Optional[str] = None) -> None:
+        """``user`` has a session (/run/user/UID); ``dump`` is what pw-dump prints for it (None: PipeWire down)."""
+        passwd = self.root / "etc/passwd"
+        old = passwd.read_text() if passwd.exists() else "root:x:0:0:root:/root:/bin/bash\n"
+        home = "/var/home" if (self.root / "usr/share/ublue-os/image-info.json").exists() else "/home"
+        self.write("/etc/passwd", old + f"{user}:x:{uid}:{uid}::{home}/{user}:/bin/bash\n")
+        self.mkdir(f"/run/user/{uid}")
+        self.mkdir(f"{home}/{user}")
+        if dump is not None:
+            self.runner.pw_dump[user] = dump
 
     def system(self) -> System:
         return System(self.root, self.runner)
@@ -682,6 +714,8 @@ class FakeCachyOS(FakeOxp3):
         self.write("/proc/self/mounts", "/dev/nvme0n1p2 / btrfs rw 0 0\n/dev/nvme0n1p1 /boot vfat rw 0 0\n")
         for tool in ("pacman", "bootctl", "bash", "sh"):
             self.write(f"/usr/bin/{tool}", "")
+        if (self.root / "usr/bin/pipewire").exists():
+            self.pipewire("/usr/lib")
         for version in self.runner.kernels.values():
             self.write(f"/usr/lib/modules/{version}/modules.builtin", "")
         if not inputplumber:
@@ -856,3 +890,41 @@ class FakeCachyOS(FakeOxp3):
             self.write("/var/lib/pacman/db.lck", "")
         else:
             (self.root / "var/lib/pacman/db.lck").unlink(missing_ok=True)
+
+
+SPEAKER = "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink"
+HEADPHONES = "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Headphones__sink"
+
+
+def pw_dump_json(speaker: bool = True, filter_loaded: bool = True, linked: bool = True, volume: float = 1.0,
+                 default: Optional[str] = None, headphones: bool = False) -> str:
+    """A shortened `pw-dump` of the OXP3's PipeWire (the objects and keys the speaker-profile fix reads)."""
+    objs: list[dict] = [{"id": 0, "type": "PipeWire:Interface:Core", "info": {"name": "pipewire-0"}}]
+
+    def node(i: int, name: str, cls: str, vol: Optional[float] = None) -> None:
+        info: dict = {"props": {"node.name": name, "media.class": cls, "object.id": i}}
+        if vol is not None:
+            info["params"] = {"Props": [{"volume": 1.0, "mute": False, "channelVolumes": [vol, vol],
+                                         "softVolumes": [vol, vol]}, {"params": []}]}
+        objs.append({"id": i, "type": "PipeWire:Interface:Node", "info": info})
+
+    if speaker:
+        node(52, SPEAKER, "Audio/Sink", volume)
+    if headphones:
+        node(53, HEADPHONES, "Audio/Sink", 0.4)
+    if filter_loaded:
+        node(70, "oxp3_speaker_profile", "Audio/Sink", 1.0)
+        node(71, "oxp3_speaker_profile.output", "Stream/Output/Audio", 1.0)
+        if speaker and linked:
+            for n, port in enumerate((80, 81)):
+                objs.append({"id": 90 + n, "type": "PipeWire:Interface:Link",
+                             "info": {"output-node-id": 71, "output-port-id": port, "input-node-id": 52,
+                                      "input-port-id": port + 10, "state": "active"}})
+    meta = [{"subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON",
+             "value": {"name": SPEAKER if speaker else HEADPHONES}}]
+    if default:
+        meta.append({"subject": 0, "key": "default.configured.audio.sink", "type": "Spa:String:JSON",
+                     "value": {"name": default}})
+    objs.append({"id": 40, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+                 "metadata": meta})
+    return json.dumps(objs, indent=2)

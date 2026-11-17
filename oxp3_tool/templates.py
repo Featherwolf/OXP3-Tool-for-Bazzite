@@ -415,3 +415,195 @@ gamescope.config.known_displays.{OLED_DISPLAY_KEY} = {{
 }}
 debug("Registered ONEXPLAYER 3 OLED (oxp3-tool) as a known display")
 """
+
+
+# -- PipeWire speaker profile ----------------------------------------------------
+
+# A filter-chain that only the OXP3's built-in speaker output passes through: WirePlumber's smart-filter policy
+# (0.5 and newer) puts it in front of the node named by filter.smart.target whenever a stream is about to link to
+# that node, so headphones, HDMI and Bluetooth never pass through it and the speaker stays the default output.
+# Only PipeWire's builtin filter-graph plugin is used (PipeWire 1.4 and newer, on Bazzite and CachyOS alike): it has
+# no limiter, so the look-ahead peak limiter below is built from its abs, max, delay, bq_lowpass, sine, recip and
+# mult nodes. The syntax follows PipeWire's module-filter-chain documentation and WirePlumber's smart-filter
+# documentation (docs/rst/policies/smart_filters.rst); no file of another project is copied.
+SPEAKER_PROFILE_PATH = "/etc/pipewire/pipewire.conf.d/80-oxp3-speaker-profile.conf"
+SPEAKER_PROFILE_NAME = SPEAKER_PROFILE_PATH.rsplit("/", 1)[-1]
+# The OXP3's speaker sink (SOF, skl_hda_dsp_generic, UCM HiFi profile), as PipeWire names it on Bazzite and CachyOS.
+SPEAKER_NODE_DEFAULT = "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink"
+SPEAKER_NODE_SUFFIX = ".HiFi__Speaker__sink"
+# Built-in (PCI) cards only: a USB device with a UCM "Speaker" output (some docks and USB codecs) is not the OXP3's.
+SPEAKER_NODE_RE = re.compile(r"alsa_output\.pci-[A-Za-z0-9_.:-]+\.HiFi__Speaker__sink")
+SPEAKER_FILTER_NODE = "oxp3_speaker_profile"
+SPEAKER_FILTER_OUTPUT = f"{SPEAKER_FILTER_NODE}.output"
+SPEAKER_FILTER_SMART_NAME = "oxp3-speaker-profile"
+SPEAKER_FILTER_DESCRIPTION = "OXP3 Speakers"
+
+SPEAKER_RATE_REF = 48000  # the rate the delays are rounded for (the OXP3's SOF card runs at 48 kHz)
+SPEAKER_HIGHPASS_HZ = 180.0
+# Two biquads with these Qs make a 4th-order Butterworth high-pass.
+SPEAKER_HIGHPASS_QS = (0.5412, 1.3066)
+# (label, Hz, Q, dB): a little body, presence and air.
+SPEAKER_EQ = (("bq_peaking", 300.0, 0.9, 2.0), ("bq_peaking", 3000.0, 1.0, 2.5), ("bq_highshelf", 8000.0, 0.707, 2.0))
+SPEAKER_MAKEUP_DB = 8.0
+SPEAKER_LIMIT_DB = -1.5  # the limiter's threshold
+SPEAKER_CEILING_DB = -0.3  # the hard clamp after it, a backstop that should never engage
+SPEAKER_LOOKAHEAD = 640  # samples at 48 kHz (13.3 ms)
+# Running maximum over the last 41.8 ms (more than the look-ahead plus the smoother's rise) as max+delay stages:
+# (step, taps) in samples at SPEAKER_HOLD_RATE_REF. PipeWire turns a delay in seconds into whole samples at the rate
+# the graph runs at, so the taps sit on a 192 kHz grid: then the stages cover every sample of the window without gaps
+# at any rate up to 192 kHz (on a 48 kHz grid, 88.2 and 96 kHz leave every other sample out of the hold, and the
+# limiter lets peaks through to the hard ceiling).
+SPEAKER_HOLD_RATE_REF = 192000
+SPEAKER_HOLD_STAGES = ((1, 7), (6, 7), (36, 7), (216, 7), (1296, 6))
+SPEAKER_ENVELOPE_HZ = 60.0  # critically damped smoothing of the held peak (Q 0.5: no overshoot)
+
+
+def _db(db: float) -> float:
+    return 10 ** (db / 20)
+
+
+def _delay_s(samples: int, ref: int = SPEAKER_RATE_REF) -> str:
+    # +0.5 so the filter's (uint32)(delay * rate) lands on the intended sample.
+    return f"{(samples + 0.5) / ref:.9f}"
+
+
+def speaker_profile_graph() -> tuple[list[dict], list[tuple[str, str]]]:
+    """The filter graph as data: nodes ({name, label, control, config}) and links (output port, input port)."""
+    nodes: list[dict] = []
+    links: list[tuple[str, str]] = []
+
+    def node(name: str, label: str, control: Optional[dict] = None, config: Optional[dict] = None) -> None:
+        nodes.append({"name": name, "label": label, "control": control or {}, "config": config or {}})
+
+    def delay(name: str, samples: int, ref: int = SPEAKER_RATE_REF) -> None:
+        node(name, "delay", {"Delay (s)": _delay_s(samples, ref)}, {"max-delay": f"{(samples + 64) / ref:.6f}"})
+
+    threshold, ceiling, makeup = _db(SPEAKER_LIMIT_DB), _db(SPEAKER_CEILING_DB), _db(SPEAKER_MAKEUP_DB)
+    for ch in ("l", "r"):
+        prev = ""
+        for i, q in enumerate(SPEAKER_HIGHPASS_QS, 1):
+            node(f"hp{i}_{ch}", "bq_highpass", {"Freq": SPEAKER_HIGHPASS_HZ, "Q": q})
+            if prev:
+                links.append((f"{prev}:Out", f"hp{i}_{ch}:In"))
+            prev = f"hp{i}_{ch}"
+        for i, (label, freq, q, gain) in enumerate(SPEAKER_EQ, 1):
+            node(f"eq{i}_{ch}", label, {"Freq": freq, "Q": q, "Gain": gain})
+            links.append((f"{prev}:Out", f"eq{i}_{ch}:In"))
+            prev = f"eq{i}_{ch}"
+        node(f"gain_{ch}", "linear", {"Mult": f"{makeup:.6f}", "Add": 0.0})
+        links.append((f"{prev}:Out", f"gain_{ch}:In"))
+        node(f"abs_{ch}", "abs")
+        links.append((f"gain_{ch}:Out", f"abs_{ch}:In"))
+        delay(f"look_{ch}", SPEAKER_LOOKAHEAD)
+        links.append((f"gain_{ch}:Out", f"look_{ch}:In"))
+        node(f"vca_{ch}", "mult")
+        links.append((f"look_{ch}:Out", f"vca_{ch}:In 1"))
+        node(f"ceil_{ch}", "clamp", {"Min": f"{-ceiling:.6f}", "Max": f"{ceiling:.6f}"})
+        links.append((f"vca_{ch}:Out", f"ceil_{ch}:In"))
+    # One detector for both channels (stereo-linked, so the image does not shift): max(|L|, |R|) ...
+    node("peak0", "max")
+    links += [("abs_l:Out", "peak0:In 1"), ("abs_r:Out", "peak0:In 2")]
+    # ... held at its maximum over the last 41.8 ms ...
+    # PipeWire 1.4's max has two inputs (1.6's has eight), so each stage is a tree of two-input max nodes.
+    src = "peak0"
+    for s, (step, taps) in enumerate(SPEAKER_HOLD_STAGES, 1):
+        level = [src]
+        for k in range(1, taps):
+            name = f"hold{s}_d{k}"
+            delay(name, step * k, SPEAKER_HOLD_RATE_REF)
+            links.append((f"{src}:Out", f"{name}:In"))
+            level.append(name)
+        m = 0
+        while len(level) > 1:
+            nxt = []
+            for a, b in zip(level[::2], level[1::2], strict=False):  # an odd one out goes up a level
+                m += 1
+                name = f"hold{s}" if len(level) == 2 else f"hold{s}_m{m}"
+                node(name, "max")
+                links += [(f"{a}:Out", f"{name}:In 1"), (f"{b}:Out", f"{name}:In 2")]
+                nxt.append(name)
+            level = nxt + level[len(level) // 2 * 2:]
+        src = level[0]
+    # ... smoothed, never below the threshold, so gain = threshold / envelope <= 1 (exactly 1 below it).
+    node("env", "bq_lowpass", {"Freq": SPEAKER_ENVELOPE_HZ, "Q": 0.5})
+    links.append((f"{src}:Out", "env:In"))
+    node("thresh", "sine", {"Freq": 0.0, "Ampl": 0.0, "Offset": f"{threshold:.6f}"})  # a constant
+    node("envt", "max")
+    links += [("env:Out", "envt:In 1"), ("thresh:Out", "envt:In 2")]
+    node("inv", "recip")
+    links.append(("envt:Out", "inv:In"))
+    for ch in ("l", "r"):
+        links += [("inv:Out", f"vca_{ch}:In 2"), ("thresh:Out", f"vca_{ch}:In 3")]
+    return nodes, links
+
+
+def _spa_values(values: dict) -> str:
+    return " ".join(f'"{k}" = {v}' for k, v in values.items())
+
+
+def speaker_profile_conf(speaker_node: str = SPEAKER_NODE_DEFAULT) -> str:
+    """The PipeWire drop-in of the speaker-profile fix, for the speaker sink named ``speaker_node``."""
+    if not SPEAKER_NODE_RE.fullmatch(speaker_node):
+        raise ValueError(f"not an ALSA speaker sink name: {speaker_node!r}")
+    nodes, links = speaker_profile_graph()
+    node_lines = []
+    for n in nodes:
+        line = f"                    {{ type = builtin name = {n['name']} label = {n['label']}"
+        if n["config"]:
+            line += f" config = {{ {_spa_values(n['config'])} }}"
+        if n["control"]:
+            line += f" control = {{ {_spa_values(n['control'])} }}"
+        node_lines.append(line + " }")
+    link_lines = [f'                    {{ output = "{o}" input = "{i}" }}' for o, i in links]
+    lookahead_ms = SPEAKER_LOOKAHEAD * 1000 / SPEAKER_RATE_REF
+    nl = "\n"
+    return f"""\
+# Installed by oxp3-tool ({PROJECT_URL}).
+# Do not edit: remove it with `sudo oxp3-tool revert speaker-profile`.
+#
+# ONEXPLAYER 3 built-in speakers ("{SPEAKER_FILTER_DESCRIPTION}"): 4th-order high-pass at {SPEAKER_HIGHPASS_HZ:.0f} Hz,
+# +2 dB at 300 Hz, +2.5 dB at 3 kHz, +2 dB shelf from 8 kHz, +{SPEAKER_MAKEUP_DB:.0f} dB, then a look-ahead peak
+# limiter ({SPEAKER_LIMIT_DB} dBFS, {lookahead_ms:.1f} ms) made of PipeWire's builtin filters and a hard
+# ceiling at {SPEAKER_CEILING_DB} dBFS, so the extra loudness never clips.
+# WirePlumber's smart-filter policy puts it in front of the speaker sink only: the
+# speaker stays the default output, and headphones, HDMI and Bluetooth bypass it.
+# Keep the speaker volume at 100% or below (above that is software gain after the limiter).
+context.modules = [
+    {{ name = libpipewire-module-filter-chain
+        flags = [ nofail ]
+        args = {{
+            node.description = "{SPEAKER_FILTER_DESCRIPTION}"
+            media.name       = "{SPEAKER_FILTER_DESCRIPTION}"
+            audio.channels   = 2
+            audio.position   = [ FL FR ]
+            filter.graph = {{
+                nodes = [
+{nl.join(node_lines)}
+                ]
+                links = [
+{nl.join(link_lines)}
+                ]
+                inputs  = [ "hp1_l:In" "hp1_r:In" ]
+                outputs = [ "ceil_l:Out" "ceil_r:Out" ]
+            }}
+            capture.props = {{
+                node.name           = "{SPEAKER_FILTER_NODE}"
+                media.class         = Audio/Sink
+                audio.position      = [ FL FR ]
+                priority.session    = 0
+                filter.smart        = true
+                filter.smart.name   = "{SPEAKER_FILTER_SMART_NAME}"
+                filter.smart.target = {{ node.name = "{speaker_node}" }}
+            }}
+            playback.props = {{
+                node.name          = "{SPEAKER_FILTER_OUTPUT}"
+                audio.position     = [ FL FR ]
+                node.passive       = true
+                node.dont-fallback = true
+                node.linger        = true
+                stream.dont-remix  = true
+            }}
+        }}
+    }}
+]
+"""

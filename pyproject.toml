@@ -1,7 +1,7 @@
 [project]
 name = "oxp3-tool"
-version = "0.4.2"
-description = "Controller and wake-from-sleep fixes for the OneXPlayer 3 on Bazzite and CachyOS"
+version = "0.4.3"
+description = "Controller, display, wake-from-sleep and speaker fixes for the OneXPlayer 3 on Bazzite and CachyOS"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]

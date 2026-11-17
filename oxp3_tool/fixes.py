@@ -15,12 +15,13 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import steam_actions, steam_session, templates
+from . import audio, steam_actions, steam_session, templates
 from .detect import CACHYOS, IP_ETC_CAPABILITY_MAPS, NATIVE_STEAM, OGUI, Context
 from .system import sha256_bytes
 
 CONTROLLER = "controller"
 DISPLAY = "display"
+AUDIO = "audio"
 
 RECOMMENDED = "recommended"
 OPTIONAL = "optional"
@@ -1035,6 +1036,186 @@ class XeDsbFix(_KargFix):
         errors = ctx.refresh_state.dsb_errors
         return [f"the kernel logged {errors} 'DSB poll error' messages this boot"] if errors else []
 
+# -- sound -------------------------------------------------------------------------
+
+
+def _pw_graphs(ctx: Context) -> list[tuple[audio.Session, Optional[audio.PwGraph]]]:
+    """Each logged-in user and their PipeWire graph (None: pw-dump missing, not allowed, or PipeWire not running)."""
+    cached = ctx.__dict__.get("_pw_graphs")
+    if cached is None:
+        cached = [(s, audio.read_graph(ctx.sys, s)) for s in audio.sessions(ctx.sys)]
+        ctx.__dict__["_pw_graphs"] = cached
+    return cached
+
+
+def _restart_pipewire(user: str, only_if_changed: tuple[str, ...] = (), note: str = "") -> PostStep:
+    # try-restart: nothing happens where PipeWire is not running. WirePlumber and pipewire-pulse are bound to
+    # pipewire.service and come back with it; they are named so each one restarts even if the units change.
+    return PostStep(f"restart-pipewire-{user}",
+                    ["systemctl", "--user", "-M", f"{user}@", "try-restart", "pipewire.service",
+                     "pipewire-pulse.service", "wireplumber.service"],
+                    f"restart {user}'s PipeWire so it loads the change", order=70,
+                    only_if_changed=only_if_changed, note=note)
+
+
+class SpeakerProfileFix(Fix):
+    id = "speaker-profile"
+    group = AUDIO
+    level = OPTIONAL
+    title = "Louder built-in speakers that do not clip"
+    summary = "PipeWire speaker EQ: high-pass, loudness EQ, +8 dB and a limiter (speakers only)"
+    details = (
+        "Linux plays the OXP3's speakers raw: no Windows sound enhancements, so they\n"
+        "sound quiet, and turning the volume above 100% only adds software gain that\n"
+        "clips. This installs a PipeWire filter, \"OXP3 Speakers\", that only the built-in\n"
+        "speaker output passes through: a 4th-order high-pass at 180 Hz (keeps the small\n"
+        "drivers from distorting on bass they cannot play), a gentle loudness EQ (+2 dB\n"
+        "at 300 Hz, +2.5 dB at 3 kHz, +2 dB from 8 kHz), +8 dB of gain, and a look-ahead\n"
+        "peak limiter at -1.5 dBFS with a hard ceiling at -0.3 dBFS, so loud scenes are\n"
+        "turned down instead of clipping. It uses only PipeWire's builtin filters (no\n"
+        "plugin packages). It adds 13 ms of audio latency on the speakers.\n"
+        "WirePlumber's smart-filter policy puts it in front of the speaker sink, so the\n"
+        "speaker stays the default output, Steam's and KDE's volume still control it,\n"
+        "and headphones, HDMI and Bluetooth bypass it. Keep the built-in speaker (not\n"
+        "\"OXP3 Speakers\") selected as the output, and the speaker volume at 100% or\n"
+        "below. Works in Game Mode and Desktop Mode.\n"
+        f"File: {templates.SPEAKER_PROFILE_PATH}. PipeWire restarts for every\n"
+        "logged-in user (sound stops for a moment; a running game may need a restart to\n"
+        "get its sound back); with --no-restart it loads at the next login.\n"
+        "Optional: it changes how the speakers sound, and is tuned by measurement of\n"
+        "the filters, not of OXP3 speakers."
+    )
+    takes_effect = "immediately (PipeWire restarts for each logged-in user; with --no-restart at the next login)"
+    PATH = templates.SPEAKER_PROFILE_PATH
+
+    def check(self, ctx: Context) -> Check:
+        if not ctx.sys.exists("/usr/bin/pipewire"):
+            return Check(False, "PipeWire is not installed")
+        if not any(ctx.sys.exists(p) for p in audio.FILTER_CHAIN_MODULES) or \
+                not any(ctx.sys.exists(p) for p in audio.BUILTIN_FILTERS):
+            return Check(False, "PipeWire's filter-chain module with its builtin filters (PipeWire 1.4 or newer) is "
+                                "not installed")
+        if not any(ctx.sys.exists(p) for p in audio.SMART_FILTER_SCRIPTS):
+            return Check(False, "WirePlumber 0.5 or newer (its smart-filter policy) is not installed")
+        return Check(True, "changes how the built-in speakers sound; try it if they are too quiet")
+
+    def _speaker_node(self, ctx: Context, prev: dict[str, Any]) -> str:
+        for _s, graph in _pw_graphs(ctx):
+            found = graph.speaker_sinks() if graph else []
+            if found:
+                return templates.SPEAKER_NODE_DEFAULT if templates.SPEAKER_NODE_DEFAULT in found else found[0]
+        recorded = prev.get("speaker_node")
+        if isinstance(recorded, str) and templates.SPEAKER_NODE_RE.fullmatch(recorded):
+            return recorded
+        return templates.SPEAKER_NODE_DEFAULT
+
+    def plan(self, ctx: Context, opts: dict[str, Any], prev: dict[str, Any]) -> Plan:
+        speaker = self._speaker_node(ctx, prev)
+        try:
+            content = templates.speaker_profile_conf(speaker)
+        except ValueError as e:
+            raise FixError(str(e)) from e
+        plan = Plan(files=[FileSpec(self.PATH, content.encode())], options={"speaker_node": speaker})
+        users = [s.user for s in audio.sessions(ctx.sys)]
+        if not opts.get("restart", True):
+            plan.messages.append("PipeWire was not restarted: log out and back in (or reboot) to load the speaker "
+                                 "profile.")
+        elif users:
+            note = ("Sound stops for a moment while PipeWire restarts; a game that was running may need a restart to "
+                    "get its sound back.")
+            for i, user in enumerate(users):
+                plan.post.append(_restart_pipewire(user, (self.PATH,), note if i == 0 else ""))
+        else:
+            plan.messages.append("Nobody is logged in: PipeWire loads the speaker profile at the next login.")
+        plan.messages.append("Keep the built-in speaker selected as the output (not \"OXP3 Speakers\"): the profile "
+                             "follows it by itself, and headphones bypass it.")
+        plan.messages += self._volume_lines(ctx, speaker, applied=True)
+        return plan
+
+    @staticmethod
+    def _volume_lines(ctx: Context, speaker: str, applied: bool) -> list[str]:
+        out = []
+        for s, graph in _pw_graphs(ctx):
+            vol = graph.volume(speaker) if graph else None
+            if vol is None or vol <= 1.0 + 1e-6:
+                continue
+            if applied:
+                out.append(f"{s.user}'s speaker volume is {audio.percent(vol)}%: above 100% is software gain after the "
+                           "limiter and clips again. Set it to 100% (with the speakers as the output: "
+                           "`wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0`) and use the profile's loudness instead.")
+            else:
+                out.append(f"{s.user}'s speaker volume is {audio.percent(vol)}%: above 100% only adds software gain, "
+                           "which clips. This fix makes the speakers louder without clipping; then set the volume to "
+                           "100%.")
+        return out
+
+    def revert_post(self, ctx: Context) -> list[PostStep]:
+        return [_restart_pipewire(s.user) for s in audio.sessions(ctx.sys)]
+
+    def revert_messages(self) -> list[str]:
+        return ["The speakers play without the profile again once PipeWire has restarted (or at the next login)."]
+
+    def note(self, ctx: Context) -> list[str]:
+        return self._volume_lines(ctx, self._speaker_node(ctx, {}), applied=False)
+
+    def _conflicts(self, ctx: Context, speaker: str) -> list[str]:
+        lines = []
+        for user, home in audio.homes(ctx.sys):
+            path = f"{home}/{audio.USER_CONFD}/{templates.SPEAKER_PROFILE_NAME}"
+            if audio.read_conf(ctx.sys, path, user_file=True) is not None:
+                lines.append(f"warning: {path} replaces this profile for {user} (PipeWire reads ~/.config last); "
+                             "remove it to use the installed one")
+        dirs = [(d, False) for d in audio.SYSTEM_CONFDS] + \
+            [(f"{home}/{audio.USER_CONFD}", True) for _u, home in audio.homes(ctx.sys)]
+        for d, user_file in dirs:
+            for name in ctx.sys.listdir(d):
+                path = f"{d}/{name}"
+                if not name.endswith(".conf") or path == self.PATH or name == templates.SPEAKER_PROFILE_NAME:
+                    continue
+                text = audio.read_conf(ctx.sys, path, user_file) or ""
+                if "libpipewire-module-filter-chain" in text and (speaker in text or
+                                                                  templates.SPEAKER_NODE_SUFFIX in text):
+                    lines.append(f"warning: {path} also puts a filter on the speakers; with this profile both apply "
+                                 "(EQ and gain twice): remove one of them")
+        return lines
+
+    def live_state(self, ctx: Context, entry: Optional[dict[str, Any]]) -> list[str]:
+        speaker = (entry or {}).get("options", {}).get("speaker_node") or templates.SPEAKER_NODE_DEFAULT
+        lines = [f"for {speaker}"] + self._conflicts(ctx, speaker)
+        graphs = _pw_graphs(ctx)
+        if not graphs:
+            return lines + ["nobody is logged in; PipeWire loads the profile at the next login"]
+        if not ctx.sys.which("pw-dump"):
+            return lines + ["pw-dump is not installed, so whether PipeWire loaded the profile is not checked"]
+        for s, graph in graphs:
+            if graph is None:
+                lines.append(f"{s.user}: PipeWire did not answer (not running, or run `sudo oxp3-tool status`)")
+                continue
+            if graph.node_id(templates.SPEAKER_FILTER_NODE) is None:
+                lines.append(f"warning: {s.user}'s PipeWire has not loaded the profile: log out and back in, or run "
+                             "`systemctl --user restart pipewire pipewire-pulse wireplumber` as that user; "
+                             "`journalctl --user -u pipewire` shows why it failed")
+            elif graph.node_id(speaker) is None and graph.speaker_sinks():
+                # Installed while PipeWire could not be asked (nobody logged in), and this unit names it differently.
+                lines.append(f"warning: {s.user}'s speaker output is {graph.speaker_sinks()[0]}, not the one the "
+                             "profile was installed for, so the profile is not used: run `sudo oxp3-tool apply "
+                             "speaker-profile` again")
+            elif graph.node_id(speaker) is None:
+                lines.append(f"{s.user}: loaded; the speakers are not the active output (headphones or another "
+                             "output), so it waits for them")
+            elif graph.linked(templates.SPEAKER_FILTER_OUTPUT, speaker):
+                lines.append(f"{s.user}: active, sound for the speakers goes through "
+                             f"{templates.SPEAKER_FILTER_DESCRIPTION}")
+            else:
+                lines.append(f"{s.user}: loaded, not linked to the speakers yet (it links when something plays)")
+            if graph.defaults.get("default.configured.audio.sink") == templates.SPEAKER_FILTER_NODE:
+                lines.append(f"warning: {s.user} chose \"{templates.SPEAKER_FILTER_DESCRIPTION}\" as the output; "
+                             "choose the built-in speaker instead (in Steam's or KDE's sound settings, or "
+                             "`wpctl set-default` with its id from `wpctl status`), or there is no sound with "
+                             "headphones plugged in")
+        lines += [f"warning: {v}" for v in self._volume_lines(ctx, speaker, applied=True)]
+        return lines
+
 
 ALL_FIXES: list[Fix] = [
     ButtonsFix(),
@@ -1047,6 +1228,7 @@ ALL_FIXES: list[Fix] = [
     XePanelReplayFix(),
     XeHdrBacklightFix(),
     XeDsbFix(),
+    SpeakerProfileFix(),
 ]
 
 BY_ID = {f.id: f for f in ALL_FIXES}

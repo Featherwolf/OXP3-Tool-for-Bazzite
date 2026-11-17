@@ -15,7 +15,7 @@ from typing import Any, Optional, Sequence
 from . import PROJECT_URL, __version__, diagnose, kernel_cmd, steam_session, templates
 from .detect import CACHYOS, NATIVE_STEAM, OGUI, Context
 from .engine import Engine, EngineError, Outcome, file_statuses, reconcile
-from .fixes import ALL_FIXES, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix, restart_pending
+from .fixes import ALL_FIXES, AUDIO, BY_ID, CONTROLLER, DISPLAY, OPTIONAL, RECOMMENDED, Fix, restart_pending
 from .kargs import REBUILD_MARKER
 from .state import State, StateError
 from .system import SimulatedRunner, System
@@ -248,7 +248,8 @@ def _status(ctx: Context, state: State) -> tuple[list[str], list[str], list[str]
         lines.append(f"warning: {state.load_error}")
         lines.append("Which fixes are applied is unknown until that file is fixed or moved aside.")
 
-    for group, title in ((CONTROLLER, "Controller fixes"), (DISPLAY, "Display and wake-from-sleep fixes")):
+    for group, title in ((CONTROLLER, "Controller fixes"), (DISPLAY, "Display and wake-from-sleep fixes"),
+                         (AUDIO, "Sound fixes")):
         lines.append("")
         lines.append(title)
         for fix in ALL_FIXES:
@@ -580,7 +581,8 @@ _JSON_ARGV = False
 def build_parser() -> argparse.ArgumentParser:
     p = _Parser(
         prog="oxp3-tool",
-        description="Controller and wake-from-sleep fixes for the OneXPlayer 3 on Bazzite and CachyOS.",
+        description="Controller, display, wake-from-sleep and speaker fixes for the OneXPlayer 3 on Bazzite and "
+                    "CachyOS.",
         epilog=f"Fix ids: {', '.join(f.id for f in ALL_FIXES)}. Project: {PROJECT_URL}",
     )
     p.add_argument("--version", action="version", version=f"oxp3-tool {__version__}")
@@ -609,7 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--fps-limit", type=int, choices=range(steam_session.MIN_FPS_LIMIT, steam_session.MAX_FPS_LIMIT + 1),
                    metavar=f"{{{steam_session.MIN_FPS_LIMIT}..{steam_session.MAX_FPS_LIMIT}}}",
                    help=f"buttons: frame limit the fps-limit action sets (default {steam_session.DEFAULT_FPS_LIMIT})")
-    a.add_argument("--no-restart", action="store_true", help="buttons: do not restart InputPlumber")
+    a.add_argument("--no-restart", action="store_true",
+                   help="buttons: do not restart InputPlumber; speaker-profile: do not restart PipeWire")
     a.add_argument("--min-refresh", type=int, choices=range(templates.PANEL_MIN_HZ, templates.LEGIONGO2_MIN_HZ + 1),
                    metavar=f"{{{templates.PANEL_MIN_HZ}..{templates.LEGIONGO2_MIN_HZ}}}",
                    help="oled-profile: lowest refresh rate offered (default 48; below 48 is untested)")
