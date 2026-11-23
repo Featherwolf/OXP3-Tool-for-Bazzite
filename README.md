@@ -259,6 +259,6 @@ The tests run every fix against a fake OXP3 filesystem: a fake Bazzite with a si
 - If `systemd-hwdb` is installed, the hwdb entry is compiled and queried with the real OXP3 DMI modalias.
 - If `OXP3_IP_CAPABILITY_MAP_SCHEMA` points to InputPlumber's `capability_map_v1.json`, the generated maps are validated against it.
 
-CI runs all of these when started from the Actions tab (it is manual while the account has no Actions minutes). `oxp3-tool --root DIR` runs against a fake root with commands simulated.
+CI runs all of these on every push and pull request; the Release workflow runs them again before it publishes. `oxp3-tool --root DIR` runs against a fake root with commands simulated.
 
 `dist/oxp3-tool` is the downloadable single-file build of `oxp3_tool/`, with [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) packed in. After changing the code, rebuild it with `python3 tools/build_zipapp.py`; a test fails while it is out of date. To publish a release, bump `__version__` in `oxp3_tool/__init__.py`, rebuild, add the notes as `release-notes/v0.1.0.md`, commit, and run Actions > Release > Run workflow with the version (`0.1.0`): it creates the tag and the release and attaches the file. Pushing an annotated tag works too; its message becomes the notes. Without Actions minutes, create the release on GitHub by hand and attach `dist/oxp3-tool` and `dist/oxp3-tool.sha256`.
