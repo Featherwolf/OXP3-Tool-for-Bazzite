@@ -32,6 +32,7 @@ from .display import (
     parse_fixed_modes,
     parse_kwin_outputs,
     parse_psr_mode,
+    parse_vrr_range,
     safe_name,
     vbt_vswing_port,
     vbt_vswing_info,
@@ -745,6 +746,7 @@ class Context:
                     psr = self.sys.read_text(f"{d}/i915_edp_psr_status")
                 st.psr_mode = parse_psr_mode(psr) if psr else None
                 st.dmc_loaded, st.dmc_version = parse_dmc_info(self.sys.read_text(f"{d}/i915_dmc_info") or "")
+                st.vrr_range = parse_vrr_range(self.sys.read_text(f"{d}/{st.connector}/vrr_range") or "")
                 vbt_ports, vbt_version, vbt_tables = vbt_vswing_info(self.sys.read_bytes(f"{d}/i915_vbt") or b"")
                 if st.mode is None:
                     st.debugfs_why = f"no active display pipe drives {st.connector} (screen off?)"

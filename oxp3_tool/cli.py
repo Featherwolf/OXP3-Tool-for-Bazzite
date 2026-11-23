@@ -298,7 +298,9 @@ def status_data(ctx: Context, state: State) -> dict[str, Any]:
         "warnings": warnings, "notes": notes, "fixes": fixes,
         "reboot_pending": any(f["pending"] == "reboot" for f in fixes),
         "rebuild_unfinished": ctx.karg_backend.unfinished(),
-        "refresh": {"summary": refresh.summary(), "advice": refresh.advice()} if refresh else None,
+        "refresh": {"summary": refresh.summary(), "advice": refresh.advice(), "vrr_safe": refresh.vrr_safe,
+                    "vrr_reason": refresh.vrr_reason, "vrr_why": refresh.vrr_why,
+                    "vrr_range_hz": list(refresh.vrr_range) if refresh.vrr_range else None} if refresh else None,
         "text": "\n".join(lines),
     }
 

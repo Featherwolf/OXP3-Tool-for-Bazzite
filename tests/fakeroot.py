@@ -358,6 +358,11 @@ class FakeOxp3:
         self.write(f"{d}/i915_dmc_info", info)
         self.symlink("/sys/kernel/debug/dri/0", "0000:00:02.0")
 
+    def vrr_range(self, lo: int = 48, hi: int = 144, text: Optional[str] = None) -> None:
+        """drm core debugfs <connector>/vrr_range for the eDP panel."""
+        self.write("/sys/kernel/debug/dri/0000:00:02.0/eDP-1/vrr_range",
+                   text if text is not None else f"Min: {lo}\nMax: {hi}\n")
+
     def mcu_hidraw(self, moved: bool = True) -> None:
         """The controller MCU's three USB interfaces with hidraw nodes; interface 2 is the vendor one.
 

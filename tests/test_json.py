@@ -48,6 +48,31 @@ class JsonTest(unittest.TestCase):
         self.assertIn("fps-limit", cat["button_actions"])
         self.assertEqual(len(cat["fixes"]), len(st["fixes"]))
 
+    def test_status_refresh_vrr_keys(self):
+        self.f = FakeOxp3(self.root)
+        self.f.build()
+        self.f.display_debugfs()
+        self.f.write("/sys/module/xe/parameters/enable_dc_balance", "N\n")
+        self.f.vrr_range(48, 144)
+        ref = self.run_json("status", "--json")["status"]["refresh"]
+        self.assertIs(ref["vrr_safe"], True)
+        self.assertEqual(ref["vrr_reason"], "fixed")
+        self.assertIsInstance(ref["vrr_why"], str)
+        self.assertEqual(ref["vrr_range_hz"], [48, 144])
+        self.assertTrue(any("is safe on this kernel" in a for a in ref["advice"]))
+        self.f.write("/sys/module/xe/parameters/enable_dc_balance", "Y\n")
+        ref = self.run_json("status", "--json")["status"]["refresh"]
+        self.assertEqual((ref["vrr_safe"], ref["vrr_reason"]), (False, "param_on"))
+
+    def test_status_refresh_vrr_unknown_is_null(self):
+        self.f = FakeOxp3(self.root)
+        self.f.build()
+        ref = self.run_json("status", "--json")["status"]["refresh"]
+        if ref is not None:  # refresh checks run on this fake device
+            self.assertIsNone(ref["vrr_safe"])
+            self.assertEqual(ref["vrr_reason"], "firmware_unknown")
+            self.assertIsNone(ref["vrr_range_hz"])
+
     def test_apply_needs_yes_and_reports_the_outcome(self):
         self.f = FakeOxp3(self.root)
         self.f.build()

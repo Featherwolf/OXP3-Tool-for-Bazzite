@@ -174,6 +174,107 @@ class RefreshStateTest(unittest.TestCase):
         self.assertNotIn("Adaptive Sync is set to Always", out)
         self.assertNotIn("leave variable refresh (VRR) off", out)
 
+    def test_vrr_reason_codes(self):
+        param = "/sys/module/xe/parameters/enable_dc_balance"
+        cases = {
+            "fixed": (dict(), "N\n", None, True),
+            "param_on": (dict(), "Y\n", None, False),
+            "bug": (dict(), None, None, False),
+            "old_firmware": (dict(dmc="2.32"), None, None, True),
+            "no_firmware": (dict(dmc=None), None, None, True),
+            "predates": (dict(), None, "6.17.9-ogc1.fc43.x86_64", True),
+        }
+        for code, (debugfs, value, kernel, safe) in cases.items():
+            with self.subTest(code):
+                self.f = FakeOxp3(self.root / code)
+                self.f.display_debugfs(**debugfs)
+                if value is not None:
+                    self.f.write(param, value)
+                st = self.state()
+                if kernel:
+                    st.kernel_version = (6, 17)
+                self.assertEqual(st.vrr_reason, code)
+                self.assertIs(st.vrr_safe, safe)
+                self.assertEqual(st.vrr_why, display.VRR_WHY[code].format(full=144))
+        self.f = FakeOxp3(self.root / "unknown")  # no debugfs, no log line
+        st = self.state()
+        self.assertEqual((st.vrr_reason, st.vrr_safe), ("firmware_unknown", None))
+        st.dc_balance_param = None
+        self.assertEqual((st.vrr_reason, st.vrr_safe), ("xe_not_loaded", None))
+        self.assertIn("far below 144 Hz", display.RefreshState(dmc_loaded=True, dmc_version=(2, 36),
+                                                                dc_balance_param=False).vrr_why)
+
+    def test_param_on_with_old_firmware_is_safe(self):
+        st = display.RefreshState(dmc_loaded=True, dmc_version=(2, 20), dc_balance_param=True, dc_balance_on=True)
+        self.assertEqual((st.vrr_reason, st.vrr_safe), ("old_firmware", True))
+
+    def test_parse_vrr_range(self):
+        self.assertEqual(display.parse_vrr_range("Min: 48\nMax: 144\n"), (48, 144))
+        self.assertIsNone(display.parse_vrr_range("Min: 144\nMax: 48\n"))
+        self.assertIsNone(display.parse_vrr_range("Min: 0\nMax: 144\n"))
+        self.assertIsNone(display.parse_vrr_range("Min: 48\n"))
+        self.assertIsNone(display.parse_vrr_range("garbage\x00\xff"))
+        self.assertIsNone(display.parse_vrr_range(""))
+
+    def test_vrr_safe_advice_on_fixed_kernel(self):
+        self.f.display_debugfs()
+        self.f.write("/sys/module/xe/parameters/enable_dc_balance", "N\n")
+        out = self.status()
+        self.assertIn("Variable refresh (VRR) is safe on this kernel (the kernel has the variable-refresh fix", out)
+        self.assertIn("where Steam offers it)", out)
+        self.assertNotIn("repeats frames", out)
+        self.assertNotIn("variable refresh range", out)
+        self.assertNotIn("In Desktop Mode, Adaptive sync", out)  # no KWin setting saved for the panel
+        self.f.kwin_config(vrr="Never")
+        self.f.vrr_range(48, 144)
+        st = self.state()
+        self.assertEqual(st.vrr_range, (48, 144))
+        out = self.status()
+        self.assertIn("Below 48 fps the screen repeats frames", " ".join(out.split()))
+        self.assertIn("variable refresh range 48–144 Hz", out)
+        self.assertIn("In Desktop Mode, Adaptive sync can be set to Automatic", " ".join(out.split()))
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 120, line)
+
+    def test_desktop_vrr_line_needs_never_or_unsaved(self):
+        self.f.display_debugfs()
+        self.f.write("/sys/module/xe/parameters/enable_dc_balance", "N\n")
+        for policy, shown in (("Automatic", False), ("Always", False), ("Never", True), (None, True)):
+            with self.subTest(policy):
+                self.f.kwin_config(vrr=policy)
+                text = " ".join(self.state().advice())
+                self.assertEqual("In Desktop Mode, Adaptive sync" in text, shown)
+
+    def test_no_vrr_safe_advice_unless_safe(self):
+        param = "/sys/module/xe/parameters/enable_dc_balance"
+        for name, debugfs, value in (("bug", dict(), None), ("param_on", dict(), "Y\n"),
+                                     ("firmware_unknown", None, None), ("no_firmware", dict(dmc=None), None)):
+            with self.subTest(name):
+                self.f = FakeOxp3(self.root / name)
+                if debugfs is not None:
+                    self.f.display_debugfs(**debugfs)
+                if value:
+                    self.f.write(param, value)
+                self.f.kwin_config(vrr="Never")
+                st = self.state()
+                self.assertEqual(st.vrr_reason, name)
+                text = " ".join(st.advice())
+                self.assertNotIn("is safe on this kernel", text)
+                self.assertNotIn("Adaptive sync can be set to Automatic", text)
+
+    def test_no_game_mode_vrr_line_without_game_mode(self):
+        self.f = FakeOxp3(self.root / "desktop", game_mode=False)
+        self.f.display_debugfs()
+        self.f.write("/sys/module/xe/parameters/enable_dc_balance", "N\n")
+        self.assertNotIn("is safe on this kernel", self.status())
+
+    def test_bad_vrr_range_file_is_ignored(self):
+        self.f.display_debugfs()
+        self.f.vrr_range(text="Min: 144\nMax: 48\n")
+        st = self.state()
+        self.assertIsNone(st.vrr_range)
+        self.assertNotIn("vrr_range", self.status())
+
     def test_dc_balance_turned_back_on(self):
         self.f.display_debugfs()
         self.f.kwin_config(vrr="Always")

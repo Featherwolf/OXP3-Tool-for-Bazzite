@@ -60,6 +60,21 @@ _PSR_ERROR_RE = re.compile(r"Selective fetch area calculation failed|Timed out w
 # Intel's generic eDP drive levels when the firmware's VBT asks for its own; with it the warning is gone.
 _VBT_VSWING_RE = re.compile(r"Port ([A-I]) asks to use VBT vswing/preemph tables")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+# drm core debugfs <connector>/vrr_range: "Min: 48\nMax: 144" (unverified on xe).
+_VRR_MIN_RE = re.compile(r"^Min: *(\d+)\s*$", re.M)
+_VRR_MAX_RE = re.compile(r"^Max: *(\d+)\s*$", re.M)
+
+# vrr_reason code -> the reason as one plain sentence (vrr_why); "{full}" is the panel's fastest rate.
+VRR_WHY = {
+    "xe_not_loaded": "xe is not loaded",
+    "predates": "the kernel predates VRR DC balance (7.0)",
+    "fixed": "the kernel has the variable-refresh fix (7.2.10 or later)",
+    "param_on": "xe.enable_dc_balance=1 turns the bug back on",
+    "no_firmware": "the display firmware did not load",
+    "firmware_unknown": "the display firmware version is unknown (run with sudo)",
+    "old_firmware": "this display firmware has no DC-balance handler",
+    "bug": "on this kernel with this display firmware, variable refresh holds the screen far below {full} Hz",
+}
 
 
 def safe_name(name: str) -> str:
@@ -144,6 +159,15 @@ def parse_psr_mode(text: str) -> Optional[str]:
     """The "PSR mode:" line of i915_psr_status, e.g. "Panel Replay Selective Update enabled"."""
     m = _PSR_MODE_RE.search(text)
     return m.group("mode").strip() if m else None
+
+
+def parse_vrr_range(text: str) -> Optional[tuple[int, int]]:
+    """(min, max) Hz from drm's vrr_range debugfs file; None unless both numbers are there and 0 < min < max."""
+    lo, hi = _VRR_MIN_RE.search(text or ""), _VRR_MAX_RE.search(text or "")
+    if not lo or not hi:
+        return None
+    rng = (int(lo.group(1)), int(hi.group(1)))
+    return rng if 0 < rng[0] < rng[1] else None
 
 
 def parse_dmc_info(text: str) -> tuple[Optional[bool], Optional[tuple[int, int]]]:
@@ -368,6 +392,7 @@ class RefreshState:
     kernel_version: Optional[tuple[int, int]] = None  # (major, minor) of the running kernel
     remove_karg_hint: str = "`sudo rpm-ostree kargs --delete=xe.enable_dc_balance`"
     kernel_update_hint: str = "until Bazzite ships kernel 7.2.10 or later"
+    vrr_range: Optional[tuple[int, int]] = None  # (min, max) Hz from drm's vrr_range debugfs file
     kwin: list[KwinOutput] = field(default_factory=list)
     kwin_is_mine: bool = False  # kwin holds only the invoking user's settings
     game_mode: bool = True
@@ -399,6 +424,35 @@ class RefreshState:
         if self.dmc_version is None:
             return None
         return self.dmc_version >= DMC_WITH_DC_BALANCE
+
+    @property
+    def vrr_safe(self) -> Optional[bool]:
+        """True when variable refresh is safe to turn on (the DC-balance bug does not apply); None when unknown."""
+        risk = self.dc_balance_risk
+        return None if risk is None else not risk
+
+    @property
+    def vrr_reason(self) -> str:
+        """Why vrr_safe is what it is, as a code (see VRR_WHY)."""
+        if self.dc_balance_param is None:
+            return "xe_not_loaded"
+        if self.kernel_version is not None and self.kernel_version < (7, 0):
+            return "predates"
+        if self.dc_balance_param and not self.dc_balance_on:
+            return "fixed"
+        if self.dc_balance_on and self.dc_balance_risk:
+            return "param_on"
+        if self.dmc_loaded is False:
+            return "no_firmware"
+        if self.dmc_version is None:
+            return "firmware_unknown"
+        if self.dmc_version < DMC_WITH_DC_BALANCE:
+            return "old_firmware"
+        return "bug"
+
+    @property
+    def vrr_why(self) -> str:
+        return VRR_WHY[self.vrr_reason].format(full=self.full_hz)
 
     def _label(self, out: KwinOutput) -> str:
         users = {k.user for k in self.kwin}
@@ -436,6 +490,8 @@ class RefreshState:
         else:
             kernel = "the kernel predates the variable-refresh fix (7.2.10)"
         lines.append(f"display firmware (DMC) {dmc}; {kernel}")
+        if self.vrr_range:  # its own line: appended to the DMC line it passes 120 columns
+            lines.append(f"variable refresh range {self.vrr_range[0]}–{self.vrr_range[1]} Hz")
         if self.vspeo == "tables":
             lines.append("eDP signal levels: the firmware's own (VBT), which this kernel's 'Vswing / Pre-emphasis "
                          "Override' fix (the white dots) applies")
@@ -498,6 +554,19 @@ class RefreshState:
             how = " (run with sudo)" if self.needs_root else ""
             out.append(f"Could not read the display firmware version{how}. If it is v2.33 or later, variable "
                        f"refresh (Adaptive Sync, VRR) holds the screen far below {full} Hz on this kernel.")
+        if self.vrr_safe is True and self.dmc_loaded is not False:
+            if self.game_mode:
+                line = (f"Variable refresh (VRR) is safe on this kernel ({self.vrr_why}): turn it on in Game Mode for "
+                        f"smooth frames at any frame rate below {full} Hz (Steam: Settings > Display > Enable VRR, "
+                        "where Steam offers it).")
+                if self.vrr_range:
+                    low = self.vrr_range[0]
+                    line += (f" Below {low} fps the screen repeats frames, so keep a frame limit at {low} fps "
+                             "or above.")
+                out.append(line)
+            if any(k.vrr_policy in (None, "Never") for k in self.kwin):
+                out.append("In Desktop Mode, Adaptive sync can be set to Automatic in System Settings > Display & "
+                           "Monitor.")
         if self.dmc_loaded is False:
             out.append("The display firmware (DMC) did not load (see `journalctl -k | grep DMC`), so the display's "
                        "power saving is off.")
