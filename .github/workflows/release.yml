@@ -4,7 +4,8 @@ name: Release
 # - Actions > Release > Run workflow, with the version (for example 0.4.1). The workflow creates the tag v0.4.1 on
 #   the commit it runs on, with the notes in release-notes/v0.4.1.md.
 # - Pushing an annotated tag such as v0.4.1. The tag's message becomes the notes.
-# Either way the version must match oxp3_tool/__init__.py and dist/ must match the sources.
+# Either way the version must match oxp3_tool/__init__.py and dist/ must match the sources, and the unit tests and
+# ruff must pass (set up as in ci.yml).
 on:
   push:
     tags: ["v*"]
@@ -30,8 +31,23 @@ jobs:
       - name: Check the tag name
         run: |
           printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+' || { echo "not a version tag: $TAG"; exit 1; }
-      - name: Check that dist/ matches the sources
-        run: python -m unittest tests.test_dist -v
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.4 shellcheck udev
+          python -m pip install pyyaml jsonschema ruff
+      - name: Fetch InputPlumber capability map schema
+        run: >
+          curl -fsSL -o "$RUNNER_TEMP/capability_map_v1.json"
+          https://raw.githubusercontent.com/ShadowBlip/InputPlumber/v0.82.0/rootfs/usr/share/inputplumber/schema/capability_map_v1.json
+      - name: Unit tests (with the check that dist/ matches the sources)
+        env:
+          OXP3_IP_CAPABILITY_MAP_SCHEMA: ${{ runner.temp }}/capability_map_v1.json
+        run: python -m unittest discover -s tests -t . -v
+      - name: Lint
+        run: |
+          ruff check .
+          shellcheck get.sh install.sh uninstall.sh
       - name: Check the version matches the tag
         run: test "$(python3 dist/oxp3-tool --version)" = "oxp3-tool ${TAG#v}"
       - name: Publish
