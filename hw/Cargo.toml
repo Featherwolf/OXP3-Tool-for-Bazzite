@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "oxp3-hw"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "ONEXPLAYER 3 hardware helper: an unprivileged Bathysphere Hw1 provider and steamos-manager remote"
+license = "MIT"
+authors = ["Featherwolf"]
+publish = false
+
+# Its own workspace: never part of Bathysphere's or any other.
+[workspace]
+
+[features]
+default = []
+# Test builds only: --sysfs-root, --bus, --time-scale and the kernel-semantics emulation of
+# src/emu.rs. The PKGBUILD never enables it; a build without it refuses those options.
+test-sysfs = []
+
+[[bin]]
+name = "oxp3-hwd"
+path = "src/main.rs"
+
+[[bin]]
+name = "oxp3-hw-testcall"
+path = "src/bin/testcall.rs"
+required-features = ["test-sysfs"]
+
+[dependencies]
+zbus = { version = "5.12", default-features = false, features = ["tokio"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[dev-dependencies]
+quick-xml = "0.41"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# The integration tests need the test-only emulation: cargo test --features test-sysfs
+[[test]]
+name = "powerhw"
+required-features = ["test-sysfs"]
+
+[[test]]
+name = "bus"
+required-features = ["test-sysfs"]
+
+[[test]]
+name = "hostile"
+required-features = ["test-sysfs"]

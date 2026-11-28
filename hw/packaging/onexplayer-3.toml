@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# steamos-manager device file for the ONEXPLAYER 3 (installed as
+# /usr/share/steamos-manager/devices/onexplayer-3.toml). It carries no hardware section and no
+# path: steamos-manager finds the oxp3-hw remotes through ../remotes.d/50-oxp3-hw.toml.
+[[device]]
+dmi.sys_vendor = "ONE-NETBOOK"
+dmi.product_name = "ONEXPLAYER 3"
+device = "onexplayer_3"
+variant = "ONEXPLAYER 3"
+friendly_name = "ONEXPLAYER 3"
+
+# Sustained power comes from the TdpLimit1 remote (oxp3-hwd writes both RAPL package zones).
+[tdp_limit]
+method = "remote_interface"
+
+# Without a device file steamos-manager switches every InputPlumber composite device to deck-uhid
+# only, which drops the keyboard and mouse targets; this keeps them.
+[inputplumber]
+target_devices = ["deck-uhid", "keyboard", "mouse"]
+
+# Deliberately NOT set:
+# - No [gpu_performance]: Valve's xe driver would limit "auto" to rpe..rpa (steamos-manager
+#   gpu.rs); the GpuPerformanceLevel1 remote serves rpn..rp0, the boot range.
+# - No [battery_charge_limit]: steamos-manager maps -1 to 0 % (manager/root.rs), which blocks
+#   charging on this hardware; the BatteryChargeLimit1 remote maps -1 to 100. Leaving it out also
+#   makes the unauthenticated RootManager.SetMaxChargeLevel fail.
+# - No [performance_profile]: power-profiles-daemon owns the platform profile, and the key
+#   changed between steamos-manager 26.4.1 and master.
+# - No download_mode_limit: LowPowerMode1 stays absent, so TDP writes are never silently dropped.

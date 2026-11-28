@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# The provider's own system user (installed as /usr/lib/sysusers.d/oxp3-hw.conf). Its group gets
+# write access to the exact attributes of 70-oxp3-hw.rules and grants.conf, nothing else.
+u oxp3-hw - "OXP3 hardware helper" - -

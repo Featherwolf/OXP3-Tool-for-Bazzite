@@ -44,3 +44,23 @@ jobs:
           "$prefix/bin/oxp3-tool" --version
           "$prefix/bin/oxp3-tool" status || true
           sudo PREFIX="$prefix" ./uninstall.sh
+
+  hw:
+    # oxp3-hw (hw/): format, clippy, unit, fake-sysfs and private-bus tests, the release build's refusal of the test
+    # options, the grant lint, the steamos-manager files, the package layout, systemd-analyze and dbus-daemon checks
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: hw
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus-daemon shellcheck udev
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      - name: oxp3-hw checks
+        run: ci/run.sh

@@ -56,6 +56,10 @@ https://raw.githubusercontent.com/Featherwolf/OXP3Deck/HEAD/release/OXP3Deck.zip
 
 It is new and not yet tested on a real device. Uninstalling the plugin reverts nothing: revert fixes and uninstall XeSS with its buttons first. It lives in its own repository: [Featherwolf/OXP3Deck](https://github.com/Featherwolf/OXP3Deck).
 
+## Hardware helper
+
+**[oxp3-hw](hw/README.md)** is a separate pacman package for CachyOS that lets Steam's Performance sliders and [Bathysphere](https://github.com/Featherwolf/Bathysphere) plugins set the OXP3's power limits, GPU clocks, CPU limits, fan mode and charge limit, without Decky. Its daemon runs as its own system user, never as root, and can only write the kernel files its package grants it, on the ONEXPLAYER 3 only. It is separate from oxp3-tool and also untested on a real device. See [hw/README.md](hw/README.md).
+
 ## Common problems
 
 | What you see | Most likely cause | What to do |

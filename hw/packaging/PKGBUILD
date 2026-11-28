@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# Maintainer: Featherwolf
+#
+# oxp3-hw: the ONEXPLAYER 3 hardware helper. Build in this directory with `makepkg`; it builds the
+# Rust daemon from the hw-v$pkgver tag. To build the working tree instead, see ../README.md.
+# There is no install scriptlet: pacman's own hooks create the user (sysusers.d) and reload udev
+# and systemd; the grants apply at the next boot (udev coldplug, then the unit's ExecStartPre).
+
+pkgname=oxp3-hw
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="ONEXPLAYER 3 hardware helper: an unprivileged Bathysphere Hw1 provider and steamos-manager remote"
+arch=('x86_64')
+url="https://github.com/Featherwolf/OXP3-Tool-for-Bazzite"
+license=('MIT')
+depends=('dbus' 'gcc-libs' 'glibc' 'systemd')
+makedepends=('cargo' 'git')
+checkdepends=('python')
+optdepends=('steamos-manager: shows the TDP, GPU and charge-limit sliders in Steam'
+            'power-profiles-daemon: coarse energy modes for Bathysphere plugins')
+# both ship an ONEXPLAYER 3 steamos-manager device file and TDP remotes
+conflicts=('oxp3-support')
+# Pin to the signed tag once a key is set: "#tag=hw-v$pkgver?signed" and validpgpkeys=(...).
+source=("$pkgname::git+$url.git#tag=hw-v$pkgver")
+sha256sums=('SKIP')
+
+_hw() {
+  cd "$srcdir/$pkgname/hw"
+}
+
+prepare() {
+  _hw
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  _hw
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # never with --features test-sysfs: a release build refuses --sysfs-root, --bus and --time-scale
+  cargo build --frozen --release --bin oxp3-hwd
+}
+
+check() {
+  _hw
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release --lib
+  python3 ci/lint_grants.py packaging
+  # the release binary must not know the test options (exit 2: unknown option)
+  local opt st
+  for opt in "--sysfs-root /nonexistent" "--bus unix:path=/nonexistent" "--time-scale 0.5" "--no-emulation"; do
+    st=0
+    # shellcheck disable=SC2086
+    target/release/oxp3-hwd $opt 2>/dev/null || st=$?
+    if [ "$st" != 2 ]; then
+      echo "the release build accepts $opt (exit $st)" >&2
+      return 1
+    fi
+  done
+}
+
+package() {
+  _hw
+  install -Dm755 target/release/oxp3-hwd "$pkgdir/usr/lib/oxp3-hw/oxp3-hwd"
+  install -Dm644 packaging/grants.conf "$pkgdir/usr/lib/oxp3-hw/grants.conf"
+  install -Dm644 packaging/oxp3-hw.service "$pkgdir/usr/lib/systemd/system/oxp3-hw.service"
+  install -dm755 "$pkgdir/usr/lib/systemd/system/multi-user.target.wants"
+  ln -s ../oxp3-hw.service "$pkgdir/usr/lib/systemd/system/multi-user.target.wants/oxp3-hw.service"
+  install -Dm644 packaging/oxp3-hw.sysusers "$pkgdir/usr/lib/sysusers.d/oxp3-hw.conf"
+  install -Dm644 packaging/70-oxp3-hw.rules "$pkgdir/usr/lib/udev/rules.d/70-oxp3-hw.rules"
+  install -Dm644 packaging/io.github.featherwolf.Bathysphere.Hw1.conf \
+    "$pkgdir/usr/share/dbus-1/system.d/io.github.featherwolf.Bathysphere.Hw1.conf"
+  install -Dm644 packaging/io.github.featherwolf.Bathysphere.Hw1.service \
+    "$pkgdir/usr/share/dbus-1/system-services/io.github.featherwolf.Bathysphere.Hw1.service"
+  install -Dm644 schemas/hw1.xml "$pkgdir/usr/share/dbus-1/interfaces/io.github.featherwolf.Bathysphere.Hw1.xml"
+  install -Dm644 packaging/onexplayer-3.toml "$pkgdir/usr/share/steamos-manager/devices/onexplayer-3.toml"
+  install -Dm644 packaging/50-oxp3-hw.toml "$pkgdir/usr/share/steamos-manager/remotes.d/50-oxp3-hw.toml"
+  install -Dm644 packaging/limits.toml.example "$pkgdir/usr/share/doc/oxp3-hw/limits.toml.example"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/oxp3-hw/README.md"
+  install -Dm644 ../LICENSE "$pkgdir/usr/share/licenses/oxp3-hw/LICENSE"
+}

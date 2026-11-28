@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# steamos-manager remotes served by oxp3-hwd (installed as
+# /usr/share/steamos-manager/remotes.d/50-oxp3-hw.toml). One bus name per interface: oxp3-hwd
+# claims each only while that knob works (both RAPL zones writable, the render GT's clocks or power
+# profile writable, the oxpec charge threshold present on Linux 7.4+), so steamos-manager never
+# registers a dead remote. A remote never overrides a local steamos-manager driver.
+[TdpLimit1]
+bus_name = "io.github.featherwolf.Bathysphere.Hw1.TdpLimit1"
+object_path = "/io/github/featherwolf/Bathysphere/Hw1/SteamOSManager"
+
+[GpuPerformanceLevel1]
+bus_name = "io.github.featherwolf.Bathysphere.Hw1.GpuPerformanceLevel1"
+object_path = "/io/github/featherwolf/Bathysphere/Hw1/SteamOSManager"
+
+[GpuPowerProfile1]
+bus_name = "io.github.featherwolf.Bathysphere.Hw1.GpuPowerProfile1"
+object_path = "/io/github/featherwolf/Bathysphere/Hw1/SteamOSManager"
+
+[BatteryChargeLimit1]
+bus_name = "io.github.featherwolf.Bathysphere.Hw1.BatteryChargeLimit1"
+object_path = "/io/github/featherwolf/Bathysphere/Hw1/SteamOSManager"

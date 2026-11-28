@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# oxp3-hw: the ONEXPLAYER 3 hardware helper (installed as
+# /usr/lib/systemd/system/oxp3-hw.service). It runs as the system user oxp3-hw, never as root.
+# The package enables it statically (multi-user.target.wants symlink in /usr/lib): stop it for
+# good with `sudo systemctl mask --now oxp3-hw` or `sudo touch /etc/oxp3-hw/disabled`.
+#
+# Not set on purpose:
+# - ProtectKernelTunables: it would make /sys read-only, and the provider writes the granted
+#   attributes. ProtectSystem=strict keeps /dev, /proc and /sys as they are, so no ReadWritePaths
+#   are needed: the kernel's file permissions (70-oxp3-hw.rules, grants.conf) are the boundary.
+# - ProtectProc/ProcSubset: the provider reads /proc/sys/kernel/random/boot_id and, advisory only,
+#   a caller's /proc/PID/cgroup.
+# - PrivateUsers: it would hide the oxp3-hw group from the kernel's permission checks.
+[Unit]
+Description=ONEXPLAYER 3 hardware helper (Bathysphere Hw1 provider)
+Documentation=https://github.com/Featherwolf/OXP3-Tool-for-Bazzite/tree/HEAD/hw
+ConditionFirmware=smbios-field(board_vendor = ONE-NETBOOK)
+ConditionPathExists=!/etc/oxp3-hw/disabled
+After=systemd-udevd.service dbus.service systemd-logind.service
+
+[Service]
+Type=dbus
+BusName=io.github.featherwolf.Bathysphere.Hw1
+User=oxp3-hw
+Group=oxp3-hw
+# The exact DMI match (all four fields, the daemon's own code) before the privileged step below:
+# ConditionFirmware only checks the board vendor, which other ONE-NETBOOK models share. Runs as
+# User=oxp3-hw inside this sandbox; exit 1 skips the unit without marking it failed.
+ExecCondition=/usr/lib/oxp3-hw/oxp3-hwd --dmi-match
+# The only privileged step: apply the exact group grants of grants.conf (the "+" prefix runs this
+# one command with full privileges; the daemon itself never has them).
+ExecStartPre=+/usr/bin/systemd-tmpfiles --create /usr/lib/oxp3-hw/grants.conf
+ExecStart=/usr/lib/oxp3-hw/oxp3-hwd
+# After any stop, crash or watchdog kill: fan and charge behaviour back to auto.
+ExecStopPost=/usr/lib/oxp3-hw/oxp3-hwd --restore-safe
+# Only the 1 s safety task sends WATCHDOG=1: a hang becomes a kill, then ExecStopPost.
+WatchdogSec=5s
+Restart=on-failure
+RestartSec=2s
+# 78: /etc/oxp3-hw/limits.toml is invalid; restarting would not help.
+RestartPreventExitStatus=78
+StateDirectory=oxp3-hw
+StateDirectoryMode=0700
+RuntimeDirectory=oxp3-hw
+RuntimeDirectoryMode=0700
+# Keep the boot snapshot across automatic restarts, so a restart never snapshots its own values.
+RuntimeDirectoryPreserve=restart
+UMask=0077
+# Any local user may send it messages of up to the bus's 32 MiB: an out-of-memory kill stays in
+# this unit (then ExecStopPost and a restart) instead of reaching the game. It runs in about 12 MB
+# and peaks near 60 MB parsing one maximum-size message (tests/hostile.rs).
+MemoryMax=128M
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SecureBits=noroot-locked
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateIPC=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

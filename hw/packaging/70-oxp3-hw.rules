@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# oxp3-hw: group grants on exact device attributes, only on the ONEXPLAYER 3 (board DMI).
+# Installed as /usr/lib/udev/rules.d/70-oxp3-hw.rules. chgrp and chmod only: no other program, no
+# owner change, no other attribute. ci/lint_grants.py checks every attribute named here.
+ACTION!="add", GOTO="oxp3_hw_end"
+ATTR{[dmi/id]board_vendor}!="ONE-NETBOOK", GOTO="oxp3_hw_end"
+ATTR{[dmi/id]board_name}!="ONEXPLAYER 3", GOTO="oxp3_hw_end"
+# PL1 (long_term) and PL2 (short_term) only: never PL4, time windows or enabled.
+SUBSYSTEM=="powercap", KERNEL=="intel-rapl:0|intel-rapl-mmio:0", ATTR{name}=="package-0", ATTR{constraint_0_name}=="long_term", ATTR{constraint_1_name}=="short_term", RUN+="/usr/bin/chgrp oxp3-hw %S%p/constraint_0_power_limit_uw %S%p/constraint_1_power_limit_uw", RUN+="/usr/bin/chmod 0664 %S%p/constraint_0_power_limit_uw %S%p/constraint_1_power_limit_uw"
+# The package energy counter, readable by the group only (CVE-2020-8694: never world-readable).
+SUBSYSTEM=="powercap", KERNEL=="intel-rapl:0", ATTR{name}=="package-0", RUN+="/usr/bin/chgrp oxp3-hw %S%p/energy_uj", RUN+="/usr/bin/chmod 0440 %S%p/energy_uj"
+# oxpec fan (Linux 7.4+).
+SUBSYSTEM=="hwmon", ATTR{name}=="oxp_ec", RUN+="/usr/bin/chgrp oxp3-hw %S%p/pwm1_enable %S%p/pwm1", RUN+="/usr/bin/chmod 0664 %S%p/pwm1_enable %S%p/pwm1"
+# The SoC power slider's platform-profile handler, found by name (never the legacy
+# /sys/firmware/acpi/platform_profile, which writes every handler).
+SUBSYSTEM=="platform-profile", ATTR{name}=="SoC Power Slider", RUN+="/usr/bin/chgrp oxp3-hw %S%p/profile", RUN+="/usr/bin/chmod 0664 %S%p/profile"
+LABEL="oxp3_hw_end"
+# The oxpec battery extension may register after the battery's add event, so change events
+# repeat the grant.
+ACTION!="add|change", GOTO="oxp3_hw_bat_end"
+ATTR{[dmi/id]board_vendor}!="ONE-NETBOOK", GOTO="oxp3_hw_bat_end"
+ATTR{[dmi/id]board_name}!="ONEXPLAYER 3", GOTO="oxp3_hw_bat_end"
+SUBSYSTEM=="power_supply", ATTR{type}=="Battery", TEST=="charge_behaviour", TEST=="charge_control_end_threshold", RUN+="/usr/bin/chgrp oxp3-hw %S%p/charge_control_end_threshold %S%p/charge_behaviour", RUN+="/usr/bin/chmod 0664 %S%p/charge_control_end_threshold %S%p/charge_behaviour"
+LABEL="oxp3_hw_bat_end"

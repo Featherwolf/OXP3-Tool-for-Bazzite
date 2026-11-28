@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# D-Bus activation of the oxp3-hw provider (installed in /usr/share/dbus-1/system-services/).
+# The bus never starts the binary itself: activation goes through systemd and the hardened unit.
+[D-BUS Service]
+Name=io.github.featherwolf.Bathysphere.Hw1
+Exec=/bin/false
+User=oxp3-hw
+SystemdService=oxp3-hw.service

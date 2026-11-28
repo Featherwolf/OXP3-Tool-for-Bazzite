@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Featherwolf
+# SPDX-License-Identifier: MIT
+#
+# oxp3-hw admin limits. Copy to /etc/oxp3-hw/limits.toml (root-owned), then
+# `sudo systemctl restart oxp3-hw`. Every key is optional. Each value may only narrow the compiled
+# ONEXPLAYER 3 bounds, except sustained_ac_max_w, which may raise the sustained limit on AC only,
+# up to 52 W. A key that widens anything, an unknown key or a malformed line stops the provider
+# from starting (exit status 78): it never runs with limits wider than you asked for.
+#
+# Sustained power above 35 W on AC (ONEXPLAYER's "up to 40 W"). Steam's slider then reaches this
+# value; on battery the provider holds it and applies 35 W until the charger is back.
+#sustained_ac_max_w = 40
+#
+# Narrowing examples:
+#sustained_max_w = 30
+#boost_max_w = 45
+#charge_min_percent = 60
+#fan_quiet = false

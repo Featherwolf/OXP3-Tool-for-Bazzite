@@ -1,0 +1,938 @@
+<!DOCTYPE node PUBLIC
+"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+
+<!--
+  SPDX-FileCopyrightText: 2026 Featherwolf
+  SPDX-License-Identifier: MIT
+-->
+
+<!--
+  Bathysphere Hw1: the D-Bus interface of a hardware provider (SPEC.md section 11.5).
+
+  A Hw1 provider is a separately installed system package (for the ONEXPLAYER 3: oxp3-hw, daemon
+  oxp3-hwd). It runs as a dedicated non-root system user on the system bus and writes only the sysfs
+  files its own package grants to its group (SPEC 11.1, 11.7). Bathysphere's hostd is its only
+  Bathysphere client; Steam reaches the provider's steamos-manager remotes through steamos-manager.
+
+  Bus names (all owned by the provider's one connection; the D-Bus policy lets only the provider's
+  system user own them):
+    io.github.featherwolf.Bathysphere.Hw1                        main name; one provider per machine
+    io.github.featherwolf.Bathysphere.Hw1.TdpLimit1              claimed only while that remote works
+    io.github.featherwolf.Bathysphere.Hw1.GpuPerformanceLevel1   claimed only while that remote works
+    io.github.featherwolf.Bathysphere.Hw1.GpuPowerProfile1       claimed only while that remote works
+    io.github.featherwolf.Bathysphere.Hw1.BatteryChargeLimit1    claimed only while that remote works
+
+  Objects:
+    /io/github/featherwolf/Bathysphere/Hw1                  the Hw1 interfaces below
+    /io/github/featherwolf/Bathysphere/Hw1/SteamOSManager   steamos-manager remotes (child node below)
+
+  Common rules (every interface):
+  - Units: watts (u) for power limits, MHz for frequencies, percent, mW for samples, and enumerated
+    strings. No floats, no paths and no free strings in arguments.
+  - Setters are methods, so a multi-field change is atomic and carries its caller for leases. State
+    is in properties; every property that can change emits org.freedesktop.DBus.Properties
+    PropertiesChanged; constant properties are annotated "const".
+  - Authorization: every setter, Provider1.Release, Provider1.TakeControl, every property set on a
+    remote and PackagePower1.Sample. The provider reads the caller's UnixUserID with
+    org.freedesktop.DBus.GetConnectionCredentials on every call (never cached), refuses uid 0, and
+    requires it to equal the User of logind's seat0 ActiveSession with Remote false, Class "user"
+    and State "active"; otherwise org.freedesktop.DBus.Error.AccessDenied. PIDs, executable paths
+    and cgroups are never used for authorization. All other reads are open.
+  - Rate: at most 2 committed writes per second per knob (a burst is coalesced: only the newest
+    waiting value is written, and every waiting caller gets the reply of that write) and at most 20
+    calls per second per sender (beyond that org.freedesktop.DBus.Error.LimitsExceeded).
+  - Bounds: a value outside the published bounds is refused with
+    org.freedesktop.DBus.Error.InvalidArgs and nothing is written. Input is never clamped.
+  - Leases: a setter on a leased knob (boost, epp, cpuLimits, socBalance, gpuRange, fan,
+    chargeBehaviour) takes or refreshes that knob's lease for the caller's unique bus name; setting
+    the knob to its default ends the caller's lease instead. While another connection holds the
+    lease, setters fail with Error.Busy "lease:UNIQUE-NAME". A lease ends on Provider1.Release or
+    when the holder's unique name vanishes (NameOwnerChanged); the provider then restores the knob's
+    default and emits Changed (released, reverted-disconnect). Steam-owned knobs (tdp, gpu,
+    gpuPowerProfile, chargeLimit), which the provider serves through the remotes, have no lease.
+  - Every accepted write is read back (tolerances: RAPL 250 mW, GPU 25 MHz, CPU caps 100 MHz, all
+    others exact). A mismatch fails with Error.NotApplied; there is no rollback, because every
+    accepted value is safe. One journal line is written per write: uid, knob, old value, new value
+    and read-back.
+
+  Errors (hostd's broker code in brackets, SPEC 11.5):
+    org.freedesktop.DBus.Error.InvalidArgs       [EINVAL] out of range, unknown key, knob or mode;
+                                                  nothing written
+    org.freedesktop.DBus.Error.AccessDenied      [EBUSY "session not active"] the seat0 check failed
+    org.freedesktop.DBus.Error.LimitsExceeded    [ERATE] more than 20 calls per second from one sender
+    io.github.featherwolf.Bathysphere.Hw1.Error.Busy
+                                                  [EBUSY] the message names the co-writer
+                                                  (power-profiles-daemon, tuned-ppd, hhd, powerstation),
+                                                  the lease holder ("lease:" + unique name) or the
+                                                  condition (governor, battery, "cooldown:" + seconds,
+                                                  "sleep" between logind's PrepareForSleep true and false)
+    io.github.featherwolf.Bathysphere.Hw1.Error.NotApplied
+                                                  [EBUSY "not applied"] read-back mismatch; the message
+                                                  is KNOB=OBSERVED, the knob id and the value read back
+                                                  in its unit (decimal) or its word
+    io.github.featherwolf.Bathysphere.Hw1.Error.Locked
+                                                  [EBUSY] a RAPL constraint refused the write with
+                                                  EACCES; the provider skips it for the rest of the boot
+    io.github.featherwolf.Bathysphere.Hw1.Error.NotSupported
+                                                  [ENOTSUP] the knob is not available on this device
+                                                  now; the message is its Describe reason
+    io.github.featherwolf.Bathysphere.Hw1.Error.Disabled
+                                                  [ENOTSUP] the provider's kill switch
+                                                  (/etc/PROVIDER/disabled) exists
+-->
+
+<node name="/io/github/featherwolf/Bathysphere/Hw1">
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.Provider1:
+      @short_description: Identity, versioning, knob state, leases and change notices of a Hw1 provider.
+
+      Knob ids are SPEC 11.2's: tdp, gpu, gpuPowerProfile and chargeLimit (served through the
+      steamos-manager remotes; owned by Steam), boost, epp, cpuLimits, socBalance, gpuRange, fan and
+      chargeBehaviour (leased), and packagePower (read only). Any other id is
+      org.freedesktop.DBus.Error.InvalidArgs.
+
+      Core types (CpuEnergy1, CpuLimits1): "p" is the performance cores (every core of a CPU with
+      one core type), "e" the efficient cores that have an L3 cache, "lpe" the low-power efficient
+      cores without one, and "all" (CpuEnergy1 only) every CPU policy.
+
+      Versioning: ApiVersion is 1 for this file. hostd uses a provider only when it knows its
+      ApiVersion, ProviderName and ProviderVersion are not revoked (the catalog's revocations.json
+      "providers" entries and hostd's shipped table), and hostd's own device table has an entry whose
+      id equals DeviceId; otherwise every Hw1 knob is ENOTSUP and health shows the provider as
+      unrecognised or revoked. Additions that a client of the same ApiVersion can ignore (a new
+      interface, property, Describe key or Changed reason) keep ApiVersion; clients ignore unknown
+      Describe keys and treat an unknown Changed reason as "set". An incompatible change to one
+      interface ships as the next interface name (for example PowerLimits2) beside the old one; a
+      change to authorization, leases or safety rules raises ApiVersion. The bus name and object path
+      do not change within Hw1.
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.Provider1">
+
+    <!--
+        ApiVersion:
+
+        The version of this contract the provider implements: 1.
+    -->
+    <property name="ApiVersion" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        ProviderName:
+
+        The provider's package name, matching ^[a-z0-9][a-z0-9-]{0,31}$ (for example "oxp3-hw"). The
+        catalog's revocation entries name a provider by it.
+    -->
+    <property name="ProviderName" type="s" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        ProviderVersion:
+
+        The provider's package version, a semver 2.0 string of at most 64 characters (for example
+        "1.0.0").
+    -->
+    <property name="ProviderVersion" type="s" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        DeviceId:
+
+        The id of the compiled device entry whose DMI match made the provider export anything,
+        matching ^[a-z0-9][a-z0-9-]{0,63}$ (for example "onexplayer-3"). A provider exports nothing
+        without an exact DMI match, so this is never empty.
+    -->
+    <property name="DeviceId" type="s" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        Knobs:
+
+        The ids of the knobs that are available now, in the order of SPEC 11.2 (Describe reports
+        available = true for exactly these). It changes when a grant, a kernel attribute or a
+        co-writer appears or goes; the provider then also emits Changed with "available" or
+        "unavailable".
+    -->
+    <property name="Knobs" type="as" access="read"/>
+
+    <!--
+        Describe:
+        @knob: a knob id (see the interface description).
+        @description: the knob's state; keys are left out where they do not apply.
+
+        Open to every caller. Keys of @description:
+        - "available" (b): whether the knob can be used now. Always present.
+        - "reason" (s): "" when available, else one of: "kernel" (the kernel does not expose the
+          attribute, for example fan and charge before Linux 7.4 on the ONEXPLAYER 3), "grants" (the
+          attribute exists but the provider's group cannot write it), "locked" (a RAPL constraint
+          refused writes this boot), "device" (this device's entry has no such knob), "disabled"
+          (the kill switch exists), or "busy:" + a co-writer (power-profiles-daemon, tuned-ppd,
+          hhd, powerstation). Always present.
+        - "unit" (s): the unit of min, max and numeric values: "W", "MHz", "percent", "mW",
+          "level" (a dimensionless step) or "enum".
+        - "min", "max" (u): the bounds of the knob's main number, the intersection of the compiled
+          hard limit, the device entry, the kernel or firmware range and the admin envelope.
+        - "values" (as): the allowed choices of the knob's enumerated part.
+        - "value" (v): the knob's held value. "effective" (v, tdp and boost only): what the
+          hardware applies now when a rule makes it differ from value (tdp: PL1 while capped on
+          battery; boost: the PL2 computed from the mode). "default" (v, leased knobs only): what
+          Release or the end of a lease restores.
+        - "lease" (s, leased knobs only): the unique bus name of the lease holder, or "".
+        - "overridden" (b): another writer changed the value twice in a row outside the grace
+          windows and the provider stopped re-asserting it (cleared by TakeControl or a new set
+          from the lease holder). Always present.
+        - "source" (s): a short citation of where the bound comes from, compiled with the device
+          entry; shown in health, never parsed.
+        - "persistence" (s): "volatile" (held until changed; the firmware value after reboot),
+          "lease" (held only while the lease holder is connected) or "persisted" (stored and
+          re-applied at provider start).
+
+        Types and parts per knob (unit; value and default; min and max; values):
+        - tdp: W; u, PL1 in W (value is the target Steam set); TdpLimitMin..TdpLimitMax; none.
+        - gpu: MHz; s, the GpuPerformanceLevel1 level; ManualGpuClockMin..ManualGpuClockMax;
+          AvailableGpuPerformanceLevels.
+        - gpuPowerProfile: enum; s; none; AvailableGpuPowerProfiles.
+        - chargeLimit: percent; u; SuggestedMinimumLimit..100; none.
+        - boost: W; s, the mode (effective: u, PL2 in W); BoostLimitMin..BoostLimitMax;
+          AvailableBoostModes.
+        - epp: enum; a{ss} as EnergyPreference; none; AvailableEnergyPreferences.
+        - cpuLimits: percent; u, MaxPerfPct; MaxPerfPctMin..100; none.
+        - socBalance: level; (uu), balance and offset; BalanceMin..BalanceMax; none.
+        - gpuRange: MHz; (uu), AutoMinFreq and AutoMaxFreq; FreqMin..FreqMax; none.
+        - fan: enum; s; none; AvailableFanModes.
+        - chargeBehaviour: enum; s; none; AvailableChargeBehaviours.
+        - packagePower: mW; u, the latest sample; none; none.
+    -->
+    <method name="Describe">
+      <arg name="knob" type="s" direction="in"/>
+      <arg name="description" type="a{sv}" direction="out"/>
+    </method>
+
+    <!--
+        Release:
+        @knobs: leased knob ids; an empty array means every knob the caller holds.
+
+        Authorized. For each listed knob the caller holds, drops the caller's lease and, unless the
+        knob is marked overridden, writes its default (Describe's "default": the device entry's
+        compiled default, or the boot snapshot where the entry has none), then emits
+        Changed(knob, "released"). Knobs the caller does not
+        hold are skipped. An id that is not a leased knob is
+        org.freedesktop.DBus.Error.InvalidArgs and nothing is released.
+    -->
+    <method name="Release">
+      <arg name="knobs" type="as" direction="in"/>
+    </method>
+
+    <!--
+        TakeControl:
+        @knobs: knob ids, at least one.
+
+        Authorized. Clears "overridden" for each knob and writes its held value once (hostd calls it
+        only on a user action in Home). A leased knob held by another connection fails with
+        Error.Busy "lease:UNIQUE-NAME" and nothing changes.
+    -->
+    <method name="TakeControl">
+      <arg name="knobs" type="as" direction="in"/>
+    </method>
+
+    <!--
+        Changed:
+        @knob: the knob id.
+        @reason: why it changed.
+
+        Emitted after every change of a knob's state, together with PropertiesChanged. Reasons:
+        "set" (a setter or a remote property set succeeded), "released" (Release or a default
+        set), "reasserted-ac" and "reasserted-resume" (the provider wrote the held value again
+        after a power-source change or a resume, inside its grace window), "overridden" (two
+        consecutive mismatches outside a grace window; re-asserting stopped), "reverted-temperature"
+        (fan back to auto at 90 °C or above), "reverted-sensor" (fan back to auto because the package
+        temperature could not be read), "reverted-sleep" (fan back to auto before sleep),
+        "reverted-disconnect" (the lease holder's name vanished), "reverted-stop" (the provider is
+        stopping), "capped-battery" (an AC-only value was lowered to the battery maximum),
+        "raised-with-sustained" (PL2 raised because a new PL1 was above it), "available" and
+        "unavailable" (the knob entered or left Knobs).
+    -->
+    <signal name="Changed">
+      <arg name="knob" type="s"/>
+      <arg name="reason" type="s"/>
+    </signal>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.PowerLimits1:
+      @short_description: Boost power (RAPL PL2, short_term) relative to Steam's sustained limit.
+
+      Knob "boost" (leased). The provider writes both package zones (intel-rapl-mmio:0 before
+      intel-rapl:0), PL2 before PL1 when raising and PL1 before PL2 when lowering, and keeps
+      PL2 at or above PL1. It never writes PL4, time windows, "enabled" or any other zone. Steam's
+      sustained limit (PL1) is the TdpLimit1 remote's TdpLimit.
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.PowerLimits1">
+
+    <!--
+        AvailableBoostModes:
+
+        The modes this device supports, in this order, from "firmware", "follow" and "manual".
+    -->
+    <property name="AvailableBoostModes" type="as" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        BoostMode:
+
+        The current mode: "firmware" (PL2 is the device entry's compiled default, 52 W on the
+        ONEXPLAYER 3, never read from registers; this is the default and ends the lease), "follow"
+        (PL2 = min(PL1 + BoostOffset, BoostLimitMax), recomputed on every PL1 change, Steam's
+        through the remote included) or "manual" (PL2 = max(BoostLimit, PL1)).
+    -->
+    <property name="BoostMode" type="s" access="read"/>
+
+    <!--
+        BoostLimit:
+
+        The PL2 limit in W used by "manual"; in other modes the last manual value, initially the
+        compiled default.
+    -->
+    <property name="BoostLimit" type="u" access="read"/>
+
+    <!--
+        BoostOffset:
+
+        The offset in W above PL1 used by "follow"; initially 0.
+    -->
+    <property name="BoostOffset" type="u" access="read"/>
+
+    <!--
+        EffectiveBoostLimit:
+
+        The PL2 in W the provider holds now.
+    -->
+    <property name="EffectiveBoostLimit" type="u" access="read"/>
+
+    <!--
+        BoostLimitMin:
+
+        The smallest manual limit in W (5 on the ONEXPLAYER 3).
+    -->
+    <property name="BoostLimitMin" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        BoostLimitMax:
+
+        The largest PL2 in W in any mode (52 on the ONEXPLAYER 3).
+    -->
+    <property name="BoostLimitMax" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        BoostOffsetMax:
+
+        The largest "follow" offset in W, from the device entry.
+    -->
+    <property name="BoostOffsetMax" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        SetBoost:
+        @mode: one of AvailableBoostModes.
+        @limit_w: with "manual", the limit in [BoostLimitMin, BoostLimitMax]; otherwise 0.
+        @offset_w: with "follow", the offset in [0, BoostOffsetMax]; otherwise 0.
+        @effective_w: the PL2 in W written and read back.
+
+        Authorized; takes the "boost" lease ("firmware" ends it). A non-zero argument that the mode
+        does not use, an unknown mode or a value out of range is
+        org.freedesktop.DBus.Error.InvalidArgs. Errors also: Busy (lease holder, hhd, powerstation),
+        NotApplied, Locked, NotSupported, Disabled.
+    -->
+    <method name="SetBoost">
+      <arg name="mode" type="s" direction="in"/>
+      <arg name="limit_w" type="u" direction="in"/>
+      <arg name="offset_w" type="u" direction="in"/>
+      <arg name="effective_w" type="u" direction="out"/>
+    </method>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.CpuEnergy1:
+      @short_description: CPU energy-performance preference (EPP) per core type.
+
+      Knob "epp" (leased). Unavailable (reason "busy:power-profiles-daemon" or "busy:tuned-ppd")
+      while org.freedesktop.UPower.PowerProfiles has an owner, because that daemon writes EPP
+      itself; hostd then offers coarse EPP through its holds instead. The default is the boot
+      snapshot.
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.CpuEnergy1">
+
+    <!--
+        CoreTypes:
+
+        "all" followed by the core types this CPU has, in the order "p", "e", "lpe".
+    -->
+    <property name="CoreTypes" type="as" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        AvailableEnergyPreferences:
+
+        The kernel's energy_performance_available_preferences list, in its order.
+    -->
+    <property name="AvailableEnergyPreferences" type="as" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        EnergyPreference:
+
+        For each core type except "all", the preference its first policy reads back. A value the
+        kernel shows as a raw number (0 to 255) is reported as that decimal string.
+    -->
+    <property name="EnergyPreference" type="a{ss}" access="read"/>
+
+    <!--
+        SetEnergyPreference:
+        @preferences: either "all" alone or any of the per-type keys of CoreTypes, each mapped to a
+        member of AvailableEnergyPreferences.
+
+        Authorized; takes the "epp" lease. An empty map, an unknown key, "all" together with a
+        per-type key, or an unknown value is org.freedesktop.DBus.Error.InvalidArgs. Errors also:
+        Busy "power-profiles-daemon" or "tuned-ppd" (the PowerProfiles name has an owner), Busy
+        "governor" (the CPU governor is "performance", so EPP cannot change), Busy (lease holder),
+        NotApplied, NotSupported, Disabled.
+    -->
+    <method name="SetEnergyPreference">
+      <arg name="preferences" type="a{ss}" direction="in"/>
+    </method>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.CpuLimits1:
+      @short_description: CPU performance caps and floor (intel_pstate max_perf_pct and
+      min_perf_pct) and per-core-type maximum frequency (scaling_max_freq).
+
+      Knob "cpuLimits" (leased). The default is the boot snapshot. The provider never writes
+      scaling_min_freq, no_turbo (steamos-manager's CpuBoost1 owns it) or intel_pstate/status.
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.CpuLimits1">
+
+    <!--
+        MaxPerfPct:
+
+        intel_pstate max_perf_pct as read back, in percent.
+    -->
+    <property name="MaxPerfPct" type="u" access="read"/>
+
+    <!--
+        MinPerfPct:
+
+        intel_pstate min_perf_pct as read back, in percent.
+    -->
+    <property name="MinPerfPct" type="u" access="read"/>
+
+    <!--
+        MaxPerfPctMin:
+
+        The smallest allowed MaxPerfPct: the hard limit, 30.
+    -->
+    <property name="MaxPerfPctMin" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        CoreTypeMaxFreq:
+
+        For each core type except "all", scaling_max_freq of its first policy in MHz.
+    -->
+    <property name="CoreTypeMaxFreq" type="a{su}" access="read"/>
+
+    <!--
+        CoreTypeFreqRange:
+
+        For each core type except "all", (cpuinfo_min_freq, cpuinfo_max_freq) of its policies in
+        MHz.
+    -->
+    <property name="CoreTypeFreqRange" type="a{s(uu)}" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        SetCpuLimits:
+        @limits: at least one of "max_perf_pct" (u), "min_perf_pct" (u) and "core_type_max_freq"
+        (a{su}, MHz per core type).
+
+        Authorized; takes the "cpuLimits" lease. Rules:
+        - max_perf_pct in [MaxPerfPctMin, 100].
+        - min_perf_pct at most the device entry's AC floor cap (50 on the ONEXPLAYER 3) and at
+          most the resulting max_perf_pct. A value above the boot snapshot is accepted only on AC
+          (else Busy "battery") and is restored to the snapshot on unplug (Changed
+          "capped-battery").
+        - core_type_max_freq keys are CoreTypes other than "all", values inside CoreTypeFreqRange.
+          While intel_pstate/no_turbo reads 1 the kernel limits each policy to its base_frequency,
+          so the read-back is compared with min(value, base_frequency).
+        - A rising cap is written before the floor, otherwise the floor first.
+        An unknown key, a wrong variant type or a value out of range is
+        org.freedesktop.DBus.Error.InvalidArgs. Errors also: Busy (lease holder, hhd, powerstation),
+        NotApplied, NotSupported, Disabled.
+    -->
+    <method name="SetCpuLimits">
+      <arg name="limits" type="a{sv}" direction="in"/>
+    </method>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.SocBalance1:
+      @short_description: The SoC power slider's balance and offset (processor_thermal_soc_slider).
+
+      Knob "socBalance" (leased). The values reach the firmware only through a write of "balanced"
+      to the platform-profile handler named "SoC Power Slider", and power-profiles-daemon owns the
+      choice of profile, so the provider writes the profile word only when it already reads
+      "balanced". It never writes another word or the legacy /sys/firmware/acpi/platform_profile.
+      The default is the boot snapshot.
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.SocBalance1">
+
+    <!--
+        Balance:
+
+        The held slider_balance value.
+    -->
+    <property name="Balance" type="u" access="read"/>
+
+    <!--
+        Offset:
+
+        The held slider_offset value.
+    -->
+    <property name="Offset" type="u" access="read"/>
+
+    <!--
+        BalanceMin:
+
+        The smallest balance (1 on the ONEXPLAYER 3; the kernel refuses 0).
+    -->
+    <property name="BalanceMin" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        BalanceMax:
+
+        The largest balance (5 on the ONEXPLAYER 3; the kernel refuses 6).
+    -->
+    <property name="BalanceMax" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        OffsetMax:
+
+        The largest offset (3 on the ONEXPLAYER 3); the smallest is 0.
+    -->
+    <property name="OffsetMax" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        Active:
+
+        True while the "SoC Power Slider" profile reads "balanced", so the held values are in
+        effect.
+    -->
+    <property name="Active" type="b" access="read"/>
+
+    <!--
+        SetSocBalance:
+        @balance: in [BalanceMin, BalanceMax].
+        @offset: in [0, OffsetMax].
+
+        Authorized; takes the "socBalance" lease. Writes slider_offset, then slider_balance (both as
+        two hex digits), then "balanced" into the "SoC Power Slider" profile only if it reads
+        "balanced" now; otherwise the parameters are held (and written), Active is false, and they
+        take effect at the next "balanced". Errors: InvalidArgs, Busy (lease holder),
+        NotApplied, NotSupported, Disabled.
+    -->
+    <method name="SetSocBalance">
+      <arg name="balance" type="u" direction="in"/>
+      <arg name="offset" type="u" direction="in"/>
+    </method>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.GpuRange1:
+      @short_description: The GPU frequency range used while Steam's GPU level is "auto".
+
+      Knob "gpuRange" (leased). Applies to the render GT only (never the media GT). It takes
+      effect only while the provider's GpuPerformanceLevel1 remote is at "auto"; Steam's "manual"
+      pins min = max and wins, and returning to "auto" writes this range again. The default is the
+      boot range (rpn..rp0).
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.GpuRange1">
+
+    <!--
+        AutoMinFreq:
+
+        The lower end of the "auto" range in MHz.
+    -->
+    <property name="AutoMinFreq" type="u" access="read"/>
+
+    <!--
+        AutoMaxFreq:
+
+        The upper end of the "auto" range in MHz.
+    -->
+    <property name="AutoMaxFreq" type="u" access="read"/>
+
+    <!--
+        FreqMin:
+
+        The render GT's rpn in MHz, read at provider start.
+    -->
+    <property name="FreqMin" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        FreqMax:
+
+        The render GT's rp0 in MHz, read at provider start.
+    -->
+    <property name="FreqMax" type="u" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        SetAutoRange:
+        @min_mhz: in [FreqMin, max_mhz].
+        @max_mhz: in [min_mhz, FreqMax].
+
+        Authorized; takes the "gpuRange" lease. While the level is "auto" it writes max_freq first
+        when raising and min_freq first when lowering, so min stays at or below max; otherwise it
+        holds the range. The kernel's EAGAIN (GPU resetting or resuming) is retried 3 times 0.3 s
+        apart, then NotApplied. Errors: InvalidArgs, Busy (lease holder, hhd, powerstation),
+        NotApplied, NotSupported, Disabled.
+    -->
+    <method name="SetAutoRange">
+      <arg name="min_mhz" type="u" direction="in"/>
+      <arg name="max_mhz" type="u" direction="in"/>
+    </method>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.FanMode1:
+      @short_description: Fan mode, with safety reverts that do not depend on any client.
+
+      Knob "fan" (leased; the default is "auto"). On the ONEXPLAYER 3 (oxpec hwmon "oxp_ec",
+      Linux 7.4 or later): "auto" writes pwm1_enable 2, "quiet" writes pwm1_enable 1 and then pwm1
+      = the device's quiet duty (102; the hard limit is 80 to 255), "max" writes pwm1_enable 0
+      (full speed). While the fan is not "auto" the provider holds the logind delay inhibitor
+      Inhibit("sleep", PROVIDER, "fan back to auto", "delay"). It returns the fan to "auto", emits
+      Changed and sets LastRevert when: the package temperature (coretemp "Package id 0", checked
+      every 1 s) is 90 °C or more ("temperature") or cannot be read ("sensor"); logind sends
+      PrepareForSleep(true) ("sleep", then the inhibitor is released); the lease holder's name
+      vanishes ("disconnect"); the provider gets SIGTERM ("stop"). A hang ends in a watchdog kill
+      (only the safety task feeds the watchdog) and a crash in ExecStopPost, which both set "auto".
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.FanMode1">
+
+    <!--
+        AvailableFanModes:
+
+        The modes this device supports, in this order, from "auto", "quiet" and "max".
+    -->
+    <property name="AvailableFanModes" type="as" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        FanMode:
+
+        The current mode, as read back.
+    -->
+    <property name="FanMode" type="s" access="read"/>
+
+    <!--
+        LastRevert:
+
+        Why the provider last returned the fan to "auto": "temperature", "sensor", "sleep",
+        "disconnect" or "stop"; "" when it has not since the last successful SetFanMode with a
+        mode other than "auto".
+    -->
+    <property name="LastRevert" type="s" access="read"/>
+
+    <!--
+        SetFanMode:
+        @mode: one of AvailableFanModes.
+
+        Authorized. A mode other than "auto" takes the "fan" lease on the caller's unique name;
+        "auto" ends it. "quiet" is refused for 600 s after a "temperature" revert (Busy
+        "cooldown:" + the seconds left). Between logind's PrepareForSleep(true) and (false) only
+        "auto" is accepted (Busy "sleep"). Errors: InvalidArgs, Busy (lease holder, cooldown, sleep),
+        NotApplied, NotSupported, Disabled.
+    -->
+    <method name="SetFanMode">
+      <arg name="mode" type="s" direction="in"/>
+    </method>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.BatteryChargeBehaviour1:
+      @short_description: Pause charging while the device is awake ("run from the charger").
+
+      Knob "chargeBehaviour" (leased; the default is "auto"). Writes the battery's
+      charge_behaviour (Linux 7.4 or later on the ONEXPLAYER 3). The provider has no code path for
+      "inhibit-charge" or "force-discharge". A non-auto value returns to "auto" when the lease
+      holder's name vanishes ("reverted-disconnect"), on SIGTERM ("reverted-stop"), and through
+      ExecStopPost after a crash or a watchdog kill.
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.BatteryChargeBehaviour1">
+
+    <!--
+        AvailableChargeBehaviours:
+
+        The values this device supports, in this order, from "auto" and "inhibit-charge-awake".
+    -->
+    <property name="AvailableChargeBehaviours" type="as" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+
+    <!--
+        ChargeBehaviour:
+
+        The current value, as read back.
+    -->
+    <property name="ChargeBehaviour" type="s" access="read"/>
+
+    <!--
+        SetChargeBehaviour:
+        @behaviour: one of AvailableChargeBehaviours.
+
+        Authorized. "inhibit-charge-awake" takes the "chargeBehaviour" lease on the caller's unique
+        name; "auto" ends it. Errors: InvalidArgs, Busy (lease holder), NotApplied, NotSupported,
+        Disabled.
+    -->
+    <method name="SetChargeBehaviour">
+      <arg name="behaviour" type="s" direction="in"/>
+    </method>
+
+  </interface>
+
+  <!--
+      io.github.featherwolf.Bathysphere.Hw1.PackagePower1:
+      @short_description: CPU package power, coarse enough not to leak secrets.
+
+      Knob "packagePower" (read only). The provider derives it from the package zone's energy_uj,
+      which its group may read and others may not (CVE-2020-8694).
+  -->
+  <interface name="io.github.featherwolf.Bathysphere.Hw1.PackagePower1">
+
+    <!--
+        Sample:
+        @milliwatts: the average package power over the window, rounded to 100 mW.
+        @window_ms: the window in milliseconds, at least 1000.
+
+        Authorized. At most one fresh sample per second across all callers; a call within the
+        same second gets the latest sample again. Counter wrap-around is handled with the zone's
+        max_energy_range_uj. Errors: AccessDenied, LimitsExceeded, NotSupported, Disabled.
+    -->
+    <method name="Sample">
+      <arg name="milliwatts" type="u" direction="out"/>
+      <arg name="window_ms" type="u" direction="out"/>
+    </method>
+
+  </interface>
+
+  <!--
+      Child object /io/github/featherwolf/Bathysphere/Hw1/SteamOSManager. (This comment names no
+      symbol on purpose: gdbus-codegen skips nested nodes and fails on a doc comment naming one.)
+
+      The steamos-manager remotes the provider serves to fill gaps (SPEC 11.6). steamos-manager's
+      user daemon finds them through the provider's remotes.d file (one section per interface, each
+      with its own bus name and this object path), pings org.freedesktop.DBus.Peer at "/", loads a
+      remote when its bus name gets an owner and drops it when the name goes; a remote never
+      overrides a local implementation. The interfaces and their member types are Valve's
+      (com.steampowered.SteamOSManager1.xml in steamos-manager, MIT; identical in 26.4.1 and
+      master); the comments state the provider's rules. Property sets are authorized like Hw1
+      setters (the user daemon makes them as the session uid) and read back.
+  -->
+  <node name="SteamOSManager">
+
+    <!--
+        com.steampowered.SteamOSManager1.TdpLimit1:
+        @short_description: Steam's sustained power limit (RAPL PL1, long_term).
+
+        Knob "tdp" (Steam-owned). Bus name io.github.featherwolf.Bathysphere.Hw1.TdpLimit1, claimed
+        only while both package zones (intel-rapl-mmio:0 and intel-rapl:0) have writable long_term
+        and short_term constraints. The provider holds the target and re-asserts it after AC
+        changes (2 s debounce, 20 s grace) and resume (+3 s, verified at +10 s); outside those
+        windows two consecutive mismatches mark it overridden. A lower value from thermald is never
+        fought.
+    -->
+    <interface name="com.steampowered.SteamOSManager1.TdpLimit1">
+
+      <!--
+          TdpLimit:
+
+          The sustained limit in W, in [TdpLimitMin, TdpLimitMax] (else InvalidArgs). Writing the
+          value it already holds only re-checks both zones. A value above the effective PL2 raises
+          PL2 first (Changed "raised-with-sustained"). With an admin AC limit above the battery
+          maximum, the provider holds the target and applies the battery maximum while on battery
+          (Changed "capped-battery").
+      -->
+      <property name="TdpLimit" type="u" access="readwrite"/>
+
+      <!--
+          TdpLimitMin:
+
+          The smallest sustained limit in W (5 on the ONEXPLAYER 3). Constant.
+      -->
+      <property name="TdpLimitMin" type="u" access="read">
+        <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+      </property>
+
+      <!--
+          TdpLimitMax:
+
+          The largest sustained limit in W: the battery envelope (35 on the ONEXPLAYER 3), or the
+          admin AC limit when /etc/PROVIDER/limits.toml sets one. Constant, because steamos-manager
+          treats it as constant.
+      -->
+      <property name="TdpLimitMax" type="u" access="read">
+        <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+      </property>
+
+    </interface>
+
+    <!--
+        com.steampowered.SteamOSManager1.GpuPerformanceLevel1:
+        @short_description: Steam's GPU level and manual clock.
+
+        Knob "gpu" (Steam-owned). Bus name
+        io.github.featherwolf.Bathysphere.Hw1.GpuPerformanceLevel1, claimed only while the render
+        GT's min_freq and max_freq are writable. Set GpuPerformanceLevel before ManualGpuClock.
+    -->
+    <interface name="com.steampowered.SteamOSManager1.GpuPerformanceLevel1">
+
+      <!--
+          AvailableGpuPerformanceLevels:
+
+          ["auto", "manual"].
+      -->
+      <property name="AvailableGpuPerformanceLevels" type="as" access="read">
+        <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+      </property>
+
+      <!--
+          GpuPerformanceLevel:
+
+          "auto" writes the GpuRange1 range (by default the boot range rpn..rp0); "manual" pins
+          min_freq = max_freq = ManualGpuClock.
+      -->
+      <property name="GpuPerformanceLevel" type="s" access="readwrite"/>
+
+      <!--
+          ManualGpuClock:
+
+          The pinned clock in MHz used by "manual", in [ManualGpuClockMin, ManualGpuClockMax].
+      -->
+      <property name="ManualGpuClock" type="u" access="readwrite"/>
+
+      <!--
+          ManualGpuClockMin:
+
+          rpn of the render GT in MHz.
+      -->
+      <property name="ManualGpuClockMin" type="u" access="read">
+        <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+      </property>
+
+      <!--
+          ManualGpuClockMax:
+
+          rp0 of the render GT in MHz.
+      -->
+      <property name="ManualGpuClockMax" type="u" access="read">
+        <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+      </property>
+
+    </interface>
+
+    <!--
+        com.steampowered.SteamOSManager1.GpuPowerProfile1:
+        @short_description: The xe GPU power profile.
+
+        Knob "gpuPowerProfile" (Steam-owned). Bus name
+        io.github.featherwolf.Bathysphere.Hw1.GpuPowerProfile1, claimed only while the render GT's
+        freq0/power_profile is writable.
+    -->
+    <interface name="com.steampowered.SteamOSManager1.GpuPowerProfile1">
+
+      <!--
+          AvailableGpuPowerProfiles:
+
+          ["base", "power_saving"].
+      -->
+      <property name="AvailableGpuPowerProfiles" type="as" access="read">
+        <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+      </property>
+
+      <!--
+          GpuPowerProfile:
+
+          One of AvailableGpuPowerProfiles; the kernel's EAGAIN is retried like GpuRange1.
+      -->
+      <property name="GpuPowerProfile" type="s" access="readwrite"/>
+
+    </interface>
+
+    <!--
+        com.steampowered.SteamOSManager1.BatteryChargeLimit1:
+        @short_description: Steam's battery charge limit.
+
+        Knob "chargeLimit" (Steam-owned). Bus name
+        io.github.featherwolf.Bathysphere.Hw1.BatteryChargeLimit1, claimed only while the
+        battery's charge_control_end_threshold is writable (Linux 7.4 or later on the ONEXPLAYER 3).
+        The only value the provider persists: a threshold at or above SuggestedMinimumLimit is
+        stored and re-applied at provider start.
+    -->
+    <interface name="com.steampowered.SteamOSManager1.BatteryChargeLimit1">
+
+      <!--
+          MaxChargeLevel:
+
+          The end-of-charge threshold in percent. -1 means "no limit" and writes 100 (never 0,
+          which blocks charging on this hardware); any other value must lie in
+          [SuggestedMinimumLimit, 100]. Reads report the threshold read back.
+      -->
+      <property name="MaxChargeLevel" type="i" access="readwrite"/>
+
+      <!--
+          SuggestedMinimumLimit:
+
+          The device entry's smallest threshold (50 on the ONEXPLAYER 3).
+      -->
+      <property name="SuggestedMinimumLimit" type="i" access="read">
+        <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+      </property>
+
+    </interface>
+
+  </node>
+
+</node>
